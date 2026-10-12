@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+if [[ "${1:-}" == -p ]]; then
+  printf '18.0.0\n'
+else
+  printf 'v18.0.0\n'
+fi

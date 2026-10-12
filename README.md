@@ -14,7 +14,7 @@ To show the local clock, enable **Clock** under Settings → Active pills. Clock
 
 ## Linux setup
 
-Supported package managers: `pacman` (Arch-based) or `apt-get` (Debian/Ubuntu-based). A graphical desktop session and `sudo` access are required to install missing system packages. The script installs build dependencies, Rust, OpenCode v2 if needed, the Tauri app, its OpenCode hook, a 30-day **Mochi chat session** cleanup timer, and autostart. It preserves an existing checkout and existing valid settings rather than resetting Git history.
+Supported package managers: `pacman` (Arch-based) or `apt-get` (Debian/Ubuntu-based), on x86_64 or aarch64 Linux with a systemd user session. Run setup as your desktop user; it requests `sudo` only to install missing system packages. The script installs build dependencies, Rust, OpenCode v2 if needed, the Tauri app, its OpenCode hook, a 30-day **Mochi chat session** cleanup timer, and autostart. If the distro's Node.js is too old, it downloads a checksum-verified Node.js 24 LTS into `~/.local/share/mochi/toolchain/` for the build. It preserves an existing checkout and existing valid settings rather than resetting Git history.
 
 ```bash
 git clone https://github.com/Spydomain/Mochi.git mochi

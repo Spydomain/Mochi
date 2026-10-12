@@ -36,6 +36,7 @@ OLD_CLEANUP_TIMER="coucou-opencode-cleanup.timer"
 NO_LAUNCH=0
 CHECK_ONLY=0
 CHECK_MISSING=0
+NODE_VERSION="v24.21.0"
 
 for arg in "$@"; do
   case "$arg" in
@@ -49,6 +50,16 @@ done
 log() { printf '[mochi] %s\n' "$*"; }
 die() { printf '[mochi] ERROR: %s\n' "$*" >&2; exit 1; }
 
+run_as_root() {
+  if ((EUID == 0)); then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    die 'sudo is needed to install missing system packages.'
+  fi
+}
+
 missing_packages() {
   local package
   for package in "$@"; do
@@ -60,14 +71,61 @@ missing_packages() {
   done
 }
 
+node_is_supported() {
+  local version major minor
+  command -v node >/dev/null 2>&1 || return 1
+  command -v npm >/dev/null 2>&1 || return 1
+  version="$(node -p 'process.versions.node' 2>/dev/null)" || return 1
+  [[ "$version" =~ ^([0-9]+)\.([0-9]+)\. ]] || return 1
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  ((major >= 25 || (major == 24 && minor >= 12) || (major == 22 && minor >= 20)))
+}
+
+ensure_node() {
+  if node_is_supported; then
+    log "Node.js $(node --version) and npm $(npm --version) are available."
+    return
+  fi
+
+  local arch archive node_dir temp_dir sums
+  case "$(uname -m)" in
+    x86_64) arch=x64 ;;
+    aarch64) arch=arm64 ;;
+    *) die 'A supported Node.js version is required on this CPU (x86_64 or aarch64). Install Node.js 24 LTS and rerun setup.' ;;
+  esac
+  archive="node-$NODE_VERSION-linux-$arch.tar.xz"
+  node_dir="$DATA_HOME/mochi/toolchain/${archive%.tar.xz}"
+  if [[ ! -x "$node_dir/bin/node" ]]; then
+    temp_dir="$(mktemp -d)"
+    log "Downloading Node.js $NODE_VERSION from nodejs.org."
+    curl --proto '=https' --tlsv1.2 --retry 3 -fsSL "https://nodejs.org/dist/$NODE_VERSION/SHASUMS256.txt" -o "$temp_dir/SHASUMS256.txt"
+    curl --proto '=https' --tlsv1.2 --retry 3 -fsSL "https://nodejs.org/dist/$NODE_VERSION/$archive" -o "$temp_dir/$archive"
+    sums="$(awk -v name="$archive" '$2 == name { print }' "$temp_dir/SHASUMS256.txt")"
+    [[ -n "$sums" ]] || die "Node.js checksum is missing for $archive."
+    (cd "$temp_dir" && printf '%s\n' "$sums" | sha256sum --check --status) || die 'Node.js download failed checksum verification.'
+    tar -xJf "$temp_dir/$archive" -C "$temp_dir"
+    mkdir -p "$(dirname "$node_dir")"
+    if [[ -e "$node_dir" ]]; then
+      mv -- "$node_dir" "$node_dir.invalid.$(date +%s%N)"
+    fi
+    mv -- "$temp_dir/${archive%.tar.xz}" "$node_dir"
+    rm -f -- "$temp_dir/$archive" "$temp_dir/SHASUMS256.txt"
+    rmdir -- "$temp_dir"
+  fi
+  export PATH="$node_dir/bin:$PATH"
+  node_is_supported || die 'Downloaded Node.js cannot run on this system; install Node.js 24 LTS for your distribution.'
+  log "Using local Node.js $(node --version)."
+}
+
 install_system_dependencies() {
   local -a packages missing
   if command -v pacman >/dev/null 2>&1; then
-    packages=(base-devel git curl file pkgconf nodejs npm gtk3 webkit2gtk-4.1 geoclue
+    packages=(base-devel git curl file pkgconf gtk3 webkit2gtk-4.1 geoclue
       gtk-layer-shell libayatana-appindicator librsvg openssl dbus xdotool playerctl iproute2
       gst-plugins-base gst-plugins-good gst-plugins-bad)
   elif command -v apt-get >/dev/null 2>&1; then
-    packages=(build-essential git curl file pkg-config nodejs npm libgtk-3-dev
+    packages=(build-essential git curl file pkg-config libgtk-3-dev
       libwebkit2gtk-4.1-dev geoclue-2.0 libgtk-layer-shell-dev libayatana-appindicator3-dev
       librsvg2-dev libssl-dev libdbus-1-dev libxdo-dev patchelf playerctl iproute2
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad)
@@ -85,10 +143,10 @@ install_system_dependencies() {
     return
   fi
   if command -v pacman >/dev/null 2>&1; then
-    sudo pacman -Syu --needed --noconfirm "${missing[@]}"
+    run_as_root pacman -S --needed --noconfirm "${missing[@]}"
   else
-    sudo apt-get update
-    sudo apt-get install -y "${missing[@]}"
+    run_as_root apt-get update
+    run_as_root apt-get install -y "${missing[@]}"
   fi
 }
 
@@ -102,6 +160,7 @@ ensure_checkout() {
 }
 
 ensure_rust() {
+  export PATH="$HOME/.cargo/bin:$PATH"
   if ! command -v rustup >/dev/null 2>&1; then
     log 'Installing Rust using rustup.'
     local installer_file
@@ -111,7 +170,7 @@ ensure_rust() {
     rm -f -- "$installer_file"
     export PATH="$HOME/.cargo/bin:$PATH"
   fi
-  rustup toolchain list | grep -q '^stable-' || rustup toolchain install stable --profile minimal
+  rustup toolchain install stable --profile minimal --no-self-update
   export RUSTUP_TOOLCHAIN=stable
   # Some distributions put an incompatible system rustc before rustup on PATH.
   local stable_rustc
@@ -122,6 +181,7 @@ ensure_rust() {
 }
 
 ensure_opencode() {
+  export PATH="$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
   if ! command -v opencode >/dev/null 2>&1 || [[ "$(opencode --version 2>/dev/null || true)" != *'v2.'* ]]; then
     log 'Installing OpenCode v2 from its official installer.'
     local installer_file
@@ -272,12 +332,18 @@ start_app() {
   log "Mochi running (PID $pid)."
 }
 
+((EUID != 0)) || die 'Run setup as your desktop user, without sudo; it requests sudo only when system packages are missing.'
+export PATH="$HOME/.cargo/bin:$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
 install_system_dependencies
 if ((CHECK_ONLY)); then
+  node_is_supported || { log 'Node.js 22.20+ or 24.12+ with npm is needed; setup can download Node.js 24 LTS.'; CHECK_MISSING=1; }
+  command -v rustup >/dev/null 2>&1 || { log 'Rust is missing; setup can install it with rustup.'; CHECK_MISSING=1; }
+  [[ "$(opencode --version 2>/dev/null || true)" == *'v2.'* ]] || { log 'OpenCode v2 is missing; setup can install it.'; CHECK_MISSING=1; }
   log 'Dependency check complete; no changes made.'
   exit "$CHECK_MISSING"
 fi
 ensure_checkout
+ensure_node
 ensure_rust
 ensure_opencode
 build_app
