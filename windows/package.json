@@ -10,8 +10,8 @@
     "test": "node --import ./tests/setup.mjs --test \"tests/**/*.test.mjs\"",
     "icons": "node scripts/gen-icons.mjs",
     "tauri": "tauri",
-    "predev": "cargo build --release -p mochi-hook",
-    "prebuild": "cargo build --release -p mochi-hook",
+    "predev": "node scripts/prepare-cargo-target.mjs && cargo build --release -p mochi-hook",
+    "prebuild": "node scripts/prepare-cargo-target.mjs && cargo build --release -p mochi-hook",
     "pack": "tauri build && node scripts/pack.mjs"
   },
   "devDependencies": {
