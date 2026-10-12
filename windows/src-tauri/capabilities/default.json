@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What Mochi's windows are allowed to do. Everything that touches the OS goes through Mochi's own commands.",
+  "windows": ["island", "settings", "mochi"],
+  "permissions": ["core:default", "autostart:default"]
+}
