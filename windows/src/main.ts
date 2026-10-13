@@ -30,6 +30,12 @@ async function main() {
   if (boot) {
     State.settings = { ...State.settings, ...boot.settings };
   }
+  void Bridge.keepAwakeStatus().then((enabled) => {
+    if (enabled !== null && !State.keepAwakePending) {
+      State.keepAwake = enabled;
+      State.notify();
+    }
+  });
   // A language change redraws the island in place: the texts given as tl(…)
   // relabel themselves (views/dom.ts) and the views redraw the rest on this
   // sync. Nothing is rebuilt, so tasks, steps and the chat stay as they are.

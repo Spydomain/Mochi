@@ -7,6 +7,7 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub struct PowerStatus {
     pub plugged_in: bool,
+    pub charging: bool,
     pub level: u8,
 }
 
@@ -15,6 +16,7 @@ pub struct PowerStatus {
 pub fn power_status() -> Option<PowerStatus> {
     let entries = std::fs::read_dir("/sys/class/power_supply").ok()?;
     let mut battery = None;
+    let mut battery_state = None;
     let mut plugged_in = false;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -25,6 +27,8 @@ pub fn power_status() -> Option<PowerStatus> {
                     .ok().and_then(|s| s.trim().parse::<u8>().ok());
                 if let Some(level) = level {
                     battery = Some(level.min(100));
+                    battery_state = std::fs::read_to_string(path.join("status"))
+                        .ok().map(|s| s.trim().to_owned());
                 }
             }
             "Mains" | "USB" | "USB_C" | "USB_PD" => {
@@ -34,7 +38,11 @@ pub fn power_status() -> Option<PowerStatus> {
             _ => {}
         }
     }
-    battery.map(|level| PowerStatus { plugged_in, level })
+    battery.map(|level| PowerStatus {
+        plugged_in,
+        charging: battery_state.as_deref().map_or(plugged_in && level < 100, |s| s == "Charging"),
+        level,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

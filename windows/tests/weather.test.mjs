@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { weatherDescription, weatherScene } from "../src/core/weather.ts";
 import { WeatherBackdrop } from "../src/island/weather.ts";
 import { Bridge } from "../src/core/bridge.ts";
-import { locateMe } from "../src/core/location.ts";
+import { deviceWeatherLocation, locateMe } from "../src/core/location.ts";
 import { State } from "../src/core/state.ts";
 import { installFakeDom } from "./fakedom.mjs";
 
@@ -95,24 +95,207 @@ test("automatic location checks only after opt-in and once a day", async () => {
   }
 });
 
-test("Locate me rechecks on startup even with a recent saved IP position", async () => {
+test("Locate me rechecks on startup but preserves the saved city when the device fix is coarse", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
   const oldAuto = Bridge.weatherAutoLocation;
   const oldSettings = State.settings;
   const oldPaused = State.paused;
-  const calls = [];
+  let calls = 0;
+  let ipCalls = 0;
   const location = { name: "Kathmandu, Nepal (approximate IP location)", latitude: 27.7, longitude: 85.3 };
-  Bridge.weatherAutoLocation = async (force) => { calls.push(force); return location; };
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition(success) {
+      calls++;
+      success({ coords: { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 } });
+    },
+  } });
+  Bridge.weatherAutoLocation = async () => { ipCalls++; return null; };
   try {
     State.paused = false;
     State.settings = { ...oldSettings, weatherEnabled: true, weatherAutoLocation: true,
       weatherLocateMe: true, weatherLocation: location, weatherLocationUpdatedAt: Date.now() };
     const backdrop = new WeatherBackdrop();
     await backdrop.refreshLocation();
-    assert.deepEqual(calls, [true]);
+    assert.equal(calls, 1);
+    assert.equal(ipCalls, 0);
+    assert.deepEqual(State.settings.weatherLocation, location);
     await backdrop.refreshLocation();
-    assert.deepEqual(calls, [true]);
+    assert.equal(calls, 1);
+  } finally {
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+    Bridge.weatherAutoLocation = oldAuto;
+    State.settings = oldSettings;
+    State.paused = oldPaused;
+  }
+});
+
+test("each app start rechecks Locate me even with a recent saved location", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  const oldSettings = State.settings;
+  const oldPaused = State.paused;
+  let calls = 0;
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition(success) {
+      calls++;
+      success({ coords: { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 } });
+    },
+  } });
+  try {
+    State.paused = false;
+    const saved = { name: "Kathmandu, Nepal", latitude: 27.70169, longitude: 85.3206 };
+    State.settings = { ...oldSettings, weatherEnabled: true, weatherAutoLocation: true,
+      weatherLocateMe: true, weatherLocation: saved, weatherLocationUpdatedAt: Date.now() };
+    await new WeatherBackdrop().refreshLocation();
+    await new WeatherBackdrop().refreshLocation(); // Simulate a fresh app after reboot.
+    assert.equal(calls, 2);
+    assert.deepEqual(State.settings.weatherLocation, saved);
+  } finally {
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+    State.settings = oldSettings;
+    State.paused = oldPaused;
+  }
+});
+
+test("Locate me retries shortly after login, then backs off after three failed fixes", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  const oldNow = Date.now;
+  const oldSettings = State.settings;
+  const oldPaused = State.paused;
+  let now = 1_800_000_000_000;
+  let calls = 0;
+  Date.now = () => now;
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition(success) {
+      calls++;
+      success({ coords: { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 } });
+    },
+  } });
+  try {
+    State.paused = false;
+    State.settings = { ...oldSettings, weatherEnabled: true, weatherAutoLocation: true,
+      weatherLocateMe: true, weatherLocationUpdatedAt: now - 1_000 };
+    const backdrop = new WeatherBackdrop();
+    await backdrop.refreshLocation();
+    assert.equal(calls, 1);
+    now += 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 1);
+    now += 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 2);
+    now += 10 * 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 3);
+    now += 60 * 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 3);
+    now += 24 * 60 * 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 4);
+  } finally {
+    Date.now = oldNow;
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+    State.settings = oldSettings;
+    State.paused = oldPaused;
+  }
+});
+
+test("a later accurate startup fix replaces the saved city and ends startup retries", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  const oldDevice = Bridge.weatherSetDeviceLocation;
+  const oldNow = Date.now;
+  const oldSettings = State.settings;
+  const oldPaused = State.paused;
+  let now = 1_800_000_000_000;
+  let calls = 0;
+  Date.now = () => now;
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition(success) {
+      calls++;
+      success({ coords: calls === 1
+        ? { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 }
+        : { latitude: 28.2096, longitude: 83.9856, accuracy: 100 } });
+    },
+  } });
+  Bridge.weatherSetDeviceLocation = async (latitude, longitude) =>
+    ({ name: "Pokhara, Nepal", latitude, longitude });
+  try {
+    State.paused = false;
+    const saved = { name: "Kathmandu, Nepal", latitude: 27.7, longitude: 85.3 };
+    State.settings = { ...oldSettings, weatherEnabled: true, weatherAutoLocation: true,
+      weatherLocateMe: true, weatherLocation: saved, weatherLocationUpdatedAt: now - 1_000 };
+    const backdrop = new WeatherBackdrop();
+    await backdrop.refreshLocation();
+    assert.deepEqual(State.settings.weatherLocation, saved);
+    now += 2 * 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(State.settings.weatherLocation.name, "Pokhara, Nepal");
+    assert.equal(State.settings.weatherLocationUpdatedAt, now);
+    now += 10 * 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 2);
+  } finally {
+    Date.now = oldNow;
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+    Bridge.weatherSetDeviceLocation = oldDevice;
+    State.settings = oldSettings;
+    State.paused = oldPaused;
+  }
+});
+
+test("an in-flight IP lookup cannot replace Locate me's saved city", async () => {
+  const oldAuto = Bridge.weatherAutoLocation;
+  const oldSettings = State.settings;
+  const oldPaused = State.paused;
+  let finish;
+  Bridge.weatherAutoLocation = () => new Promise((resolve) => { finish = resolve; });
+  try {
+    State.paused = false;
+    const saved = { name: "Kathmandu, Nepal", latitude: 27.7, longitude: 85.3 };
+    State.settings = { ...oldSettings, weatherEnabled: true, weatherAutoLocation: true,
+      weatherLocateMe: false, weatherLocation: saved, weatherLocationUpdatedAt: 0 };
+    const pending = new WeatherBackdrop().refreshLocation();
+    State.settings.weatherLocateMe = true;
+    finish({ name: "Birgunj, Nepal (approximate IP location)", latitude: 27.0174, longitude: 84.8805 });
+    await pending;
+    assert.deepEqual(State.settings.weatherLocation, saved);
   } finally {
     Bridge.weatherAutoLocation = oldAuto;
+    State.settings = oldSettings;
+    State.paused = oldPaused;
+  }
+});
+
+test("failed Locate me checks retry daily, not hourly", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  const oldSettings = State.settings;
+  const oldPaused = State.paused;
+  let calls = 0;
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition(success) {
+      calls++;
+      success({ coords: { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 } });
+    },
+  } });
+  try {
+    State.paused = false;
+    State.settings = { ...oldSettings, weatherEnabled: true, weatherAutoLocation: true,
+      weatherLocateMe: true, weatherLocationUpdatedAt: 0 };
+    const backdrop = new WeatherBackdrop();
+    backdrop.startupLocationCheck = false;
+    backdrop.lastLocationAttempt = Date.now() - 2 * 60 * 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 0);
+    backdrop.lastLocationAttempt = Date.now() - 25 * 60 * 60_000;
+    await backdrop.refreshLocation();
+    assert.equal(calls, 1);
+  } finally {
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
     State.settings = oldSettings;
     State.paused = oldPaused;
   }
@@ -125,16 +308,19 @@ test("Locate me prefers a device position and does not call the IP provider", as
   let deviceCalls = 0;
   let ipCalls = 0;
   Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
-    getCurrentPosition(success) { success({ coords: { latitude: 27.7, longitude: 85.3 } }); },
+    getCurrentPosition(success, _error, options) {
+      assert.equal(options.enableHighAccuracy, true);
+      success({ coords: { latitude: 27.7, longitude: 85.3, accuracy: 50 } });
+    },
   } });
-  Bridge.weatherSetDeviceLocation = async (latitude, longitude) => {
+  Bridge.weatherSetDeviceLocation = async (latitude, longitude, accuracyMeters) => {
     deviceCalls++;
-    assert.deepEqual([latitude, longitude], [27.7, 85.3]);
-    return { name: "Current location", latitude, longitude };
+    assert.deepEqual([latitude, longitude, accuracyMeters], [27.7, 85.3, 50]);
+    return { name: "Kathmandu, Nepal", latitude, longitude };
   };
   Bridge.weatherAutoLocation = async () => { ipCalls++; return null; };
   try {
-    assert.equal((await locateMe(true))?.name, "Current location");
+    assert.equal((await locateMe())?.name, "Kathmandu, Nepal");
     assert.equal(deviceCalls, 1);
     assert.equal(ipCalls, 0);
   } finally {
@@ -142,6 +328,97 @@ test("Locate me prefers a device position and does not call the IP provider", as
     else delete navigator.geolocation;
     Bridge.weatherSetDeviceLocation = oldDevice;
     Bridge.weatherAutoLocation = oldAuto;
+  }
+});
+
+test("Locate me never switches to an IP city when device naming fails", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  const oldDevice = Bridge.weatherSetDeviceLocation;
+  const oldAuto = Bridge.weatherAutoLocation;
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition(success) { success({ coords: { latitude: 27.7, longitude: 85.3, accuracy: 100 } }); },
+  } });
+  Bridge.weatherSetDeviceLocation = async () => null;
+  let ipCalls = 0;
+  Bridge.weatherAutoLocation = async () => { ipCalls++; return null; };
+  try {
+    assert.equal(await locateMe(), null);
+    assert.equal(ipCalls, 0);
+  } finally {
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+    Bridge.weatherSetDeviceLocation = oldDevice;
+    Bridge.weatherAutoLocation = oldAuto;
+  }
+});
+
+test("a 25 km GeoClue fix is not accepted as a precise city", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    getCurrentPosition(success) {
+      success({ coords: { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 } });
+    },
+  } });
+  try {
+    assert.equal(await deviceWeatherLocation(), null);
+  } finally {
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+  }
+});
+
+test("Locate me waits for a better Wi-Fi fix and releases the location watch", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  let update;
+  const cleared = [];
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    watchPosition(success, _error, options) {
+      assert.equal(options.enableHighAccuracy, true);
+      update = success;
+      return 42;
+    },
+    clearWatch(id) { cleared.push(id); },
+  } });
+  try {
+    let settled = false;
+    const pending = deviceWeatherLocation().then((fix) => { settled = true; return fix; });
+    update({ coords: { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 } });
+    await Promise.resolve();
+    assert.equal(settled, false);
+    update({ coords: { latitude: 27.7, longitude: 85.3, accuracy: 250 } });
+    const fix = await pending;
+    assert.deepEqual([fix.latitude, fix.longitude, fix.accuracyMeters], [27.7, 85.3, 250]);
+    assert.deepEqual(cleared, [42]);
+  } finally {
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+  }
+});
+
+test("a watch with only coarse fixes times out without naming the wrong city", async () => {
+  const oldGeo = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+  const oldTimeout = window.setTimeout;
+  const oldClearTimeout = window.clearTimeout;
+  let expire;
+  let update;
+  let cleared = false;
+  window.setTimeout = (callback) => { expire = callback; return 9; };
+  window.clearTimeout = () => {};
+  Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+    watchPosition(success) { update = success; return 42; },
+    clearWatch(id) { assert.equal(id, 42); cleared = true; },
+  } });
+  try {
+    const pending = deviceWeatherLocation();
+    update({ coords: { latitude: 27.0174, longitude: 84.8805, accuracy: 25_000 } });
+    expire();
+    assert.equal(await pending, null);
+    assert.equal(cleared, true);
+  } finally {
+    if (oldGeo) Object.defineProperty(navigator, "geolocation", oldGeo);
+    else delete navigator.geolocation;
+    window.setTimeout = oldTimeout;
+    window.clearTimeout = oldClearTimeout;
   }
 });
 

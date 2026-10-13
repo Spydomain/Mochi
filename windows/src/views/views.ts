@@ -117,7 +117,35 @@ export function buildHeader(actions: ViewActions): ViewHost {
   // Plan usage pills (off by default): before the gear, Claude first, as on the Mac.
   const claudePill = buildPlanPill(false);
   const codexPill = buildPlanPill(true);
-  const planPills = h("div", { class: "plan-pills" }, claudePill.el, codexPill.el);
+  const batteryFill = h("span", { class: "battery-fill" });
+  const batteryIcon = h("span", { class: "battery-icon" }, batteryFill);
+  const batteryBolt = svg(ICONS.bolt, 11);
+  batteryBolt.classList.add("battery-bolt");
+  const batteryPlug = svg(ICONS.plug, 11);
+  batteryPlug.classList.add("battery-plug");
+  const batteryLabel = h("span", { class: "battery-label" });
+  const batteryPill = h("span", { class: "battery-status-pill", role: "status" },
+    batteryIcon, batteryBolt, batteryPlug, batteryLabel);
+  const awakeLabel = h("span", { text: "Awake" });
+  const awakeBtn = h("button", {
+    class: "keep-awake-pill",
+    type: "button",
+    onclick: async () => {
+      if (State.keepAwakePending) return;
+      State.keepAwakePending = true;
+      State.keepAwakeError = "";
+      State.notify();
+      try {
+        State.keepAwake = await Bridge.setKeepAwake(!State.keepAwake);
+      } catch (err) {
+        State.keepAwakeError = String(err);
+      } finally {
+        State.keepAwakePending = false;
+        State.notify();
+      }
+    },
+  }, svg(ICONS.sun, 12), awakeLabel);
+  const planPills = h("div", { class: "plan-pills" }, claudePill.el, codexPill.el, batteryPill, awakeBtn);
   let codexShown = false;
 
   function go(v: IslandViewName) {
@@ -155,9 +183,39 @@ export function buildHeader(actions: ViewActions): ViewHost {
     const codexOn = codexPillVisible();
     claudePill.el.style.display = claudeOn ? "" : "none";
     codexPill.el.style.display = codexOn ? "" : "none";
-    planPills.classList.toggle("on", claudeOn || codexOn);
+    const power = State.powerStatus;
+    const batteryOn = State.view === "overview" && power !== null;
+    batteryPill.style.display = batteryOn ? "" : "none";
+    if (power) {
+      const level = Math.max(0, Math.min(100, Math.round(power.level)));
+      const charging = power.charging ?? (power.pluggedIn && level < 100);
+      const status = charging ? "Charging" : power.pluggedIn
+        ? level === 100 ? "Fully charged" : "Plugged in, not charging"
+        : "On battery";
+      batteryLabel.textContent = `${level}%`;
+      batteryFill.style.width = `${level}%`;
+      batteryBolt.style.display = charging ? "" : "none";
+      batteryPlug.style.display = power.pluggedIn && !charging ? "" : "none";
+      batteryPill.classList.toggle("charging", charging);
+      batteryPill.classList.toggle("low", !power.pluggedIn && level <= 20);
+      batteryPill.title = `${status} · ${level}%`;
+      batteryPill.setAttribute("aria-label", `${status}, ${level}%`);
+    }
+    const awakeOn = State.os === "linux" && State.view === "overview" && (codexOn || State.keepAwake);
+    awakeBtn.style.display = awakeOn ? "" : "none";
+    awakeBtn.disabled = State.keepAwakePending;
+    awakeBtn.classList.toggle("on", State.keepAwake);
+    awakeBtn.classList.toggle("failed", !!State.keepAwakeError);
+    awakeBtn.setAttribute("aria-pressed", String(State.keepAwake));
+    awakeBtn.setAttribute("aria-label", State.keepAwake ? "Use system idle settings" : "Keep screen awake");
+    awakeBtn.title = State.keepAwakeError || (State.keepAwake
+      ? "Keep awake is on. Click to use normal system idle settings."
+      : "Keep screen awake until you turn this off or Mochi exits.");
+    awakeLabel.textContent = State.keepAwakeError ? "Unavailable" : "Awake";
+    planPills.classList.toggle("on", claudeOn || codexOn || batteryOn || awakeOn);
     // Both pills: the right side tightens so it still clears the screen edge.
     headerActions.classList.toggle("both-plans", claudeOn && codexOn);
+    headerActions.classList.toggle("with-battery", batteryOn);
     if (claudeOn) claudePill.sync();
     if (codexOn) codexPill.sync();
     // Codex is asked when its pill comes into view (stale answers only).

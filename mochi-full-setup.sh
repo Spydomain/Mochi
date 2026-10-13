@@ -15,9 +15,11 @@ BUILT_BINARY="$WINDOWS_DIR/target/release/mochi"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 BINARY="$DATA_HOME/mochi/bin/mochi"
+INSTALLED_REVISION="$DATA_HOME/mochi/installed-revision"
 DESKTOP_FILE="$DATA_HOME/applications/io.github.spydomain.mochi.desktop"
 LEGACY_DESKTOP_FILE="$DATA_HOME/applications/mochi.desktop"
 AUTOSTART_FILE="$CONFIG_HOME/autostart/mochi.desktop"
+CLEANUP_AUTOSTART_FILE="$CONFIG_HOME/autostart/mochi-session-cleanup.desktop"
 ICON_FILE="$DATA_HOME/icons/hicolor/128x128/apps/mochi.png"
 SETTINGS_FILE="$CONFIG_HOME/mochi/settings.json"
 PLUGIN_FILE="$CONFIG_HOME/opencode/plugins/mochi.js"
@@ -37,6 +39,8 @@ NO_LAUNCH=0
 CHECK_ONLY=0
 CHECK_MISSING=0
 NODE_VERSION="v24.21.0"
+PACKAGE_MANAGER=""
+DISTRO_NAME=""
 
 for arg in "$@"; do
   case "$arg" in
@@ -60,14 +64,40 @@ run_as_root() {
   fi
 }
 
+detect_linux() {
+  [[ "$(uname -s)" == Linux ]] || die 'This setup script is for Linux desktops only.'
+  [[ ! -e /run/ostree-booted ]] || die 'This is an OSTree/immutable Linux host. Package layering requires a reboot; this one-run source installer will not change the base image.'
+  local release_file="${MOCHI_OS_RELEASE_FILE:-/etc/os-release}" id like candidate
+  [[ -r "$release_file" ]] || die "Cannot read Linux distribution metadata: $release_file"
+  # os-release is a shell-compatible system file; use only its ID fields.
+  id="$(. "$release_file"; printf '%s' "${ID:-}")"
+  like="$(. "$release_file"; printf '%s' "${ID_LIKE:-}")"
+  DISTRO_NAME="$(. "$release_file"; printf '%s' "${PRETTY_NAME:-${NAME:-$id}}")"
+  for candidate in $id $like; do
+    case "$candidate" in
+      arch|archlinux|manjaro|endeavouros|cachyos) PACKAGE_MANAGER=pacman; break ;;
+      debian|ubuntu|linuxmint|pop|elementary|kali) PACKAGE_MANAGER=apt-get; break ;;
+      fedora|rhel|centos|rocky|almalinux) PACKAGE_MANAGER=dnf; break ;;
+      opensuse*|suse|sles) PACKAGE_MANAGER=zypper; break ;;
+    esac
+  done
+  [[ -n "$PACKAGE_MANAGER" ]] || die "Unsupported Linux distribution: $DISTRO_NAME ($id, ID_LIKE=$like). No packages were changed."
+  command -v "$PACKAGE_MANAGER" >/dev/null 2>&1 || die "$DISTRO_NAME requires $PACKAGE_MANAGER, but it is not installed."
+  log "Detected $DISTRO_NAME; using $PACKAGE_MANAGER."
+}
+
+has_user_systemd() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
 missing_packages() {
   local package
   for package in "$@"; do
-    if command -v pacman >/dev/null 2>&1; then
-      pacman -Qq "$package" >/dev/null 2>&1 || printf '%s\n' "$package"
-    else
-      dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$' || printf '%s\n' "$package"
-    fi
+    case "$PACKAGE_MANAGER" in
+      pacman) pacman -Qq "$package" >/dev/null 2>&1 || printf '%s\n' "$package" ;;
+      apt-get) dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q '^install ok installed$' || printf '%s\n' "$package" ;;
+      dnf|zypper) rpm -q "$package" >/dev/null 2>&1 || printf '%s\n' "$package" ;;
+    esac
   done
 }
 
@@ -120,18 +150,31 @@ ensure_node() {
 
 install_system_dependencies() {
   local -a packages missing
-  if command -v pacman >/dev/null 2>&1; then
+  case "$PACKAGE_MANAGER" in
+  pacman)
     packages=(base-devel git curl file pkgconf gtk3 webkit2gtk-4.1 geoclue
-      gtk-layer-shell libayatana-appindicator librsvg openssl dbus xdotool playerctl iproute2
+      gtk-layer-shell libayatana-appindicator librsvg openssl dbus xdg-desktop-portal xdotool playerctl iproute2
       gst-plugins-base gst-plugins-good gst-plugins-bad)
-  elif command -v apt-get >/dev/null 2>&1; then
+    ;;
+  apt-get)
     packages=(build-essential git curl file pkg-config libgtk-3-dev
       libwebkit2gtk-4.1-dev geoclue-2.0 libgtk-layer-shell-dev libayatana-appindicator3-dev
-      librsvg2-dev libssl-dev libdbus-1-dev libxdo-dev patchelf playerctl iproute2
+      librsvg2-dev libssl-dev libdbus-1-dev xdg-desktop-portal libxdo-dev patchelf playerctl iproute2
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad)
-  else
-    die 'Supported package managers: pacman or apt-get.'
-  fi
+    ;;
+  dnf)
+    packages=(gcc gcc-c++ make git curl file pkgconf-pkg-config gtk3-devel
+      webkit2gtk4.1-devel geoclue2 gtk-layer-shell-devel libayatana-appindicator-gtk3-devel
+      librsvg2-devel openssl-devel dbus-devel xdg-desktop-portal libxdo-devel patchelf playerctl iproute
+      gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free)
+    ;;
+  zypper)
+    packages=(gcc gcc-c++ make git curl file pkg-config gtk3-devel
+      webkit2gtk3-devel geoclue2 gtk-layer-shell-devel libappindicator3-devel
+      librsvg-devel libopenssl-devel dbus-1-devel xdg-desktop-portal xdotool-devel patchelf playerctl iproute2
+      gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugins-bad)
+    ;;
+  esac
   mapfile -t missing < <(missing_packages "${packages[@]}")
   if ((${#missing[@]} == 0)); then
     log 'System dependencies are installed.'
@@ -142,12 +185,12 @@ install_system_dependencies() {
     CHECK_MISSING=1
     return
   fi
-  if command -v pacman >/dev/null 2>&1; then
-    run_as_root pacman -S --needed --noconfirm "${missing[@]}"
-  else
-    run_as_root apt-get update
-    run_as_root apt-get install -y "${missing[@]}"
-  fi
+  case "$PACKAGE_MANAGER" in
+    pacman) run_as_root pacman -S --needed --noconfirm "${missing[@]}" ;;
+    apt-get) run_as_root apt-get update; run_as_root apt-get install -y "${missing[@]}" ;;
+    dnf) run_as_root dnf install -y "${missing[@]}" ;;
+    zypper) run_as_root zypper --non-interactive install "${missing[@]}" ;;
+  esac
 }
 
 ensure_checkout() {
@@ -197,8 +240,8 @@ ensure_opencode() {
 }
 
 build_app() {
-  log 'Installing JavaScript dependencies and building release app.'
-  (cd "$WINDOWS_DIR" && npm ci && ./node_modules/.bin/tauri build --no-bundle)
+  log 'Installing JavaScript dependencies, checking app behaviour, and building release app.'
+  (cd "$WINDOWS_DIR" && npm ci && npm test && ./node_modules/.bin/tauri build --no-bundle)
   [[ -x "$BUILT_BINARY" && -x "$WINDOWS_DIR/target/release/mochi-hook" ]] || die 'Release app or relay is missing.'
 }
 
@@ -220,17 +263,19 @@ retire_previous_autostart() {
     install -d -m 700 "$AUTOSTART_BACKUP_DIR"
     mv -- "$OLD_AUTOSTART_FILE" "$AUTOSTART_BACKUP_DIR/coucou.desktop.disabled.$(date +%s%N)"
   fi
-  if [[ -f "$SYSTEMD_DIR/$OLD_APP_SERVICE" ]] &&
+  if has_user_systemd && [[ -f "$SYSTEMD_DIR/$OLD_APP_SERVICE" ]] &&
       grep -Fq "ExecStart=$OLD_BINARY" "$SYSTEMD_DIR/$OLD_APP_SERVICE"; then
     systemctl --user disable --now "$OLD_APP_SERVICE" >/dev/null || die 'Could not stop the previous app service.'
   fi
-  if [[ -f "$SYSTEMD_DIR/$OLD_CLEANUP_TIMER" ]]; then
+  if has_user_systemd && [[ -f "$SYSTEMD_DIR/$OLD_CLEANUP_TIMER" ]]; then
     systemctl --user disable --now "$OLD_CLEANUP_TIMER" >/dev/null 2>&1 || true
   fi
 }
 
 install_files() {
   local desktop_session="${XDG_CURRENT_DESKTOP:-${XDG_SESSION_DESKTOP:-}}"
+  local user_systemd=0
+  has_user_systemd && user_systemd=1
   [[ -z "${NIRI_SOCKET:-}" ]] || desktop_session="niri"
   mkdir -p "$(dirname "$DESKTOP_FILE")" "$(dirname "$AUTOSTART_FILE")" "$(dirname "$ICON_FILE")" "$(dirname "$SETTINGS_FILE")" "$(dirname "$PLUGIN_FILE")" "$(dirname "$HOOK_FILE")" "$SYSTEMD_DIR"
   migrate_previous_settings
@@ -267,9 +312,26 @@ install_files() {
     printf '[Desktop Entry]\nType=Application\nName=Mochi\nComment=Desktop companion and media controls\nExec="%s"\nIcon=mochi\nTerminal=false\nCategories=Utility;\nX-Mochi-Managed=true\n' "$BINARY" > "$DESKTOP_FILE"
     chmod 644 "$DESKTOP_FILE"
   fi
-  printf '[Unit]\nDescription=Mochi OpenCode session cleanup\n\n[Service]\nType=oneshot\nWorkingDirectory=%%h\nExecStart=%s\n' "$CLEANUP_FILE" > "$SYSTEMD_DIR/mochi-opencode-cleanup.service"
-  printf '[Unit]\nDescription=Remove Mochi chat sessions older than 30 days\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1d\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' > "$SYSTEMD_DIR/mochi-opencode-cleanup.timer"
-  if [[ "${desktop_session,,}" == *niri* ]]; then
+  # WebKitGTK/GeoClue identifies the app by this desktop-file basename. The
+  # installer provides it, but cannot make a coarse OS position accurate.
+  [[ "${DESKTOP_FILE##*/}" == 'io.github.spydomain.mochi.desktop' ]] || die 'GeoClue desktop identity does not match Mochi.'
+  log 'Device location needs desktop permission and a fix accurate to 5 km; use Find city if GeoClue only reports an approximate position.'
+  if ((user_systemd)); then
+    printf '[Unit]\nDescription=Mochi OpenCode session cleanup\n\n[Service]\nType=oneshot\nWorkingDirectory=%%h\nExecStart=%s\n' "$CLEANUP_FILE" > "$SYSTEMD_DIR/mochi-opencode-cleanup.service"
+    printf '[Unit]\nDescription=Remove Mochi chat sessions older than 30 days\n\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=1d\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n' > "$SYSTEMD_DIR/mochi-opencode-cleanup.timer"
+    if [[ -f "$CLEANUP_AUTOSTART_FILE" ]] && grep -Fqx 'X-Mochi-Managed=true' "$CLEANUP_AUTOSTART_FILE"; then
+      rm -- "$CLEANUP_AUTOSTART_FILE"
+    fi
+  else
+    # Non-systemd desktops can still clean old Mochi chats on every login.
+    if [[ -e "$CLEANUP_AUTOSTART_FILE" ]] && ! grep -Fqx 'X-Mochi-Managed=true' "$CLEANUP_AUTOSTART_FILE"; then
+      log "Preserved existing cleanup entry: $CLEANUP_AUTOSTART_FILE"
+    else
+      printf '[Desktop Entry]\nType=Application\nName=Mochi chat cleanup\nExec="%s"\nNoDisplay=true\nX-Mochi-Managed=true\n' "$CLEANUP_FILE" > "$CLEANUP_AUTOSTART_FILE"
+      chmod 644 "$CLEANUP_AUTOSTART_FILE"
+    fi
+  fi
+  if [[ "${desktop_session,,}" == *niri* ]] && ((user_systemd)); then
     # Niri gets one graphical-session service. systemd's XDG generator treats
     # renamed files *inside* autostart/ as launchers too, so move old entries
     # completely outside that directory. Keep them as recoverable backups.
@@ -293,12 +355,16 @@ install_files() {
     chmod 644 "$AUTOSTART_FILE"
     grep -Fq "Exec=\"$BINARY\"" "$AUTOSTART_FILE" || die 'Autostart entry was not written correctly.'
   fi
-  systemctl --user daemon-reload >/dev/null || die 'Could not reload user services.'
-  systemctl --user enable --now mochi-opencode-cleanup.timer >/dev/null || die 'Could not enable session cleanup timer.'
-  if [[ "${desktop_session,,}" == *niri* ]]; then
-    systemctl --user enable mochi-app.service >/dev/null || die 'Could not enable Niri autostart service.'
+  if ((user_systemd)); then
+    systemctl --user daemon-reload >/dev/null || die 'Could not reload user services.'
+    systemctl --user enable --now mochi-opencode-cleanup.timer >/dev/null || die 'Could not enable session cleanup timer.'
+    if [[ "${desktop_session,,}" == *niri* ]]; then
+      systemctl --user enable mochi-app.service >/dev/null || die 'Could not enable Niri autostart service.'
+    else
+      systemctl --user disable --now mochi-app.service >/dev/null 2>&1 || true
+    fi
   else
-    systemctl --user disable --now mochi-app.service >/dev/null 2>&1 || true
+    log 'No running user systemd; using XDG autostart and login-time session cleanup.'
   fi
   retire_previous_autostart
   log 'Created application menu and one desktop autostart method.'
@@ -332,8 +398,22 @@ start_app() {
   log "Mochi running (PID $pid)."
 }
 
+record_install_revision() {
+  local revision marker_file
+  revision="$(git -C "$MOCHI_DIR" rev-parse HEAD 2>/dev/null || true)"
+  if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]]; then
+    revision=unknown
+  elif [[ -n "$(git -C "$MOCHI_DIR" status --porcelain --untracked-files=normal)" ]]; then
+    revision="$revision dirty"
+  fi
+  marker_file="$(mktemp "$DATA_HOME/mochi/.installed-revision.XXXXXX")"
+  printf '%s\n' "$revision" > "$marker_file"
+  mv -f -- "$marker_file" "$INSTALLED_REVISION"
+}
+
 ((EUID != 0)) || die 'Run setup as your desktop user, without sudo; it requests sudo only when system packages are missing.'
 export PATH="$HOME/.cargo/bin:$HOME/.opencode/bin:$HOME/.local/bin:$PATH"
+detect_linux
 install_system_dependencies
 if ((CHECK_ONLY)); then
   node_is_supported || { log 'Node.js 22.20+ or 24.12+ with npm is needed; setup can download Node.js 24 LTS.'; CHECK_MISSING=1; }
@@ -350,8 +430,9 @@ build_app
 install_files
 opencode service start >/dev/null || die 'Could not start the OpenCode background service.'
 if ((NO_LAUNCH)); then
-  log 'Setup complete. Launch skipped (--no-launch).'
+  log 'Launch skipped (--no-launch).'
 else
   start_app
-  log 'Setup complete.'
 fi
+record_install_revision
+log 'Setup complete.'

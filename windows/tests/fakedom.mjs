@@ -57,6 +57,9 @@ class FakeElement {
   get firstChild() {
     return this.childNodes[0] ?? null;
   }
+  get lastElementChild() {
+    return this.children.at(-1) ?? null;
+  }
   get textContent() {
     return this.childNodes.map((n) => n.textContent).join("");
   }

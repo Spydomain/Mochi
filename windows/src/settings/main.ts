@@ -890,6 +890,8 @@ let weatherRedraw: (() => void) | null = null;
 let weatherLocationResult: ((ok: boolean) => void) | null = null;
 
 function weatherSection(): HTMLElement {
+  const locationName = (location: WeatherLocation) => location.name === "Current location"
+    ? "Finding city name…" : location.name;
   const city = h("input", { type: "text", placeholder: "City, Country", maxlength: "80",
     "aria-label": "Weather city", style: "min-width:200px" }) as HTMLInputElement;
   const status = h("div", { class: "hint", role: "status" });
@@ -902,6 +904,20 @@ function weatherSection(): HTMLElement {
   const remove = h("button", { text: "Remove location" });
   let busy = false;
   let forecastKey = "";
+  let lastForecast: { key: string; text: string } | null = null;
+  let locateFailed = false;
+  let locating = false;
+
+  const locationKey = (location: WeatherLocation) =>
+    `${location.latitude},${location.longitude},${location.name}`;
+  const locateNote = () => {
+    if (!settings.weatherLocateMe || !settings.weatherEnabled) return "";
+    if (locating) return " · Checking device location…";
+    if (locateFailed) return " · Accurate device location unavailable; using saved city. Mochi will retry tomorrow.";
+    return settings.weatherLocationUpdatedAt === 0
+      ? " · Using saved city until an accurate device fix is available."
+      : " · Locate me mode";
+  };
 
   const showLocation = () => {
     const location = settings.weatherLocation;
@@ -910,23 +926,28 @@ function weatherSection(): HTMLElement {
     enabled.toggleAttribute("disabled", busy);
     if (location && !busy) remove.removeAttribute("disabled");
     else remove.setAttribute("disabled", "");
+    const forecast = location && settings.weatherEnabled && lastForecast?.key === locationKey(location)
+      ? lastForecast.text : null;
     status.textContent = location
-      ? `${location.name} · ${settings.weatherEnabled ? "Weather on" : "Weather off"}${settings.weatherLocateMe ? " · Locate me mode" : settings.weatherAutoLocation ? " · IP location" : " · Custom city"}`
+      ? `${locationName(location)} · ${forecast ?? (settings.weatherEnabled ? "Weather on" : "Weather off")}${settings.weatherLocateMe ? locateNote() : settings.weatherAutoLocation ? " · IP location" : " · Custom city"}`
       : settings.weatherLocateMe && settings.weatherEnabled
-        ? "Locating device; approximate IP location will be used if unavailable…"
+        ? locateFailed ? "Accurate device location unavailable. Use Find city or try again later."
+          : "Looking for an accurate device position…"
         : settings.weatherEnabled ? "Choose Locate me or find a city." : "Weather off. Choose Locate me or find a city.";
   };
   weatherRedraw = () => {
+    if (!settings.weatherLocateMe) { locateFailed = false; locating = false; }
     showLocation();
     const location = settings.weatherLocation;
-    const key = settings.weatherEnabled && location ? `${location.latitude},${location.longitude}` : "";
+    const key = settings.weatherEnabled && location ? locationKey(location) : "";
     if (key && key !== forecastKey && location) void showForecast(location);
     forecastKey = key;
   };
   weatherLocationResult = (ok) => {
-    if (!ok && settings.weatherLocateMe && !settings.weatherLocation) {
-      status.textContent = "Location unavailable. Mochi will retry later, or use Find city.";
-    }
+    if (!settings.weatherLocateMe) return;
+    locating = false;
+    locateFailed = !ok;
+    showLocation();
   };
 
   const showForecast = async (location: WeatherLocation) => {
@@ -937,7 +958,11 @@ function weatherSection(): HTMLElement {
     const range = report.highC != null && report.lowC != null
       ? ` · Today ${Math.round(report.lowC)}–${Math.round(report.highC)}°C`
       : "";
-    status.textContent = `${location.name} · ${Math.round(report.temperatureC)}°C · ${weatherDescription(report.weatherCode)}${range}`;
+    lastForecast = {
+      key: locationKey(location),
+      text: `${Math.round(report.temperatureC)}°C · ${weatherDescription(report.weatherCode)}${range}`,
+    };
+    showLocation();
   };
 
   const activate = async (location: WeatherLocation) => {
@@ -946,6 +971,8 @@ function weatherSection(): HTMLElement {
     settings.weatherAutoLocation = false;
     settings.weatherLocateMe = false;
     settings.weatherLocationUpdatedAt = 0;
+    locateFailed = false;
+    locating = false;
     showLocation();
     await save();
     await showForecast(location);
@@ -962,9 +989,11 @@ function weatherSection(): HTMLElement {
     settings.weatherAutoLocation = true;
     settings.weatherLocateMe = true;
     settings.weatherLocationUpdatedAt = 0;
-    settings.weatherLocation = null;
-    forecastKey = "";
-    status.textContent = "Locating device; approximate IP location will be used if unavailable…";
+    locateFailed = false;
+    locating = true;
+    // Keep the last selected city while a new device fix is attempted. A
+    // failed or coarse fix must never replace it with an unrelated IP city.
+    status.textContent = "Looking for an accurate device position…";
     try {
       await save();
     } catch (err) {
@@ -1003,6 +1032,8 @@ function weatherSection(): HTMLElement {
     settings.weatherAutoLocation = false;
     settings.weatherLocateMe = false;
     settings.weatherLocationUpdatedAt = 0;
+    locateFailed = false;
+    locating = false;
     showLocation();
     void save();
   });
@@ -1010,7 +1041,7 @@ function weatherSection(): HTMLElement {
 
   return h("section", {},
     h("h2", { text: "Weather background" }),
-    h("div", { class: "hint", text: "Night sky uses local time offline. Locate me is opt-in: it checks device location when Mochi starts after login and once daily while running. If device positioning is unavailable, it uses approximate IP location from ipwho.is instead. Find city saves a fixed custom location. Chosen coordinates go to Open-Meteo for weather at most every 15 minutes while enabled. IP location may be inaccurate, especially with VPNs." }),
+    h("div", { class: "hint", text: "Night sky uses local time offline. Locate me is opt-in: it requests a fresh, accurate device position at startup and daily. Coarse fixes (over 5 km accuracy) are rejected rather than shown as an exact city; Mochi keeps your saved city and retries. Device coordinates go to OpenStreetMap Nominatim for a city name (© OpenStreetMap contributors), and to Open-Meteo for weather at most every 15 minutes while enabled. If your device cannot provide an accurate position, use Find city to save a fixed city. Existing IP-only preferences still use approximate IP location from ipwho.is; Locate me does not silently switch to IP." }),
     h("div", { class: "row" }, h("label", { text: "Live weather" }), enabled, status),
     h("div", { class: "row" }, city, search, locate, remove),
   );

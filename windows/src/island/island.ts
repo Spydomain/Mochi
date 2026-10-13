@@ -1305,6 +1305,10 @@ export class Island {
     const sync = async () => {
       const power = await Bridge.powerStatus();
       if (!power) {
+        if (State.powerStatus !== null) {
+          State.powerStatus = null;
+          State.notify();
+        }
         // Desktop PCs have no battery: avoid waking Rust every 1.5 seconds
         // forever just to discover the same absent sysfs device.
         if (hasBattery !== false) {
@@ -1313,6 +1317,11 @@ export class Island {
           hasBattery = false;
         }
         return;
+      }
+      if (State.powerStatus?.level !== power.level || State.powerStatus?.pluggedIn !== power.pluggedIn
+        || State.powerStatus?.charging !== power.charging) {
+        State.powerStatus = power;
+        State.notify();
       }
       if (hasBattery === false) {
         window.clearInterval(timer);

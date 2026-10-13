@@ -14,6 +14,7 @@ mod i18n;
 mod identity;
 mod integrations;
 mod island;
+mod keep_awake;
 mod local_chat;
 mod log;
 mod media;
@@ -147,7 +148,7 @@ async fn weather_auto_location(app: AppHandle, shared: State<'_, Shared>, force:
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     {
         let settings = shared.settings.lock().unwrap();
-        if !settings.weather_enabled || !settings.weather_auto_location || integrations::PAUSED.load(Ordering::Relaxed) {
+        if !settings.weather_enabled || !settings.weather_auto_location || settings.weather_locate_me || integrations::PAUSED.load(Ordering::Relaxed) {
             return Err("Automatic weather location is off or Mochi is paused.".into());
         }
         if !force && now.saturating_sub(settings.weather_location_updated_at) < DAY_MS {
@@ -161,7 +162,7 @@ async fn weather_auto_location(app: AppHandle, shared: State<'_, Shared>, force:
     let location = weather::ip_location().await?;
     let updated = {
         let mut settings = shared.settings.lock().unwrap();
-        if !settings.weather_enabled || !settings.weather_auto_location {
+        if !settings.weather_enabled || !settings.weather_auto_location || settings.weather_locate_me {
             return Err("Automatic weather location was turned off.".into());
         }
         settings.weather_location = Some(location.clone());
@@ -177,22 +178,45 @@ async fn weather_auto_location(app: AppHandle, shared: State<'_, Shared>, force:
 }
 
 #[tauri::command]
-fn weather_set_device_location(
+async fn weather_set_device_location(
     app: AppHandle,
     shared: State<'_, Shared>,
     latitude: f64,
     longitude: f64,
+    accuracy_meters: f64,
 ) -> Result<weather::WeatherLocation, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let location = weather::WeatherLocation {
-        name: "Current location".into(),
-        latitude,
-        longitude,
-    };
-    if !location.valid() {
+    if !(weather::WeatherLocation { name: String::new(), latitude, longitude }).valid() {
         return Err("Invalid device location.".into());
     }
+    if !weather::valid_device_accuracy(accuracy_meters) {
+        return Err("Device location is too approximate to identify a city.".into());
+    }
+    let cached_name = {
+        let settings = shared.settings.lock().unwrap();
+        if !settings.weather_enabled || !settings.weather_auto_location || !settings.weather_locate_me {
+            return Err("Locate me is off.".into());
+        }
+        settings.weather_location.as_ref().filter(|old| {
+            old.name != "Current location"
+                && !old.name.starts_with("Device location")
+                && !old.name.contains("approximate IP location")
+                && (old.latitude - latitude).abs() < 0.01
+                && (old.longitude - longitude).abs() < 0.01
+        }).map(|old| old.name.clone())
+    };
+    let location = if let Some(name) = cached_name {
+        weather::WeatherLocation { name, latitude, longitude }
+    } else {
+        weather::device_location(latitude, longitude).await.unwrap_or_else(|_| {
+            weather::WeatherLocation {
+                name: "Device location (city unavailable)".into(),
+                latitude,
+                longitude,
+            }
+        })
+    };
     let updated = {
         let mut settings = shared.settings.lock().unwrap();
         if !settings.weather_enabled || !settings.weather_auto_location || !settings.weather_locate_me {
@@ -419,6 +443,19 @@ fn open_file_in_vscode(path: String) -> bool {
 #[tauri::command]
 fn quit_app(app: AppHandle) {
     app.exit(0);
+}
+
+/// The toggle is intentionally not saved: every new Mochi process starts off.
+#[tauri::command]
+fn keep_awake_status() -> bool {
+    keep_awake::active()
+}
+
+#[tauri::command]
+async fn set_keep_awake(enabled: bool) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || keep_awake::set(enabled))
+        .await
+        .map_err(|err| format!("Could not update keep awake: {err}"))?
 }
 
 /// Tray → Pause. Paused means paused: the pollers stop talking to the network,
@@ -865,6 +902,8 @@ pub fn run() {
             open_claude_desktop,
             open_file_in_vscode,
             quit_app,
+            keep_awake_status,
+            set_keep_awake,
             hooks_status,
             agent_hooks_status,
             hooks_preview,

@@ -27,9 +27,11 @@ test("a desktop without a battery backs off power polling and recovers if one ap
     assert.deepEqual(cleared, [1]);
     scheduled[1].fn();
     await Promise.resolve();
+    assert.equal(State.powerStatus.level, 75);
     assert.deepEqual(scheduled.map((x) => x.ms), [1_500, 30_000, 1_500]);
     assert.deepEqual(cleared, [1, 2]);
   } finally {
+    State.powerStatus = null;
     Bridge.powerStatus = originalPower;
     window.setInterval = originalSet;
     window.clearInterval = originalClear;
@@ -61,6 +63,7 @@ test("both power transitions start a reaction, but the initial reading does not"
     assert.deepEqual(events, ["plug:63", "unplug:63"]);
     assert.equal(island.root.classList.contains("charging"), false);
   } finally {
+    State.powerStatus = null;
     Bridge.powerStatus = originalPowerStatus;
     window.setInterval = originalInterval;
   }
@@ -99,6 +102,7 @@ test("low battery opens at 20, 10 and 5 percent without repeated popups", async 
       { pluggedIn: false, level: 19, low: true },
     ]);
   } finally {
+    State.powerStatus = null;
     Bridge.powerStatus = originalPowerStatus;
     window.setInterval = originalInterval;
   }

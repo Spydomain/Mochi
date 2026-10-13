@@ -11,6 +11,9 @@ const WEATHER_INTERVAL = 15 * 60_000;
 const STALE_AFTER = 45 * 60_000;
 const LOCATION_INTERVAL = 24 * 60 * 60_000;
 const LOCATION_RETRY = 60 * 60_000;
+// GeoClue and the network can become ready after the graphical session starts.
+// Keep these retries bounded so a machine with only a coarse fix stays quiet.
+const STARTUP_RETRY_DELAYS = [2 * 60_000, 10 * 60_000];
 
 export class WeatherBackdrop {
   private report: WeatherReport | null = null;
@@ -23,6 +26,8 @@ export class WeatherBackdrop {
   private lastLocationAttempt = 0;
   private locationPending = false;
   private startupLocationCheck = true;
+  private startupFailures = 0;
+  private nextStartupAttemptAt = 0;
   private previousLocateMe = false;
 
   start() {
@@ -40,7 +45,11 @@ export class WeatherBackdrop {
   }
 
   settingsChanged() {
-    if (State.settings.weatherLocateMe && !this.previousLocateMe) this.lastLocationAttempt = 0;
+    if (State.settings.weatherLocateMe
+      && (!this.previousLocateMe || State.settings.weatherLocationUpdatedAt === 0)) {
+      this.lastLocationAttempt = 0;
+      this.nextStartupAttemptAt = 0;
+    }
     this.previousLocateMe = State.settings.weatherLocateMe;
     this.generation++;
     this.fetchedAt = 0;
@@ -61,19 +70,22 @@ export class WeatherBackdrop {
     if (!settings.weatherEnabled || !settings.weatherAutoLocation || State.paused || this.locationPending) return;
     const now = Date.now();
     const startup = this.startupLocationCheck && settings.weatherLocateMe;
-    if ((!startup && now - settings.weatherLocationUpdatedAt < LOCATION_INTERVAL)
-      || now - this.lastLocationAttempt < LOCATION_RETRY) return;
-    this.startupLocationCheck = false;
+    const retryInterval = settings.weatherLocateMe ? LOCATION_INTERVAL : LOCATION_RETRY;
+    if (startup ? now < this.nextStartupAttemptAt
+      : now - settings.weatherLocationUpdatedAt < LOCATION_INTERVAL
+        || now - this.lastLocationAttempt < retryInterval) return;
     this.lastLocationAttempt = now;
     this.locationPending = true;
+    const locateMode = settings.weatherLocateMe;
     let succeeded = false;
     try {
       // Existing IP-only users retain their original daily check. "Locate me"
-      // tries the device on each app start, then an IP fallback if necessary.
-      const location = settings.weatherLocateMe
-        ? await locateMe(startup)
+      // never upgrades a coarse GeoClue/IP fix into a falsely precise city.
+      const location = locateMode
+        ? await locateMe()
         : await Bridge.weatherAutoLocation();
-      if (!location || !State.settings.weatherEnabled || !State.settings.weatherAutoLocation) return;
+      if (!location || !State.settings.weatherEnabled || !State.settings.weatherAutoLocation
+        || State.settings.weatherLocateMe !== locateMode) return;
       succeeded = true;
       // On startup the native settings-changed event can arrive before the
       // listener is registered. Apply the command result directly as well so
@@ -86,6 +98,15 @@ export class WeatherBackdrop {
       console.warn("[mochi] Automatic weather location unavailable", err);
     } finally {
       this.locationPending = false;
+      if (startup && State.settings.weatherLocateMe) {
+        if (succeeded) this.startupLocationCheck = false;
+        else {
+          this.startupFailures++;
+          if (this.startupFailures <= STARTUP_RETRY_DELAYS.length) {
+            this.nextStartupAttemptAt = Date.now() + STARTUP_RETRY_DELAYS[this.startupFailures - 1];
+          } else this.startupLocationCheck = false;
+        }
+      }
       void emitToWindow("settings", "weather-location-result", { ok: succeeded });
     }
   }

@@ -1,63 +1,54 @@
-# Mochi for Windows
+# Mochi on Windows
 
-Mochi is a desktop companion for Windows. It lives at the top of the screen and can display agent activity, receive permission prompts, provide chat, accept dropped files, and offer configurable shortcuts and integrations.
+Mochi is a compact desktop companion for coding-agent activity, chat, media, shortcuts, and system status. This directory contains the shared web interface and Tauri desktop application. The [main guide](../README.md) covers the automated Linux installation; Windows is built from source here.
 
-**Mochi is a modified version of [Coucou](https://github.com/Louis-CFM/coucou), adapted and extended for this project. Special thanks to [Louis-CFM](https://github.com/Louis-CFM) and the Coucou project for the original foundation.**
+![Mochi's shared interface running on Linux](../docs/media/mochi-overview.png)
 
-## Official project and ownership
-
-Mochi is maintained by Spydomain. The official project home, source repository, and ownership reference are:
-
-https://github.com/Spydomain/Mochi
-
-Use this repository URL as the canonical source for Mochi.
+*The screenshot shows the shared interface on Linux. Window behavior and available integrations can differ on Windows.*
 
 ## Requirements
 
-- Windows 10 or Windows 11
-- Node.js 20 or newer
-- Rust, installed with [rustup](https://rustup.rs)
-- Visual Studio Build Tools with the **Desktop development with C++** workload
+- Windows 10 or 11 with Microsoft Edge WebView2 Runtime.
+- Node.js 20 or newer and npm.
+- Rust and Cargo installed through [rustup](https://rustup.rs/).
+- Visual Studio Build Tools with the **Desktop development with C++** workload and a compatible Windows SDK.
 
-WebView2 is available on supported Windows installations.
+Install Git if it is not already available. Run the commands below in PowerShell as your normal user. A source build downloads npm and Cargo dependencies and needs Internet access on its first run.
 
-## Run a development build
+## Get started
 
 ```powershell
 git clone https://github.com/Spydomain/Mochi.git
-cd Mochi/windows
+cd Mochi\windows
 npm ci
 npm run tauri dev
 ```
 
-## Build a Windows package
+`npm run tauri dev` builds the hook and launches the development app. If the Rust toolchain or C++ workload is missing, resolve that prerequisite before retrying.
 
-```powershell
-cd windows
-npm run pack
-```
+## Test and package
 
-The installer is written to `windows/release/`. A locally built executable is available under `windows/target/release/`.
-
-## Test and validate
+From the `windows` directory:
 
 ```powershell
 npm test
 npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+npm run pack
 ```
 
-Run backend tests from `windows/src-tauri/`:
+`npm run pack` builds release bundles and copies the Windows installers to `windows\release\`. Tauri's raw release artifacts remain under `windows\target\release\`. Packaging availability depends on the Windows build environment; inspect the command's output for the actual installer paths.
 
-```powershell
-cargo test
-```
+## Configuration and local data
 
-## Application data
+| Item | Path |
+| --- | --- |
+| Preferences and custom sounds | `%APPDATA%\Mochi` |
+| Logs, inbox, and helper binaries | `%LOCALAPPDATA%\Mochi` |
+| App log | `%LOCALAPPDATA%\Mochi\mochi.log` |
 
-- Settings and user data: `%APPDATA%\\Mochi`
-- Logs: `%LOCALAPPDATA%\\Mochi\\mochi.log`
-- Custom sounds: `%APPDATA%\\Mochi\\sounds`
+OpenCode and other coding-agent integrations use their own installed binaries and credentials. Mochi does not bundle a model or replace their permission controls. Feature availability varies by operating system: Linux MPRIS, Niri autostart, and Linux location-service notes in the [main guide](../README.md) are not Windows setup instructions.
 
-## Repository automation
+For the optional Apple Live Activity integration, see the separate [relay guide](../relay/README.md); it is not needed to build or use this Windows app.
 
-This repository has no `.github` directory and no GitHub Actions workflow definitions. GitHub Actions are not configured from this repository.
+**Mochi is a modified version of [Coucou](https://github.com/Louis-CFM/coucou). Special thanks to [Louis-CFM](https://github.com/Louis-CFM) and the Coucou project for the original foundation.**

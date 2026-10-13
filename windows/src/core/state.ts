@@ -18,6 +18,12 @@ import type { WeatherLocation, WeatherReport } from "./weather";
 export type AgentSource = "claudeCode" | "n8n" | "agent";
 export type PillBadge = "approval" | "finished" | "error";
 
+export interface PowerStatus {
+  pluggedIn: boolean;
+  charging: boolean;
+  level: number;
+}
+
 export interface AgentTask {
   id: string;
   name: string;
@@ -157,7 +163,7 @@ export interface Settings {
   weatherLocation: WeatherLocation | null;
   /** Opt-in daily approximate IP lookup; false keeps a custom city fixed. */
   weatherAutoLocation: boolean;
-  /** Explicit opt-in to device location on startup, with IP fallback. */
+  /** Explicit opt-in to accurate device location on startup; no silent IP fallback. */
   weatherLocateMe: boolean;
   /** Unix milliseconds of the last successful automatic location check. */
   weatherLocationUpdatedAt: number;
@@ -273,6 +279,14 @@ class AppState {
   lastActivity = performance.now();
 
   settings: Settings = { ...DEFAULT_SETTINGS };
+
+  /** Session-only: switching this off restores the desktop's idle policy. */
+  keepAwake = false;
+  keepAwakePending = false;
+  keepAwakeError = "";
+
+  /** Current battery reading, shared with the charging animation's poller. */
+  powerStatus: PowerStatus | null = null;
 
   /** Shared forecast for the Clock card; the island's single poller owns it. */
   weatherReport: WeatherReport | null = null;

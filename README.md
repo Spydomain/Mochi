@@ -1,48 +1,100 @@
-# Mochi desktop companion
+# Mochi
 
-This repository contains a personal Linux setup of Mochi, with a top-edge capsule, Mochi animations, media controls, and OpenCode chat. The code also contains macOS, iOS and Windows projects; this guide covers the Linux setup script and does not claim to publish installers for those platforms.
+A small desktop companion that lives at the top edge of your screen. Mochi brings agent activity, media controls, system status, time and weather into one capsule that opens when you need it and stays out of the way when you do not.
 
-**Mochi is a modified version of [Coucou](https://github.com/Louis-CFM/coucou), adapted and extended for this project.**
+![Mochi opening from its compact capsule on Linux](docs/media/mochi-demo.gif)
 
-**Special thanks to [Louis-CFM](https://github.com/Louis-CFM) and the Coucou project for the original foundation.**
+*Live capture from the Linux app. [Watch the short MP4 demo](docs/media/mochi-demo.mp4). The main setup path below builds Mochi locally; this repository also contains Windows and Apple-platform source.*
 
-The capsule opens on hover. It shows media and agent activity, plays charging/unplugging and low-battery reactions, and gives occasional time-of-day and long-use reminders. Reminders stay inside the expanded capsule. OpenCode is the configured chat provider; no Llama installation is needed.
+## What Mochi does
 
-The Clock card shows a subtle moon and stars at night without a network request. For live rain, snow, and today's forecast, open **Settings → Weather background** and choose **Locate me** or **Find city**. **Locate me** saves an opt-in mode: Mochi tries device positioning when it starts after login and once daily while running. If the OS cannot provide a position, it checks an approximate public-IP location through [ipwho.is](https://ipwhois.io/documentation) over HTTPS (which sees your public IP). IP location can be wrong with a VPN. Existing IP-only preferences remain IP-only until you explicitly choose **Locate me**. **Find city** saves a fixed custom location without a device or IP lookup. On Linux the setup script installs GeoClue for device positioning, but the desktop must also allow location access. Mochi uses [Open-Meteo](https://open-meteo.com/en/docs) for current conditions and today's high/low; the selected coordinates are stored in your private settings file and sent to Open-Meteo at most every 15 minutes while weather is enabled. Automatic checks pause when Mochi is paused. If a check fails, Mochi keeps the last known location and retries later.
+- **Agent activity and chat:** follow supported coding-agent sessions, respond to prompts, and chat through your existing OpenCode installation. Setup installs the OpenCode hook and starts its local service; it does not install Llama.
+- **Media:** play, pause, skip, and select players exposed through Linux MPRIS. A browser or page must publish a controllable media session for these buttons to work.
+- **System and power:** view process and network snapshots, see battery charge and charging state, and use the optional Awake control to inhibit screen-idle blanking on supported Linux desktops.
+- **Clock and weather:** show local 12-hour time and, if you opt in, live conditions and subtle weather animation behind the Clock card.
+- **A little personality:** Mochi reacts to music, charging changes, low battery, and the time of day. Reminders and animations stay inside the expanded capsule.
 
-To show the local clock, enable **Clock** under Settings → Active pills. Clock uses one of the four companion slots, so turn off an existing pill first if all four are occupied. Its small pill and compact 2×2 slot show a Mochi like the others; selecting it shows 12-hour AM/PM time in the large card. The compact capsule retracts shortly after you leave it; the browser tabs beneath it remain clickable.
+The four small companion pills are configurable in Settings. The capsule retracts after inactivity and reopens from the top-edge hover area.
 
-## Linux setup
+### From the desktop
 
-Supported package managers: `pacman` (Arch-based) or `apt-get` (Debian/Ubuntu-based), on x86_64 or aarch64 Linux with a systemd user session. Run setup as your desktop user; it requests `sudo` only to install missing system packages. The script installs build dependencies, Rust, OpenCode v2 if needed, the Tauri app, its OpenCode hook, a 30-day **Mochi chat session** cleanup timer, and autostart. If the distro's Node.js is too old, it downloads a checksum-verified Node.js 24 LTS into `~/.local/share/mochi/toolchain/` for the build. It preserves an existing checkout and existing valid settings rather than resetting Git history.
+| Overview | Wardrobe |
+| --- | --- |
+| ![Mochi overview with companion pills](docs/media/mochi-overview.png) | ![Mochi wardrobe with optional outfits](docs/media/mochi-wardrobe.png) |
+
+*These are captures from a running Linux session. Other platforms and desktop themes may look different.*
+
+## Install on Linux
+
+The setup script supports Arch-family, Debian/Ubuntu-family, Fedora-family, and openSUSE-family desktops with the required WebKitGTK 4.1 packages. It targets x86_64 and aarch64; immutable/OSTree hosts and distributions without the required packages need a manual setup. Run it as your desktop user, not with `sudo`. It asks for `sudo` only when system packages are missing.
 
 ```bash
-git clone https://github.com/Spydomain/Mochi.git mochi
-cd mochi
-./mochi-full-setup.sh --check      # inspect missing system packages; no changes
-./mochi-full-setup.sh              # install, build, configure, and launch
+git clone https://github.com/Spydomain/Mochi.git
+cd Mochi
+./mochi-full-setup.sh --check   # inspect dependencies without changing anything
+./mochi-full-setup.sh           # install, build, configure, and launch
 ```
 
-The first build can take a while and downloads dependencies from the distribution package manager, npm, Rust, and (if missing) OpenCode's official installer. Review this repository and those sources before running a setup script. Running the script again rebuilds and restarts the app without a `git reset` or pull. `--no-launch` installs everything without starting Mochi immediately.
+Setup installs the required distro packages, Node.js 24 LTS locally if the existing Node is unsuitable, Rust, OpenCode v2 if needed, the app, and its hook. It runs the frontend tests before installing the release build. The first run downloads dependencies and can take several minutes. Review the script and its upstream installers before running it.
 
-On Niri, the installer enables `mochi-app.service` for the graphical session. On other Linux desktops it writes an XDG autostart entry. It moves duplicate autostart entries to `~/.config/mochi/autostart-backups/` to prevent extra launches after a reboot. When upgrading from the previous local name, it copies existing settings, retires the previous generated OpenCode plugin, and disables the previous service. Settings are stored at `~/.config/mochi/settings.json` (mode `0600`); the app and hook are built in `windows/target/release/` and installed to stable paths under `~/.local/share/mochi/bin/`. OpenCode must be installed and available for chat; the installer checks that its v2 service starts. Reinstall any other agent hooks from Mochi's settings after upgrading, because their old relay paths are not rewritten automatically.
+On Niri, setup enables a user `systemd` service for graphical login. On other desktops it writes an XDG autostart entry. It also configures a daily timer—or a login-time fallback without user `systemd`—to remove **Mochi chat sessions** older than 30 days without deleting other OpenCode work. Setup keeps your local Git checkout and existing preferences, while setting autostart, hover opening, English, and OpenCode as its defaults. It does not reset or pull the repository. Use `./mochi-full-setup.sh --no-launch` if you want to install without starting the app immediately.
 
-To inspect the running app on Niri:
+### Update
+
+```bash
+./update-mochi.sh
+```
+
+The updater checks this repository's default branch. It leaves an up-to-date installation unchanged, fast-forwards a clean checkout when a new commit exists, and rebuilds through the same setup script. If a previous installation stopped partway through, it retries setup. It refuses to overwrite local edits or merge divergent histories; commit or stash your changes first.
+
+### Check the running app
 
 ```bash
 systemctl --user status mochi-app.service
 journalctl --user -u mochi-app.service -n 100 --no-pager
-systemctl --user status mochi-opencode-cleanup.timer
+opencode service status
 ```
 
-For other desktops, check the autostart entry in `~/.config/autostart/mochi.desktop` and Mochi's log in `~/.local/share/mochi/mochi.log`. Move the pointer to the top-center edge of the screen to open the capsule; select a media player for play/pause, previous and next. If a player does not support a command, its own media service may not expose it.
+On non-Niri desktops, check `~/.config/autostart/mochi.desktop` instead of the Mochi service. Settings live at `~/.config/mochi/settings.json`, local logs at `~/.local/share/mochi/mochi.log`, and installed binaries under `~/.local/share/mochi/bin/`.
 
-On Linux, Media works with any browser or app that publishes an MPRIS player on the session bus, including Brave and Firefox when they have eligible audio/video playing. Mochi follows the playing player automatically, or keeps the one you choose in the Media card selected. Next/previous are always sent to the player, even if it reports stale capability flags; a player that does not support a command may ignore it. A browser or page that does not expose media through MPRIS cannot be controlled through this integration; for example, Firefox does not expose Web Audio or notification sounds as controllable media. Check what the desktop can see with `playerctl -l` and `playerctl metadata`.
+## Weather and location
 
-## Privacy and security
+Weather is optional. **Find city** saves the city you choose. **Locate me** requests a fresh device fix on every app start and daily while Mochi runs; if location services are late after login, it retries after 2 minutes and then 10 minutes later. Mochi accepts only fixes reported within 5 km. A coarse GeoClue/IP-level result is not presented as your exact city: your last saved city remains in use until a better fix arrives. If your device cannot provide one, use Find city.
 
-Mochi's local agent hook uses a private same-user Unix socket on Linux, rather than an Internet listener. Mochi chat automatically starts the installed OpenCode service and uses your existing OpenCode agent and permissions. OpenCode may use tools, read files, or contact configured model providers and plugins under those permissions; a prompt asking it not to use tools is not an enforcement boundary. Review your OpenCode configuration before chatting about sensitive data. Enabling an optional service integration sends its requests to that service. Leave integrations disabled when they are not needed, and use HTTPS for remote n8n endpoints. Logs and settings are local; do not share them if they include project names, session text, or tokens. The app cannot guarantee privacy of an external OpenCode provider or third-party integration.
+With live weather enabled, Mochi sends the selected coordinates to Open-Meteo for a forecast at most every 15 minutes. An accepted device fix is sent to OpenStreetMap Nominatim to obtain a city name; if naming fails, its coordinates can still provide weather. Older IP-only preferences remain separate and use ipwho.is. Offline night-sky animation uses local time without a weather request.
 
-## Other platforms and development
+## Media and troubleshooting
 
-The Windows/Linux Tauri source is in [`windows/`](windows/README.md). From `windows/`, use `npm ci`, `npm test`, and `npm run build` for frontend development; Rust tests run with `cargo test` in `windows/src-tauri/`. macOS and iOS source is under `NotchBuddy/`.
+Linux media controls use the player's MPRIS interface. Mochi sends previous/next commands even when a player reports stale capability flags, but the player or page may still ignore them. To see what your desktop exposes:
+
+```bash
+playerctl -l
+playerctl metadata
+```
+
+| Symptom | First check |
+| --- | --- |
+| The capsule does not reopen | Move the pointer to the top-center edge; then inspect the app service or local log. |
+| Media controls do nothing | Start eligible media and confirm the browser or app appears in `playerctl -l`. |
+| Locate me names no new city | Check desktop location permission and GeoClue accuracy; use Find city if the only fix is coarse. |
+| Chat reports a local connection error | Check `opencode service status`, then try `opencode service start`. |
+
+## Privacy and scope
+
+Mochi's Linux agent hook uses a private same-user Unix socket, not a public Internet listener. Its settings and logs are local, but they may contain session names or other sensitive context. OpenCode uses your configured agent, model provider, plugins, and permissions; a prompt asking it not to use tools is not a security boundary. Optional integrations and live weather contact their respective services only when enabled. Review those services before using Mochi with sensitive work.
+
+The Linux installer is the supported path documented here. The shared Tauri client has a separate [Windows/development guide](windows/README.md); the repository also contains macOS/iOS source and an [optional Apple Live Activity relay](relay/README.md). This README does not claim that prebuilt packages are published for every platform.
+
+## Development
+
+```bash
+cd windows
+npm ci
+npm test
+npm run build
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+```
+
+**Mochi is a modified version of [Coucou](https://github.com/Louis-CFM/coucou). Special thanks to [Louis-CFM](https://github.com/Louis-CFM) and the Coucou project for the original foundation.**
+
+Questions or project contact: [contactme@bikashkumarsarraf.com.np](mailto:contactme@bikashkumarsarraf.com.np).

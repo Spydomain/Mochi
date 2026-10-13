@@ -8,6 +8,11 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const REFRESH_AFTER: Duration = Duration::from_secs(15 * 60);
+pub const MAX_DEVICE_ACCURACY_METERS: f64 = 5_000.0;
+
+pub fn valid_device_accuracy(accuracy_meters: f64) -> bool {
+    accuracy_meters.is_finite() && (0.0..=MAX_DEVICE_ACCURACY_METERS).contains(&accuracy_meters)
+}
 
 struct Cached {
     location: WeatherLocation,
@@ -98,6 +103,64 @@ fn parse_ip_location(v: &Value) -> Option<WeatherLocation> {
         longitude: v.get("longitude")?.as_f64()?,
     };
     location.valid().then_some(location)
+}
+
+fn parse_device_place(v: &Value, latitude: f64, longitude: f64) -> Option<WeatherLocation> {
+    let address = v.get("address")?;
+    let first = ["city", "town", "village", "municipality", "hamlet", "county", "state"]
+        .iter()
+        .find_map(|key| address.get(*key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()))?;
+    let country = address.get("country").and_then(Value::as_str).unwrap_or("").trim();
+    let name = if country.is_empty() || first == country {
+        first.to_string()
+    } else {
+        format!("{first}, {country}")
+    };
+    (name.chars().count() <= 100).then_some(WeatherLocation { name, latitude, longitude })
+}
+
+/// Only called after Locate me is enabled. The precise device coordinates are
+/// sent to OpenStreetMap Nominatim for a city name; weather still uses the
+/// original coordinates. The small in-process cache avoids repeated clicks.
+pub async fn device_location(latitude: f64, longitude: f64) -> Result<WeatherLocation, String> {
+    use tokio::sync::Mutex;
+    static LAST: OnceLock<Mutex<Option<(Instant, WeatherLocation)>>> = OnceLock::new();
+    static LAST_CALL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let mut last = LAST.get_or_init(|| Mutex::new(None)).lock().await;
+    if let Some((at, location)) = last.as_ref() {
+        if at.elapsed() < Duration::from_secs(60)
+            && (location.latitude - latitude).abs() < 0.01
+            && (location.longitude - longitude).abs() < 0.01
+        {
+            return Ok(WeatherLocation { latitude, longitude, ..location.clone() });
+        }
+    }
+    // Rate-limit attempts too, including failed HTTP requests.
+    let mut last_call = LAST_CALL.get_or_init(|| Mutex::new(None)).lock().await;
+    if let Some(at) = *last_call {
+        if at.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_secs(1) - at.elapsed()).await;
+        }
+    }
+    *last_call = Some(Instant::now());
+    drop(last_call);
+    let response = client()
+        .get("https://nominatim.openstreetmap.org/reverse")
+        .header(reqwest::header::USER_AGENT, "Mochi/0.3 (+https://github.com/Spydomain/Mochi; contact:contactme@bikashkumarsarraf.com.np)")
+        .query(&[
+            ("format", "jsonv2"), ("addressdetails", "1"), ("zoom", "10"),
+            ("layer", "address"), ("accept-language", "en"),
+            ("lat", &latitude.to_string()), ("lon", &longitude.to_string()),
+        ])
+        .send().await
+        .map_err(|_| "Could not identify the device's city.".to_string())?
+        .error_for_status()
+        .map_err(|_| "Could not identify the device's city.".to_string())?;
+    let body: Value = response.json().await.map_err(|_| "Invalid reverse-location response.")?;
+    let location = parse_device_place(&body, latitude, longitude)
+        .ok_or("No city name found for this device position.")?;
+    *last = Some((Instant::now(), location.clone()));
+    Ok(location)
 }
 
 /// Called only after the user opts into automatic location. The server sees
@@ -234,6 +297,24 @@ mod tests {
         assert!(location.name.contains("approximate IP location"));
         assert!(parse_ip_location(&json!({"success":false,"city":"Kathmandu","country":"Nepal","latitude":27.7,"longitude":85.3})).is_none());
         assert!(parse_ip_location(&json!({"success":true,"city":"Kathmandu","country":"Nepal","latitude":900.0,"longitude":85.3})).is_none());
+    }
+
+    #[test]
+    fn device_place_uses_city_or_nearest_settlement() {
+        let city = parse_device_place(&json!({"address":{"city":"Kathmandu","country":"Nepal"}}), 27.7, 85.3).unwrap();
+        assert_eq!(city.name, "Kathmandu, Nepal");
+        let village = parse_device_place(&json!({"address":{"village":"Sankhu","country":"Nepal"}}), 27.7, 85.3).unwrap();
+        assert_eq!(village.name, "Sankhu, Nepal");
+        assert!(parse_device_place(&json!({"address":{"road":"Main Road"}}), 27.7, 85.3).is_none());
+    }
+
+    #[test]
+    fn device_fix_must_be_accurate_enough_to_name_a_city() {
+        assert!(valid_device_accuracy(100.0));
+        assert!(valid_device_accuracy(MAX_DEVICE_ACCURACY_METERS));
+        assert!(!valid_device_accuracy(25_000.0));
+        assert!(!valid_device_accuracy(-1.0));
+        assert!(!valid_device_accuracy(f64::NAN));
     }
 
     #[tokio::test]

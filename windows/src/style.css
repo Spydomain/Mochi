@@ -2154,6 +2154,70 @@ input[type="range"]::-webkit-slider-thumb {
   margin-right: -5px;
 }
 
+.header-actions.with-battery {
+  gap: 8px;
+  padding-right: 8px;
+}
+
+.header-actions .battery-status-pill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid rgba(34, 211, 238, 0.22);
+  border-radius: 999px;
+  background: #0e0f11;
+  color: var(--dim-3);
+  font: 600 10px var(--font);
+  line-height: 12px;
+  white-space: nowrap;
+}
+
+.header-actions .battery-status-pill.charging {
+  color: #67e8f9;
+  border-color: rgba(34, 211, 238, 0.5);
+  background: rgba(34, 211, 238, 0.1);
+}
+
+.header-actions .battery-status-pill.low {
+  color: #fb7185;
+  border-color: rgba(251, 113, 133, 0.5);
+}
+
+.battery-icon {
+  position: relative;
+  display: block;
+  width: 15px;
+  height: 9px;
+  flex: 0 0 15px;
+  box-sizing: border-box;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  padding: 1px;
+}
+
+.battery-icon::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  right: -3px;
+  width: 2px;
+  height: 3px;
+  border-radius: 0 1px 1px 0;
+  background: currentColor;
+}
+
+.battery-fill {
+  display: block;
+  height: 100%;
+  border-radius: 1px;
+  background: currentColor;
+}
+
+.battery-bolt, .battery-plug {
+  flex: 0 0 auto;
+}
+
 .header-actions .plan-pill {
   --plan: #6b7079;
   display: flex;
@@ -2182,6 +2246,36 @@ input[type="range"]::-webkit-slider-thumb {
   width: 6px;
   height: 6px;
   border-radius: 50%;
+}
+
+.header-actions .keep-awake-pill {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid rgba(34, 211, 238, 0.2);
+  border-radius: 999px;
+  background: #0e0f11;
+  color: var(--dim-3);
+  font: 600 10px var(--font);
+  line-height: 12px;
+  white-space: nowrap;
+}
+
+.header-actions .keep-awake-pill:hover,
+.header-actions .keep-awake-pill.on {
+  color: #67e8f9;
+  border-color: rgba(34, 211, 238, 0.55);
+  background: rgba(34, 211, 238, 0.12);
+}
+
+.header-actions .keep-awake-pill.failed {
+  color: #f4505e;
+  border-color: rgba(244, 80, 94, 0.55);
+}
+
+.header-actions .keep-awake-pill:disabled {
+  opacity: 0.55;
 }
 
 .plan-card {

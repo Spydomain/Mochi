@@ -10,7 +10,8 @@ export function clockText(now: Date): string {
 }
 
 export function clockWeatherText(location: WeatherLocation, report: WeatherReport): string {
-  const city = location.name.split(",")[0].replace(/ \(approximate.*\)$/, "");
+  const city = location.name === "Current location" ? "Finding city name…"
+    : location.name.split(",")[0].replace(/ \(approximate.*\)$/, "");
   const prefix = location.name.includes("approximate IP location") ? "Approx. " : "";
   return `${prefix}${city} · ${Math.round(report.temperatureC)}°C · ${weatherDescription(report.weatherCode)}`;
 }

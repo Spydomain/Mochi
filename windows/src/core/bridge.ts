@@ -5,7 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import type { Settings } from "./state";
+import type { PowerStatus, Settings } from "./state";
 import type { RecapHistory, RecapPrefs } from "../recap/summary";
 import type { SpotifyState } from "./spotify";
 import type { WeatherLocation, WeatherReport } from "./weather";
@@ -35,11 +35,11 @@ export interface BootInfo {
 
 export const Bridge = {
   boot: () => call<BootInfo>("boot"),
-  powerStatus: () => call<{ pluggedIn: boolean; level: number }>("power_status"),
+  powerStatus: () => call<PowerStatus>("power_status"),
   weatherFindCity: (query: string) => call<WeatherLocation>("weather_find_city", { query }),
   weatherAutoLocation: (force = false) => call<WeatherLocation>("weather_auto_location", { force }),
-  weatherSetDeviceLocation: (latitude: number, longitude: number) =>
-    call<WeatherLocation>("weather_set_device_location", { latitude, longitude }),
+  weatherSetDeviceLocation: (latitude: number, longitude: number, accuracyMeters: number) =>
+    call<WeatherLocation>("weather_set_device_location", { latitude, longitude, accuracyMeters }),
   weatherForecast: () => call<WeatherReport>("weather_forecast"),
   securitySnapshot: () => call<{ addresses: string[]; listening: string[]; established: number }>("security_snapshot"),
   /** The system's languages as the webview sees them, for Rust's own texts (i18n.rs). */
@@ -99,6 +99,8 @@ export const Bridge = {
   openFileInVSCode: (path: string) => call<boolean>("open_file_in_vscode", { path }),
 
   quit: () => call<void>("quit_app"),
+  keepAwakeStatus: () => call<boolean>("keep_awake_status"),
+  setKeepAwake: (enabled: boolean) => callOrThrow<boolean>("set_keep_awake", { enabled }),
 
   openSettingsWindow: () => call<void>("open_settings_window"),
 
