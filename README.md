@@ -157,6 +157,10 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
+## License
+
+Mochi is distributed under the [MIT License](LICENSE). It builds on [Coucou](https://github.com/Louis-CFM/coucou) (also MIT-licensed); the original project and author are credited below. The optional AirDrop stack downloads separate third-party software, and the bundled [AirDrop source patches](windows/airdrop/README.md) have their own upstream licensing terms. Mochi's MIT license does not relicense those components.
+
 **Mochi is a modified version of [Coucou](https://github.com/Louis-CFM/coucou). Special thanks to [Louis-CFM](https://github.com/Louis-CFM) and the Coucou project for the original foundation.**
 
 Questions and bug reports: [contactme@bikashkumarsarraf.com.np](mailto:contactme@bikashkumarsarraf.com.np).

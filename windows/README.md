@@ -61,4 +61,8 @@ For the optional Apple Live Activity integration, see the separate [relay guide]
 
 Found a bug? Open a [GitHub Issue](https://github.com/Spydomain/Mochi/issues) or email [contactme@bikashkumarsarraf.com.np](mailto:contactme@bikashkumarsarraf.com.np). Include the Windows version, app commit, reproduction steps, and a redacted screenshot or video when useful. The Linux AirDrop receiver is not a Windows feature.
 
+## License
+
+Mochi is distributed under the [MIT License](../LICENSE). See the [AirDrop bundle notes](airdrop/README.md) for separate third-party source and patch licensing; that experimental backend is Linux-only.
+
 **Mochi is a modified version of [Coucou](https://github.com/Louis-CFM/coucou). Special thanks to [Louis-CFM](https://github.com/Louis-CFM) and the Coucou project for the original foundation.**

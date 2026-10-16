@@ -12,6 +12,12 @@ files are kept in their own checkouts:
 | [OWL](https://github.com/jedbillyb/owl) | `832d70f815c3d4a06a02117bf0fc5e868daa1ff0` | `owl-local.patch` |
 | [hostapd](https://w1.fi/hostapd/) | 2.11; SHA-256 verified by installer | `hostapd-p2p-go-iftype.patch` from [mt7921-dual-channel](https://github.com/jedbillyb/mt7921-dual-channel) |
 
+Licensing: Mochi's [MIT license](../../LICENSE) does not replace upstream
+terms. The airdrop-mt7921, OWL and mt7921-dual-channel sources and patches
+are [GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.html); hostapd is
+[BSD-licensed](https://w1.fi/hostapd/) upstream. Refer to the license files
+in each downloaded source checkout when redistributing these components.
+
 The local patches include iOS 26 archive support, explicit consent, partial
 transfer reporting, OWL receive/transmit fixes, dual-channel P2P-GO and
 Wi-Fi coexistence. The tested radio is **only** MT7922 (`14c3:0616`,
