@@ -2,9 +2,7 @@
 
 Mochi is a Linux-first, Dynamic Island-style desktop companion built with Tauri, Rust, and TypeScript. Its compact top-edge capsule brings OpenCode and coding-agent activity, MPRIS media controls, battery status, time, and weather together without taking over your desktop. On supported MediaTek MT7922 hardware, an experimental AirDrop/AWDL receiver can accept iPhone transfers with explicit consent. The repository also contains Windows and Apple-platform source.
 
-![Mochi opening its clock and weather card, then receiving an iPhone AirDrop](docs/media/mochi-demo.gif)
-
-*Recorded from the running Linux build on October 16, 2026: hover opening, Clock with weather, an actual iPhone consent prompt, the compact transfer indicator, and completion. Pauses between excerpts are removed; no audio or file contents are included. [Watch the short MP4 demo](docs/media/mochi-demo.mp4).*
+[Watch the inline demo](#screenshots-and-video) · [Open the MP4](docs/media/mochi-demo.mp4)
 
 ## Documentation
 
@@ -28,6 +26,10 @@ The four small companion pills are configurable in Settings. The capsule retract
 
 ### Screenshots and video
 
+[![Animated Linux demo: Mochi opens its Clock and weather card, prompts for an iPhone AirDrop, and shows transfer completion](docs/media/mochi-demo.gif)](docs/media/mochi-demo.mp4)
+
+*The looping demo plays inline above. Click it to open the [MP4 version](docs/media/mochi-demo.mp4). Recorded from the running Linux build on October 16, 2026: hover opening, Clock with weather, an actual iPhone consent prompt, the compact transfer indicator, and completion. Pauses between excerpts are removed; no audio or file contents are included.*
+
 | Clock and weather | Incoming AirDrop |
 | --- | --- |
 | ![Mochi's Clock card with Kathmandu weather, four companion pills, battery status, AirDrop, and Awake](docs/media/mochi-overview.png) | ![An actual incoming iPhone photo request with explicit Decline and Accept buttons](docs/media/mochi-airdrop-request.png) |
@@ -36,7 +38,7 @@ The four small companion pills are configurable in Settings. The capsule retract
 
 ![Mochi's compact AirDrop indicator showing successful receipt](docs/media/mochi-airdrop-received.png)
 
-[Watch the Linux demo video (MP4)](docs/media/mochi-demo.mp4) · [View the overview](docs/media/mochi-overview.png) · [View the consent prompt](docs/media/mochi-airdrop-request.png).
+[Open the Linux demo as MP4](docs/media/mochi-demo.mp4) · [View the overview](docs/media/mochi-overview.png) · [View the consent prompt](docs/media/mochi-airdrop-request.png).
 
 The recorded iPhone → Mochi test received a 2.17 MB photo. The receiver verified the archive trailer, extracted the photo, and returned HTTP 200 before reporting success. This demonstrates receiving on the development machine, not universal hardware compatibility or verified sending to an iPhone. Requests need an explicit **Accept**; unanswered prompts expire after 15 seconds.
 
