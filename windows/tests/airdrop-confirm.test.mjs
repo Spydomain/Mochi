@@ -120,3 +120,25 @@ test("a leftover active directory from a killed hook does not decline every tran
   } finally { rmSync(runtime, { recursive: true, force: true }); }
   assert.equal(result, 0);
 });
+
+test("overlapping requests cannot replace the visible request or inherit its answer", async () => {
+  const runtime = mkdtempSync(join(tmpdir(), "mochi-airdrop-"));
+  chmodSync(runtime, 0o700);
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime, AIRDROP_CONFIRM_TIMEOUT: "3" };
+  const request = join(runtime, "mochi-airdrop/active/request.json");
+  const first = spawn("bash", [script, "First sender", "first"], { env });
+  try {
+    for (let i = 0; i < 50 && !existsSync(request); i++) await delay(20);
+    assert.ok(existsSync(request));
+    const id = JSON.parse(readFileSync(request, "utf8")).id;
+    const second = spawn("bash", [script, "Second sender", "second"], { env });
+    assert.equal(await new Promise(resolve => second.once("exit", resolve)), 1);
+    assert.equal(JSON.parse(readFileSync(request, "utf8")).id, id);
+    writeFileSync(join(runtime, "mochi-airdrop/active/decision"), "accept", { mode: 0o600 });
+    assert.equal(await new Promise(resolve => first.once("exit", resolve)), 0);
+    assert.match(readFileSync(join(runtime, "mochi-airdrop/hook.log"), "utf8"), /another request is awaiting consent/);
+  } finally {
+    if (first.exitCode === null) first.kill();
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});

@@ -3,6 +3,8 @@
 **/target/
 **/dist/
 **/.vite/
+__pycache__/
+*.pyc
 NotchBuddy/build/
 NotchBuddy/NotchBuddy.xcodeproj/project.xcworkspace/xcuserdata/
 NotchBuddy/NotchBuddy.xcodeproj/xcuserdata/

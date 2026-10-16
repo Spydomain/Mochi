@@ -129,6 +129,24 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     let _ = app.emit("settings-changed", settings);
 }
 
+/// Save only AirDrop's preferences, not a possibly stale copy of every setting
+/// from the settings webview. Report disk failures instead of claiming success.
+#[tauri::command]
+fn airdrop_save_preferences(app: AppHandle, shared: State<Shared>, name: String, directory: String) -> Result<(), String> {
+    airdrop::preferences(&name, &directory)?;
+    let updated = {
+        let mut current = shared.settings.lock().unwrap();
+        let mut updated = current.clone();
+        updated.airdrop_name = name.trim().to_string();
+        updated.airdrop_directory = directory.trim().to_string();
+        settings::save(&updated).map_err(|e| format!("Could not save AirDrop preferences: {e}"))?;
+        *current = updated.clone();
+        updated
+    };
+    let _ = app.emit("settings-changed", updated);
+    Ok(())
+}
+
 #[tauri::command]
 async fn weather_find_city(query: String) -> Result<weather::WeatherLocation, String> {
     if integrations::PAUSED.load(Ordering::Relaxed) {
@@ -952,6 +970,7 @@ pub fn run() {
             airdrop_decide,
             airdrop_transfer,
             airdrop_validate,
+            airdrop_save_preferences,
             airdrop_peers,
             airdrop_send,
             hooks_status,
@@ -1055,6 +1074,7 @@ pub fn run() {
             log::line(format!("--- Mochi {} started ---", env!("CARGO_PKG_VERSION")));
             hooks::ensure_hook_exe(&handle);
             pipe::start(handle.clone());
+            airdrop::watch_incoming(handle.clone());
             integrations::start(handle.clone());
             spotify::sync(&handle, &loaded.active_integrations);
             shortcuts::apply(&handle, &loaded.shortcuts);

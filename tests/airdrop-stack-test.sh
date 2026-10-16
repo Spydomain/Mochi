@@ -39,17 +39,38 @@ for item in 'airdrop-mt7921:airdrop-mt7921-local' 'owl:owl-local'; do
   git -C "$tmp/$name" diff --binary | cmp - "$patches/$delta.patch"
   git -C "$tmp/$name" apply --reverse --check "$patches/$delta.patch"
 done
-# An installed v1 tree upgrades only through the reviewed, exact patch delta.
+install -m 644 "$repo/windows/airdrop/tests/test_awdl_rx.cpp" "$tmp/owl/tests/test_awdl_rx.cpp"
+git -C "$tmp/owl" apply --reverse "$patches/owl-discovery-upgrade-v1.patch"
+[[ "$(git -C "$tmp/owl" diff --binary | sha256sum | cut -d' ' -f1)" == 7dd07e0cb289b732aedd744e4ef61d54ac4643a12bc4390862e13fb5bae3166a ]]
+git -C "$tmp/owl" apply --check "$patches/owl-discovery-upgrade-v1.patch"
+git -C "$tmp/owl" apply "$patches/owl-discovery-upgrade-v1.patch"
+git -C "$tmp/owl" diff --binary | cmp - "$patches/owl-local.patch"
+# Installed trees upgrade only through reviewed, exact patch deltas.
+git -C "$tmp/airdrop-mt7921" apply --reverse "$patches/airdrop-mt7921-upgrade-v2.patch"
+[[ "$(git -C "$tmp/airdrop-mt7921" diff --binary | sha256sum | cut -d' ' -f1)" == 16ab16d8f3459c9edc9b93525e98d7fa614894e43ccc5063447f42f51d45717b ]]
 git -C "$tmp/airdrop-mt7921" apply --reverse "$patches/airdrop-mt7921-upgrade-v1.patch"
 [[ "$(git -C "$tmp/airdrop-mt7921" diff --binary | sha256sum | cut -d' ' -f1)" == bb5c8a5f308361d765ae32d1ee30624830372340ecc36794422e13f12cb0446a ]]
 git -C "$tmp/airdrop-mt7921" apply --check "$patches/airdrop-mt7921-upgrade-v1.patch"
 git -C "$tmp/airdrop-mt7921" apply "$patches/airdrop-mt7921-upgrade-v1.patch"
+git -C "$tmp/airdrop-mt7921" apply --check "$patches/airdrop-mt7921-upgrade-v2.patch"
+git -C "$tmp/airdrop-mt7921" apply "$patches/airdrop-mt7921-upgrade-v2.patch"
 git -C "$tmp/airdrop-mt7921" diff --binary | cmp - "$patches/airdrop-mt7921-local.patch"
+# Exercise owl-start without hardware or root. Only awdl0 may get a short queue;
+# a queue configuration failure must not be reported as a successful radio.
+python3 "$repo/tests/airdrop-tap-queue-test.py" "$tmp/airdrop-mt7921/daemon/airdrop-helper"
+python3 "$repo/tests/airdrop-ack-filter-test.py" "$tmp/airdrop-mt7921/daemon/airdrop-helper"
+bash "$repo/tests/airdrop-wake-lifecycle-test.sh" "$tmp/airdrop-mt7921/daemon/airdropd"
 installed_opendrop="${XDG_DATA_HOME:-$HOME/.local/share}/mochi/owl/.venv-opendrop"
 opendrop_source="$(find "$installed_opendrop" -path '*/site-packages/opendrop/server.py' -print -quit 2>/dev/null || true)"
 if [[ -n "$opendrop_source" ]]; then
   mkdir -p "$tmp/opendrop/opendrop"
   cp "$opendrop_source" "$tmp/opendrop/opendrop/server.py"
+  # Restore the pre-workspace baseline to prove both overlay directions.
+  if patch --batch "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
+      < "$patches/opendrop-receive-workspace.patch" >/dev/null 2>&1; then
+    patch --batch "$tmp/opendrop/opendrop/server.py" --reverse \
+      < "$patches/opendrop-receive-workspace.patch" >/dev/null
+  fi
   # An already-installed receiver carries this patch. Applying it twice would
   # reverse it, so accept whichever state the copy is actually in.
   if ! patch --batch -d "$tmp/opendrop" -p1 --dry-run --reverse \
@@ -57,6 +78,20 @@ if [[ -n "$opendrop_source" ]]; then
     patch --batch -d "$tmp/opendrop" -p1 < "$patches/opendrop-verified-archive.patch" >/dev/null
   fi
   python3 "$repo/tests/opendrop-archive-test.py" "$tmp/opendrop/opendrop/server.py"
+  patch --batch "$tmp/opendrop/opendrop/server.py" < "$patches/opendrop-receive-workspace.patch" >/dev/null
+  patch --batch "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
+      < "$patches/opendrop-receive-workspace.patch" >/dev/null
+  python3 "$repo/tests/opendrop-archive-test.py" "$tmp/opendrop/opendrop/server.py"
+  "$installed_opendrop/bin/python" "$repo/tests/airdrop-receive-test.py" "$tmp/opendrop/opendrop/server.py"
+  cp "$(dirname "$opendrop_source")/config.py" "$tmp/opendrop/opendrop/config.py"
+  identity_patch="$patches/opendrop-stable-service-id.patch"
+  if patch --batch --forward -d "$tmp/opendrop/opendrop" -p1 --fuzz=0 --dry-run --reverse \
+      < "$identity_patch" >/dev/null 2>&1; then
+    patch --batch --forward -d "$tmp/opendrop/opendrop" -p1 --fuzz=0 --reverse < "$identity_patch" >/dev/null
+  fi
+  patch --batch --forward -d "$tmp/opendrop/opendrop" -p1 --fuzz=0 < "$identity_patch" >/dev/null
+  patch --batch --forward -d "$tmp/opendrop/opendrop" -p1 --fuzz=0 --dry-run --reverse < "$identity_patch" >/dev/null
+  "$installed_opendrop/bin/python" "$repo/tests/airdrop-identity-test.py" "$tmp/opendrop/opendrop/config.py"
 fi
 if [[ -n "${MOCHI_TEST_HOSTAPD_TARBALL:-}" ]]; then
   printf '%s  %s\n' '2b3facb632fd4f65e32f4bf82a76b4b72c501f995a4f62e330219fe7aed1747a' \

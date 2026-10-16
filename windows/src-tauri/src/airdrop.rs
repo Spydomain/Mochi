@@ -107,6 +107,36 @@ mod linux {
         Ok(Some(item))
     }
 
+    /// Consent is short-lived. WebKit can throttle page timers while the island
+    /// has been hidden for a long time, so observe the private request from
+    /// Rust as well. Only a change in request ID emits; the page still reads
+    /// the current file before presenting the card or writing a decision.
+    pub fn watch_incoming(app: tauri::AppHandle) {
+        use tauri::{Emitter, Manager};
+        tauri::async_runtime::spawn(async move {
+            let mut seen: Option<String> = None;
+            loop {
+                let now = incoming().ok().flatten().map(|item| item.id);
+                if now != seen {
+                    if now.is_some() {
+                        // Wake the GTK surface without stealing keyboard focus
+                        // from a running agent or changing the radio session.
+                        let handle = app.clone();
+                        let _ = app.run_on_main_thread(move || {
+                            if let Some(win) = handle.get_webview_window(crate::island::WINDOW_LABEL) {
+                                let _ = win.show();
+                                let _ = win.set_always_on_top(true);
+                            }
+                        });
+                    }
+                    seen = now;
+                    let _ = app.emit_to(crate::island::WINDOW_LABEL, "airdrop-incoming", ());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
     pub fn decide(id: String, accept: bool) -> Result<(), String> {
         if incoming()?.is_none_or(|item| item.id != id) {
             return Err("This AirDrop request has expired.".into());
@@ -177,7 +207,8 @@ mod linux {
         // The log changes only at state transitions. Stat the raw file even
         // when the log is cached, so the ring tracks bytes while data arrives.
         let received_bytes = if state == "receiving" || state == "failed" {
-            directory.and_then(|dir| archive_received(dir, start, now))
+            raw["rawPath"].as_str().and_then(|path| private_archive_received(std::path::Path::new(path), start, now))
+                .or_else(|| directory.and_then(|dir| archive_received(dir, start, now)))
         } else { None };
         Some(Transfer {
             state,
@@ -199,6 +230,30 @@ mod linux {
             .filter_map(|line| line.strip_prefix("TotalBytes: ")?.trim().parse::<u64>().ok())
             .filter(|total| (1..=1_000_000_000_000).contains(total))
             .last()
+    }
+
+    fn private_archive_received(path: &std::path::Path, start: u64, now: u64) -> Option<u64> {
+        let cache = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+        workspace_archive_received(path, &cache.join("mochi/airdrop/incoming"), start, now)
+    }
+
+    fn workspace_archive_received(path: &std::path::Path, incoming: &std::path::Path, start: u64, now: u64) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        if !path.is_absolute() || path.is_symlink() { return None; }
+        let root = incoming.canonicalize().ok()?;
+        let canonical = path.canonicalize().ok()?;
+        if canonical != path { return None; }
+        let relative = canonical.strip_prefix(root).ok()?;
+        if relative.components().count() != 2 { return None; }
+        if !relative.parent()?.file_name()?.to_str()?.starts_with("receive-") { return None; }
+        let suffix = path.file_name()?.to_str()?.strip_prefix("airdrop-received-")?;
+        let (seconds, ext) = suffix.rsplit_once('.')?;
+        let seconds = seconds.parse::<u64>().ok()?;
+        if !(start..=now).contains(&seconds) || !matches!(ext, "dvzip" | "cpio") { return None; }
+        let meta = path.symlink_metadata().ok()?;
+        if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } { return None; }
+        Some(meta.len())
     }
 
     fn archive_received(directory: &std::path::Path, start: u64, now: u64) -> Option<u64> {
@@ -493,6 +548,42 @@ mod linux {
             .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
     }
 
+    /// The receiver survives Mochi UI restarts. Read its actual OpenDrop
+    /// worker's cwd rather than guessing the destination from new settings or
+    /// from a stale page-local value. The child must belong to our user service
+    /// and be the installed OpenDrop receive command, not an unrelated process.
+    async fn mt7922_live_directory() -> Option<String> {
+        let output = Command::new("systemctl")
+            .args(["--user", "show", "mochi-airdrop.service", "-p", "MainPID", "--value"])
+            .output().await.ok()?;
+        if !output.status.success() { return None; }
+        let pid = String::from_utf8_lossy(&output.stdout).trim().parse::<u32>().ok()?;
+        if pid == 0 { return None; }
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        let daemon = mt7922_daemon()?;
+        let argv = std::fs::read(process.join("cmdline")).ok()?;
+        if !argv.split(|b| *b == 0).any(|part| part == daemon.to_string_lossy().as_bytes()) ||
+            !argv.split(|b| *b == 0).any(|part| part == b"run") {
+            return None;
+        }
+        let children = std::fs::read_to_string(process.join(format!("task/{pid}/children"))).ok()?;
+        let home = std::env::var_os("HOME")?;
+        let opendrop = PathBuf::from(home).join(".local/share/mochi/owl/.venv-opendrop/bin/opendrop");
+        for child in children.split_whitespace().filter_map(|s| s.parse::<u32>().ok()) {
+            let worker = PathBuf::from(format!("/proc/{child}"));
+            let Ok(args) = std::fs::read(worker.join("cmdline")) else { continue };
+            let args: Vec<&[u8]> = args.split(|b| *b == 0).collect();
+            if !args.contains(&opendrop.to_string_lossy().as_bytes()) || !args.contains(&b"receive".as_slice()) {
+                continue;
+            }
+            let Ok(directory) = std::fs::read_link(worker.join("cwd")) else { continue };
+            if directory.is_absolute() && directory.is_dir() {
+                return Some(directory.to_string_lossy().into_owned());
+            }
+        }
+        None
+    }
+
     async fn wait_for_mt7922_session(running: bool, seconds: u64) -> Result<(), String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
         loop {
@@ -536,6 +627,7 @@ mod linux {
         let receiver_listening = daemon_active && mt7922_receiver_listening().await;
         let active = daemon_active && radio_active && receiver_listening;
         let visible = matches!(raw.state.as_str(), "armed" | "receiving") && active;
+        let directory = if active { mt7922_live_directory().await } else { None };
         Ok(Status {
             installed: true,
             receiving: active,
@@ -544,7 +636,7 @@ mod linux {
             // own config; do not present guessed values as confirmed state.
             name: None,
             remaining: None,
-            directory: None,
+            directory,
             can_send_nearby: false,
             message: if daemon_active && !radio_active {
                 Some(
@@ -627,6 +719,7 @@ mod linux {
                 // longer radio pause should not be mistaken for completion.
                 "--setenv=AIRDROP_STALL_FLOOR=30",
                 "--setenv=AIRDROP_STALL_TIMEOUT=60",
+                "--setenv=AIRDROP_UPLOAD_IDLE_TIMEOUT=300",
             ]);
             receiver.arg(format!("--setenv=AIRDROP_NAME={name}"));
             if let Some(path) = directory {
@@ -1122,6 +1215,28 @@ mod linux {
     #[cfg(test)]
     mod tests {
         #[test]
+        fn private_upload_progress_rejects_outside_and_symlink_paths() {
+            use super::workspace_archive_received;
+            let root = std::env::temp_dir().join(format!("mochi-private-progress-{}", std::process::id()));
+            let incoming = root.join("incoming");
+            let workspace = incoming.join("receive-test");
+            std::fs::create_dir_all(&workspace).unwrap();
+            let file = workspace.join("airdrop-received-100.dvzip");
+            std::fs::write(&file, b"bytes").unwrap();
+            assert_eq!(workspace_archive_received(&file, &incoming, 100, 101), Some(5));
+            assert_eq!(workspace_archive_received(&file, &incoming, 101, 102), None);
+            assert_eq!(workspace_archive_received(&file, &root.join("elsewhere"), 100, 101), None);
+            let link = workspace.join("airdrop-received-101.dvzip");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert_eq!(workspace_archive_received(&link, &incoming, 100, 101), None);
+            std::fs::remove_file(link).unwrap();
+            std::fs::remove_file(file).unwrap();
+            std::fs::remove_dir(workspace).unwrap();
+            std::fs::remove_dir(incoming).unwrap();
+            std::fs::remove_dir(root).unwrap();
+        }
+
+        #[test]
         fn upload_progress_uses_wire_total_and_only_the_new_raw_archive() {
             use super::{archive_received, upload_total_bytes};
             let log = "POST request at /Upload\nTotalBytes: 186876480\nTransfer-Encoding: chunked\nReceiving file(s) ...";
@@ -1245,7 +1360,7 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{decide, incoming, peers, preferences, send, set, status, stop_if_owned, transfer};
+pub use linux::{decide, incoming, peers, preferences, send, set, status, stop_if_owned, transfer, watch_incoming};
 
 #[cfg(target_os = "linux")]
 pub use linux::Incoming;
@@ -1258,6 +1373,9 @@ pub struct Incoming {}
 pub fn incoming() -> Result<Option<Incoming>, String> {
     Ok(None)
 }
+
+#[cfg(not(target_os = "linux"))]
+pub fn watch_incoming(_app: tauri::AppHandle) {}
 
 #[cfg(not(target_os = "linux"))]
 pub fn transfer() -> Option<Transfer> {

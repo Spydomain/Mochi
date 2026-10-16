@@ -43,13 +43,15 @@ async function main() {
     void refreshAirDrop();
   }, 8_000);
   let checkingIncoming = false;
+  let incomingCheckQueued = false;
   let checkingTransfer = false;
   let completedAt = 0;
   let lastTransferCheck = 0;
-  window.setInterval(() => {
-    // The receiver's /Ask clock is short. Do not wait for the slower radio
-    // status poll (or a busy agent card) before checking private consent.
-    if (State.os !== "linux" || checkingIncoming) return;
+  const checkIncoming = () => {
+    // Native file-change notification wakes a long-hidden WebKit page; the
+    // fallback poll recovers events missed while the page was starting.
+    if (State.os !== "linux") return;
+    if (checkingIncoming) { incomingCheckQueued = true; return; }
     checkingIncoming = true;
     void (async () => {
       try {
@@ -60,9 +62,11 @@ async function main() {
           if (request.id !== State.airdropRequest?.id) {
             State.airdropRequest = request;
             State.airdropError = "";
-            island.alert("airdropRequest");
             State.notify();
           }
+          // A busy agent or a stale hidden-state transition must not strand an
+          // existing request behind another card. Never answer it implicitly.
+          if (State.view !== "airdropRequest" || State.mode !== "expanded") island.alert("airdropRequest");
         } else if (State.airdropRequest || State.view === "airdropRequest") {
           // Answered, declined or expired: the request file is gone, so release
           // the pinned consent card. This must not depend on a *change* in
@@ -77,9 +81,18 @@ async function main() {
         }
       } catch (err) {
         console.error("[mochi] AirDrop consent check failed", err);
-      } finally { checkingIncoming = false; }
+      } finally {
+        checkingIncoming = false;
+        if (incomingCheckQueued) {
+          incomingCheckQueued = false;
+          checkIncoming();
+        }
+      }
     })();
-  }, 200);
+  };
+  await onEvent<null>("airdrop-incoming", checkIncoming);
+  checkIncoming();
+  window.setInterval(checkIncoming, 200);
   window.setInterval(() => {
     if (State.os !== "linux" || checkingTransfer) return;
     if (!State.airdropStatus?.receiving) {
@@ -104,7 +117,7 @@ async function main() {
         if (transfer?.state === "complete" || transfer?.state === "failed") {
           if (!completedAt) completedAt = Date.now();
           if (transfer.state === "failed" && State.airdropTransfer !== "failed") {
-            State.airdropError = "AirDrop transfer incomplete. The partial file was kept in your save folder; try sending it again.";
+            State.airdropError = "AirDrop transfer incomplete. Any complete files were saved. Unfinished data is kept in Mochi's private recovery folder; please retry.";
           }
           State.airdropTransfer = Date.now() - completedAt < 5000 ? transfer.state : null;
         } else {

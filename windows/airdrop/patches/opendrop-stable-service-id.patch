@@ -1,0 +1,26 @@
+--- a/config.py
++++ b/config.py
+@@ -20,6 +20,7 @@
+ import logging
+ import os
+ import random
++import re
+ import socket
+ import ssl
+ import subprocess
+@@ -81,7 +82,14 @@
+         self.port = server_port
+ 
+         if service_id is None:
+-            service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"  # random 6-byte string in base16
++            # Mochi keeps this ID across receiver/app restarts so iOS does not
++            # retain a separate cached AirDrop tile for every restart. Other
++            # OpenDrop clients still use the upstream random default.
++            service_id = os.environ.get("MOCHI_AIRDROP_SERVICE_ID")
++            if service_id is not None and not re.fullmatch(r"[0-9a-f]{12}", service_id):
++                raise ValueError("Invalid Mochi AirDrop service ID")
++            if service_id is None:
++                service_id = f"{random.randint(0, 0xFFFFFFFFFFFF):012x}"
+         self.service_id = service_id
+ 
+         self.debug = debug

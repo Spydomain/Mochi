@@ -1,5 +1,5 @@
 diff --git a/daemon/core.c b/daemon/core.c
-index bb8bdb9..feba0be 100644
+index bb8bdb9..5b9b143 100644
 --- a/daemon/core.c
 +++ b/daemon/core.c
 @@ -26,6 +26,7 @@
@@ -82,6 +82,19 @@ index bb8bdb9..feba0be 100644
  		} else { /* try later */
  			if (in == 0) /* try again next EAW */
  				in = usec_to_sec(ieee80211_tu_to_usec(64));
+@@ -390,6 +409,12 @@ static void awdl_adopt_chanseq(struct daemon_state *state) {
+ 	src = awdl_chanseq_source(awdl);
+ 
+ 	if (!src) {
++		/* Losing a peer must not switch shared mode back to the all-slot
++		 * PIN advertisement that iOS ignored in compatibility tests. Keep
++		 * the last honest intersection (or our structured bootstrap) until
++		 * a fresh peer supplies an updated schedule. The radio stays up. */
++		if (awdl->channel.strategy == AWDL_CHANSEQ_INTERSECT)
++			return;
+ 		if (awdl->channel.sequence_from_peer) {
+ 			log_info("no sync master, reverting to static channel sequence");
+ 			awdl_chanseq_init_static(awdl->channel.sequence, &awdl->channel.master);
 diff --git a/daemon/io.c b/daemon/io.c
 index 46c8cc7..8f6a052 100644
 --- a/daemon/io.c
@@ -101,6 +114,54 @@ index 46c8cc7..8f6a052 100644
  	}
  	return 0;
  }
+diff --git a/daemon/owl.c b/daemon/owl.c
+index 349c6a6..75921b2 100644
+--- a/daemon/owl.c
++++ b/daemon/owl.c
+@@ -234,6 +234,8 @@ int main(int argc, char *argv[]) {
+ 	}
+ 	state.awdl_state.filter_rssi = filter_rssi;
+ 	state.awdl_state.channel.strategy = strategy;
++	if (strategy == AWDL_CHANSEQ_INTERSECT)
++		awdl_chanseq_init_shared(state.awdl_state.channel.sequence, &chan);
+ 	state.awdl_state.channel.widen_max = widen_max;
+ 	log_info("channel sequence strategy: %s",
+ 	         strategy == AWDL_CHANSEQ_PIN ? "pin" :
+diff --git a/src/channel.c b/src/channel.c
+index 826de48..921270f 100644
+--- a/src/channel.c
++++ b/src/channel.c
+@@ -54,6 +54,15 @@ void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *cha
+ 	}
+ }
+ 
++void awdl_chanseq_init_shared(struct awdl_chan *seq, const struct awdl_chan *chan) {
++	for (int i = 0; i < AWDL_CHANSEQ_LENGTH; i++) {
++		/* Slot 0 is infrastructure; the paired social slots follow the
++		 * shape observed on the peer. Never advertise an unreachable channel. */
++		seq[i] = (i == 0 || i == 6 || i == 7 || i == 14 || i == 15)
++		         ? *chan : (struct awdl_chan) CHAN_NULL;
++	}
++}
++
+ void awdl_chanseq_rotate(struct awdl_chan *dst, const struct awdl_chan *src, int delta) {
+ 	delta %= AWDL_CHANSEQ_LENGTH;
+ 	if (delta < 0)
+diff --git a/src/channel.h b/src/channel.h
+index de86666..3470b66 100644
+--- a/src/channel.h
++++ b/src/channel.h
+@@ -144,6 +144,10 @@ void awdl_chanseq_init_idle(struct awdl_chan *seq);
+ 
+ void awdl_chanseq_init_static(struct awdl_chan *seq, const struct awdl_chan *chan);
+ 
++/* Structured bootstrap for a shared radio: serve only our real channel,
++ * leaving empty slots rather than claiming an all-slot pinned sequence. */
++void awdl_chanseq_init_shared(struct awdl_chan *seq, const struct awdl_chan *chan);
++
+ /**
+  * @brief Rotate a channel sequence by {@code delta} slots into another clock phase.
+  *
 diff --git a/src/rx.c b/src/rx.c
 index 4581ae5..d05d39e 100644
 --- a/src/rx.c
@@ -119,6 +180,22 @@ index 4581ae5..d05d39e 100644
  		log_debug("awdl_action: unexpected bytes (%d) at end of frame", buf_len(frame));
  		return RX_UNEXPECTED_FORMAT;
  	}
+diff --git a/src/schedule.c b/src/schedule.c
+index c6246b0..d5470c6 100644
+--- a/src/schedule.c
++++ b/src/schedule.c
+@@ -92,6 +92,11 @@ bool awdl_same_channel_as_peer(const struct awdl_state *state, uint64_t now, con
+ 
+ int awdl_is_multicast_eaw(const struct awdl_state *state, uint64_t now) {
+ 	uint16_t slot = awdl_sync_current_eaw(now, &state->sync) % AWDL_CHANSEQ_LENGTH;
++	/* A shared radio cannot follow the usual multicast channels in slots
++	 * 0/10. Send discovery in the windows we actually share with the peer,
++	 * not on our fixed physical channel while the peer is elsewhere. */
++	if (state->channel.strategy == AWDL_CHANSEQ_INTERSECT)
++		return awdl_chan_num(state->channel.sequence[slot], state->channel.enc) != 0;
+ 	return slot == 0 || slot == 10;
+ }
+ 
 diff --git a/src/tx.h b/src/tx.h
 index 9af9daa..be504a0 100644
 --- a/src/tx.h
@@ -143,3 +220,60 @@ index a81d1f2..a552200 100644
  )
  
  target_include_directories(tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+diff --git a/tests/test_awdl_channel.cpp b/tests/test_awdl_channel.cpp
+index 7ed88ae..156adb6 100644
+--- a/tests/test_awdl_channel.cpp
++++ b/tests/test_awdl_channel.cpp
+@@ -23,6 +23,19 @@ extern "C" {
+ 
+ #include "gtest/gtest.h"
+ 
++TEST(AWDLSharedBootstrap, HasEmptySlotsAndOnlyTheRealChannel) {
++	const struct awdl_chan channels[] = {CHAN_OPCLASS_36, CHAN_OPCLASS_44, CHAN_OPCLASS_149};
++	for (const auto &chan : channels) {
++		struct awdl_chan sequence[AWDL_CHANSEQ_LENGTH];
++		awdl_chanseq_init_shared(sequence, &chan);
++		EXPECT_EQ(5, awdl_chanseq_count_chan(sequence, AWDL_CHAN_ENC_OPCLASS,
++		                                      chan.opclass.chan_num));
++		EXPECT_EQ(chan.opclass.chan_num, sequence[0].opclass.chan_num);
++		for (const auto &slot : sequence)
++			EXPECT_TRUE(slot.opclass.chan_num == 0 || slot.opclass.chan_num == chan.opclass.chan_num);
++	}
++}
++
+ /*
+  * Sequences below are real, captured from an iPhone on 2026-07-31 and decoded
+  * with opclass encoding. Slot 0 holds a non-social channel (the phone's infra
+diff --git a/tests/test_awdl_txgate.cpp b/tests/test_awdl_txgate.cpp
+index 0e4f8d9..3718aef 100644
+--- a/tests/test_awdl_txgate.cpp
++++ b/tests/test_awdl_txgate.cpp
+@@ -102,6 +102,28 @@ TEST_F(TxGate, verbatim_adoption_is_co_channel_on_every_named_slot) {
+ 	EXPECT_EQ(co_channel_slots(&state, peer), 4);
+ }
+ 
++TEST_F(TxGate, shared_multicast_uses_the_real_overlap_not_unreachable_social_slots) {
++	const uint8_t phone[AWDL_CHANSEQ_LENGTH] = {
++		149,149,149,149,149,149,36,36,6,149,149,149,149,149,36,36};
++	mkseq(peer->sequence, phone);
++	state.channel.strategy = AWDL_CHANSEQ_INTERSECT;
++	state.channel.enc = AWDL_CHAN_ENC_OPCLASS;
++	EXPECT_EQ(4, awdl_chanseq_intersect(state.channel.sequence, peer->sequence,
++	                                    peer->sequence_enc, 36));
++	for (int slot = 0; slot < AWDL_CHANSEQ_LENGTH; slot++) {
++		uint64_t now = state.sync.last_update + slot * EAW_USEC;
++		EXPECT_EQ(phone[slot] == 36, !!awdl_is_multicast_eaw(&state, now));
++	}
++}
++
++TEST_F(TxGate, normal_multicast_keeps_the_original_social_slots) {
++	state.channel.strategy = AWDL_CHANSEQ_VERBATIM;
++	for (int slot = 0; slot < AWDL_CHANSEQ_LENGTH; slot++) {
++		uint64_t now = state.sync.last_update + slot * EAW_USEC;
++		EXPECT_EQ(slot == 0 || slot == 10, !!awdl_is_multicast_eaw(&state, now));
++	}
++}
++
+ TEST_F(TxGate, pinning_is_still_co_channel_on_the_peers_slots) {
+ 	/* THE REGRESSION TEST. Pinned to 149 in all 16 slots, we should still be
+ 	 * co-channel wherever the peer names 149 -- slots 2 and 10. Fewer than

@@ -38,6 +38,9 @@ done
 if (( !found )); then log 'No supported MT7922 (14c3:0616, mt7921e); radio installation skipped.'; exit 0; fi
 if ((check)); then log 'Supported MT7922 detected; one-shot receiver installation is available.'; exit 0; fi
 if ((verify)); then
+  bash "$here/install-airdrop-receiver.sh" "$owl/.venv-opendrop" --verify || die 'Streaming receiver verification failed.'
+  grep -Eq '^[[:space:]]*export[[:space:]]+MOCHI_AIRDROP_SERVICE_ID="[0-9a-f]{12}"[[:space:]]*$' \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config" || die 'Persistent AirDrop identity is missing.'
   [[ -x "$backend/daemon/airdropd" && -x "$owl/.venv-opendrop/bin/opendrop" &&
      -x /usr/local/bin/airdrop-helper && -x /usr/local/bin/airdrop-owl &&
      -x /usr/local/bin/airdrop-go-hostapd ]] || die 'MT7922 backend is incomplete.'
@@ -47,6 +50,8 @@ if ((verify)); then
   [[ "$(git -C "$owl" rev-parse HEAD 2>/dev/null)" == "$owl_sha" ]] &&
     git -C "$owl" diff --binary | cmp -s - "$patches/owl-local.patch" ||
     die 'OWL does not match the tested patch set.'
+  cmp -s "$here/../airdrop/tests/test_awdl_rx.cpp" "$owl/tests/test_awdl_rx.cpp" ||
+    die 'OWL receive regression source is missing or changed.'
   for name in opendrop-incomplete-response opendrop-verified-archive owl-ios26-action-trailer owl-tx-backpressure; do
     cmp -s "$patches/$name.patch" "$backend/patches/$name.patch" || die "AirDrop patch $name is missing or changed."
   done
@@ -107,11 +112,20 @@ prepare_repo() {
     die "Source revision changed in $path; review before updating it."
   if git -C "$path" apply --reverse --check "$delta" 2>/dev/null; then
     log "Tested patch already applied to $path"
+  elif [[ "$path" == "$owl" &&
+          "$(git -C "$path" diff --binary | sha256sum | cut -d' ' -f1)" == 7dd07e0cb289b732aedd744e4ef61d54ac4643a12bc4390862e13fb5bae3166a ]] &&
+       git -C "$path" apply --check "$patches/owl-discovery-upgrade-v1.patch"; then
+    git -C "$path" apply "$patches/owl-discovery-upgrade-v1.patch"
+  elif [[ "$path" == "$backend" &&
+          "$(git -C "$path" diff --binary | sha256sum | cut -d' ' -f1)" == 16ab16d8f3459c9edc9b93525e98d7fa614894e43ccc5063447f42f51d45717b ]] &&
+       git -C "$path" apply --check "$patches/airdrop-mt7921-upgrade-v2.patch"; then
+    git -C "$path" apply "$patches/airdrop-mt7921-upgrade-v2.patch"
   elif [[ "$path" == "$backend" &&
           "$(git -C "$path" diff --binary | sha256sum | cut -d' ' -f1)" == bb5c8a5f308361d765ae32d1ee30624830372340ecc36794422e13f12cb0446a ]] &&
        git -C "$path" apply --check "$patches/airdrop-mt7921-upgrade-v1.patch"; then
     # Only the exact previously shipped tree may be upgraded in place.
     git -C "$path" apply "$patches/airdrop-mt7921-upgrade-v1.patch"
+    git -C "$path" apply "$patches/airdrop-mt7921-upgrade-v2.patch"
   elif git -C "$path" apply --check "$delta" 2>/dev/null; then
     [[ -z "$(git -C "$path" diff --binary)" ]] || die "Other local edits in $path; preserved."
     git -C "$path" apply "$delta"
@@ -125,6 +139,14 @@ prepare_repo() {
 mkdir -p "$data"
 prepare_repo "$backend" "$backend_url" "$backend_sha" "$patches/airdrop-mt7921-local.patch"
 prepare_repo "$owl" "$owl_url" "$owl_sha" "$patches/owl-local.patch"
+# CMake checks source existence even when building only the owl target. This
+# regression used to exist only as an untracked file on the development host.
+owl_test="$owl/tests/test_awdl_rx.cpp"
+if [[ -e "$owl_test" ]]; then
+  cmp -s "$here/../airdrop/tests/test_awdl_rx.cpp" "$owl_test" || die 'Existing OWL receive test differs; preserved.'
+else
+  install -m 644 "$here/../airdrop/tests/test_awdl_rx.cpp" "$owl_test"
+fi
 for name in opendrop-incomplete-response opendrop-verified-archive owl-ios26-action-trailer owl-tx-backpressure; do
   target="$backend/patches/$name.patch"
   if [[ -e "$target" ]]; then
@@ -151,6 +173,15 @@ if ! grep -q '^[[:space:]]*AIRDROP_CONFIRM=' "$config" 2>/dev/null; then
   ( umask 077; printf '\n# Mochi: prompt the island, not a notification daemon.\nAIRDROP_CONFIRM="%s"\n' \
     "$confirm_hook" >> "$config" )
   log 'Configured the island consent hook in the receiver config.'
+fi
+# OpenDrop otherwise changes its advertised service ID on every restart. iOS
+# can retain the old entry as a second Mochi tile. Keep one 6-byte ID in the
+# existing per-user AirDrop config across both app and backend updates.
+if ! grep -Eq '^[[:space:]]*(export[[:space:]]+)?MOCHI_AIRDROP_SERVICE_ID=' "$config"; then
+  service_id="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
+  ( umask 077; printf '\nexport MOCHI_AIRDROP_SERVICE_ID="%s"\n' "$service_id" >> "$config" )
+elif ! grep -Eq '^[[:space:]]*export[[:space:]]+MOCHI_AIRDROP_SERVICE_ID=' "$config"; then
+  ( umask 077; printf '\nexport MOCHI_AIRDROP_SERVICE_ID\n' >> "$config" )
 fi
 
 # Build the P2P-GO hostapd extension from a checksum-verified upstream source.
@@ -189,6 +220,7 @@ grep -aq 'HOSTAPD_P2P_GO=1' "$hostapd/hostapd/hostapd" || die 'Built hostapd lac
 # Upstream installs only root-owned fixed helper paths, validates sudoers with
 # visudo and builds the pinned OWL/OpenDrop receiver. No radio is started here.
 OWL_DIR="$owl" bash "$backend/install.sh" --yes
+bash "$here/install-airdrop-receiver.sh" "$owl/.venv-opendrop"
 [[ -x "$owl/.venv-opendrop/bin/opendrop" ]] || die 'Patched OpenDrop is missing.'
 grep -q 'application/x-dvzip' "$owl/.venv-opendrop/lib"/python*/site-packages/opendrop/server.py ||
   die 'OpenDrop did not receive the iPhone upload patches.'

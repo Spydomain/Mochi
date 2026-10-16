@@ -230,7 +230,11 @@ export function buildAirDropView(openSettings: () => void, back: () => void) {
     info.textContent = State.airdropError || (starting ? "Starting AirDrop radio…" : status?.message) || (on
       ? `${status?.name || State.airdropActiveName ? `Receiving as ${status?.name || State.airdropActiveName}` : "Receiver running"} · ready for an iPhone`
       : "Off · turn on to receive from an iPhone");
-    destination.textContent = on ? `Saves to ${status?.directory || State.airdropActiveDirectory || "~/Downloads"}` : "";
+    destination.textContent = on
+      ? status?.directory ? `Saves to ${status.directory}`
+        : State.airdropActiveDirectory ? `Saves to ${State.airdropActiveDirectory}`
+          : `Configured save folder: ${State.settings.airdropDirectory || "~/Downloads"} · active receiver destination unverified`
+      : "";
     // The island closes after three seconds; detailed send/receive guidance is
     // available after reopening rather than overflowing this compact card.
     clear(peers);

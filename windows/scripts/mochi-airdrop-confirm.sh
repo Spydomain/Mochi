@@ -17,6 +17,13 @@ note() {
   printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$runtime/hook.log" 2>/dev/null || true
 }
 
+# Two simultaneous /Ask handlers must never share a decision file. Keep this
+# inode across requests: removing a flock file permits a second lock on a new
+# inode while the first prompt is still alive. A competing request fails closed.
+[[ ! -L "$runtime/hook.lock" ]] || { note 'declined: unsafe consent lock'; exit 1; }
+exec 9>> "$runtime/hook.lock" || exit 1
+flock -n 9 || { note 'declined: another request is awaiting consent'; exit 1; }
+
 if [[ -e "$runtime/active" || -L "$runtime/active" ]]; then
   # A hook killed mid-transfer can leave this behind. Reuse it only when it is
   # a real, private directory of ours; a plain mkdir failed here and declined

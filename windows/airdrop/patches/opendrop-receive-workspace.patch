@@ -1,0 +1,463 @@
+--- a/server.py
++++ b/server.py
+@@ -101,7 +101,7 @@
+         # Use IPv6
+         self.serveraddress = ("::", self.config.port)
+         self.ServerClass = HTTPServerV6
+-        self.ServerClass.allow_reuse_address = False
++        self.ServerClass.allow_reuse_address = True
+ 
+         self.ip_addr = AirDropUtil.get_ip_for_interface(
+             self.config.interface, ipv6=True
+@@ -198,18 +198,22 @@
+             self._announce_stop = None
+ 
+     def _init_server(self):
+-        try:
+-            httpd = self.ServerClass(self.serveraddress, self.Handler)
+-        except OSError:
+-            # Address in use. Change port
+-            self.config.port = self.config.port + 1
+-            self.serveraddress = (self.serveraddress[0], self.config.port)
+-            httpd = self.ServerClass(self.serveraddress, self.Handler)
++        # Mochi's health checks and consent tooling use this configured port.
++        # A genuine bind conflict must be reported, not silently move the
++        # receiver to a different port that the island reports as offline.
++        httpd = self.ServerClass(self.serveraddress, self.Handler)
+ 
+         # Adapt socket for awdl0
+         if self.config.interface == "awdl0" and platform.system() == "Darwin":
+             httpd.socket.setsockopt(socket.SOL_SOCKET, 0x1104, 1)
+ 
++        # Configure the LISTENING socket before TLS and before advertising, so
++        # accepted upload sockets inherit the window from the first SYN.
++        try:
++            httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
++            logger.debug(f"SO_RCVBUF = {httpd.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)} B")
++        except OSError as exc:
++            logger.warning(f"Could not enlarge the receive buffer ({exc})")
+         httpd.socket = self.config.get_ssl_context().wrap_socket(
+             sock=httpd.socket, server_side=True
+         )
+@@ -228,29 +232,6 @@
+         properties = {b"flags": str(self.config.flags).encode("utf-8")}
+         return properties
+ 
+-        # Pin a large receive buffer, inherited by accepted connections.
+-        #
+-        # AWDL delivers in ~68 ms bursts separated by ~450 ms of silence, so a
+-        # connection gets only a couple of round trips per second. That makes the
+-        # kernel's receive-window recovery pathologically slow: measured on a real
+-        # transfer, the advertised window opened at 64766 B, collapsed to 528 B in
+-        # a single step when the sender's opening burst outran our first read(),
+-        # and then took ~40 s to crawl back to 10 kB - longer than the whole
+-        # transfer. Throughput was pinned at ~45 kB/s the entire time.
+-        #
+-        # A large fixed buffer means the opening burst cannot overrun us, so
+-        # rcv_ssthresh never collapses and never has to recover. Setting
+-        # SO_RCVBUF also disables autotuning, which is what we want here: the
+-        # kernel's bandwidth estimate is meaningless on a link this bursty.
+-        # The kernel clamps this to net.core.rmem_max and doubles what we ask for.
+-        try:
+-            httpd.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+-            logger.debug(
+-                f"SO_RCVBUF = {httpd.socket.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)} B"
+-            )
+-        except OSError as e:
+-            logger.warning(f"Could not enlarge the receive buffer ({e})")
+-
+ class HTTPServerV6(ThreadingHTTPServer):
+     """
+     One thread per connection. This MUST NOT be the stock single-threaded
+@@ -513,193 +494,50 @@
+     UPLOAD_CONTENT_TYPES = ("application/x-cpio", "application/x-dvzip")
+ 
+     def handle_upload(self):
+-        if self.headers.get("content-type", "").lower() not in self.UPLOAD_CONTENT_TYPES:
+-            logger.warning(
+-                f"Unsupported content-type: {self.headers.get('content-type')}"
+-            )
+-            self.send_response(406)  # Unprocessable Entity
+-            self.send_header("Content-Type", "application/x-cpio")
++        from .mochi_receive import HTTPChunkedReader, ReceiveWorkspace
++
++        content_type = self.headers.get("content-type", "").lower()
++        if content_type not in self.UPLOAD_CONTENT_TYPES:
++            self.send_response(406)
+             self.send_header("Content-Length", 0)
+             self.send_header("Connection", "close")
+             self.end_headers()
+             return
+-
+         if self.headers.get("transfer-encoding", "").lower() != "chunked":
+-            logger.warning("Expect chunked transfer encoding")
+-            self.send_response(400)  # Bad Request
+-            self.send_header("Transfer-Encoding", "Chunked")
++            self.send_response(400)
+             self.send_header("Content-Length", 0)
+             self.send_header("Connection", "close")
+             self.end_headers()
+             return
+ 
+-        class HTTPChunkedReader(io.RawIOBase):
+-            def __init__(self, rfile, *args, **kwargs):
+-                super().__init__(*args, **kwargs)
+-                self.rfile = rfile
+-                self.chunk = None
+-                self.total = 0
+-
+-            def _next_chunk(self):
+-                if self.chunk is None or len(self.chunk) == 0:
+-                    length = int(self.rfile.readline().rstrip(), 16)
+-                    self.chunk = self.rfile.read(length)
+-                    self.rfile.readline()  # strip trailing \n\r
+-
+-            def readinto(self, buf):
+-                self._next_chunk()
+-                length = min(len(self.chunk), len(buf))
+-                buf[:length] = self.chunk[:length]
+-                self.chunk = self.chunk[length:]
+-                self.total += length
+-                return length
+-
+-        def extract_stream(stream, flags=0):
+-            """
+-            Extracts an archive from memory into the current directory.
+-            """
+-
+-            with libarchive.read.stream_reader(stream) as archive:
+-                libarchive.extract.extract_entries(archive, flags)
+-
+-        def dvzip_to_cpio(path):
+-            """
+-            Decode Apple's dvzip container into the cpio archive inside it.
+-
+-            iOS 26 wraps the cpio in a sequence of length-prefixed blocks, which
+-            libarchive does not recognise ("Unrecognized archive format"):
+-
+-                [4-byte big-endian header][block payload] ...
+-
+-            Bit 31 of the header means the payload is STORED; otherwise it is a
+-            zlib stream. The low 31 bits are the payload length. Blocks
+-            decompress to 128 KiB each except the last. Verified against a
+-            2.06 MB photo transfer: 17 blocks, whole file consumed exactly,
+-            yielding an ODC cpio ("070707") holding IMG_8276.JPG.
+-            """
+-            out = bytearray()
+-            with open(path, "rb") as f:
+-                while True:
+-                    header = f.read(4)
+-                    if len(header) < 4:
+-                        break
+-                    (raw,) = struct.unpack(">I", header)
+-                    stored = raw >> 31
+-                    length = raw & 0x7FFFFFFF
+-                    if length == 0:
+-                        break
+-                    payload = f.read(length)
+-                    if len(payload) < length:
+-                        # A truncated block is NOT a lost file. Measured over
+-                        # 17 interrupted transfers: 9 of them already held the
+-                        # complete cpio and had lost only the container's
+-                        # terminator - the extracted JPEG matched the sender's
+-                        # sha256 exactly. Raising here therefore threw whole
+-                        # files away. Keep what arrived and let extraction
+-                        # decide what is usable.
+-                        logger.warning(
+-                            f"dvzip block truncated (wanted {length}, got "
+-                            f"{len(payload)}) - salvaging what arrived")
+-                        if stored:
+-                            out += payload
+-                        else:
+-                            try:
+-                                out += zlib.decompressobj().decompress(payload)
+-                            except zlib.error as exc:
+-                                logger.warning(f"  tail block unusable ({exc})")
+-                        break
+-                    out += payload if stored else zlib.decompress(payload)
+-            return bytes(out)
+-
+         logger.info("Receiving file(s) ...")
+         start = time.time()
++        storage = ReceiveWorkspace(os.getcwd(), "dvzip" if "dvzip" in content_type else "cpio")
++        raw_path = str(storage.raw_path)
+         reader = HTTPChunkedReader(self.rfile)
+-
+-        # Buffer to disk first, then extract. Extracting straight off the socket
+-        # means a container libarchive cannot parse leaves us with a half-read
+-        # stream and nothing to show for it - and x-dvzip is new enough here that
+-        # it is worth keeping the bytes regardless. The raw archive is only
+-        # removed once extraction has actually succeeded.
+-        raw_path = os.path.join(
+-            os.getcwd(), f"airdrop-received-{int(start)}.{'dvzip' if 'dvzip' in self.headers.get('content-type', '') else 'cpio'}"
+-        )
++        # Upload inactivity is independent of the short request-header timeout.
++        # Each underlying read renews it; no deadline on the whole transfer.
++        stall = max(60.0, min(3600.0, float(os.environ.get("AIRDROP_UPLOAD_IDLE_TIMEOUT", "300"))))
++        self.connection.settimeout(stall)
+         with open(raw_path, "wb") as raw:
+-            # Only now tell the sender to go ahead. Upstream answered
+-            # 'Expect: 100-continue' before the chunked check, the reader and this
+-            # open() - so the phone began transmitting while we were still getting
+-            # ready, and its opening burst collapsed our receive window (see the
+-            # SO_RCVBUF note in create_server). Answering once we are genuinely
+-            # ready to read costs nothing and removes that race.
+             if self.headers.get("expect", "").lower() == "100-continue":
+                 self.send_response(100)
+                 self.send_header("Content-Length", 0)
+                 self.end_headers()
+-
+-            # A read timeout. _next_chunk blocked in readline() with no
+-            # deadline: when the phone stops transmitting - which happens near
+-            # the end, regularly, on this link - the loop never ended, the
+-            # `with` never closed, and even the bytes already received stayed
+-            # in the write buffer. The value is wide compared to the measured
+-            # AWDL jitter (RTT ~400 ms, bursts ~450 ms apart) so that a merely
+-            # slow transfer is not cut off.
+-            stall = float(os.environ.get("AIRDROP_STALL_TIMEOUT", "30"))
+-            floor = float(os.environ.get("AIRDROP_STALL_FLOOR", "8"))
+-
+-            # THE TIMEOUT FOLLOWS THE LINK'S RHYTHM; it is not a constant.
+-            #
+-            # A flat 30 s is added to EVERY salvaged transfer: of one measured
+-            # 43 s transfer, thirty were spent waiting on a sender that had
+-            # already gone quiet. But it cannot simply be shortened - the link
+-            # delivers in bursts, and cutting off a slow transfer would be
+-            # worse than waiting.
+-            #
+-            # First attempt, abandoned: trigger a short tier once close to
+-            # TotalBytes. That assumes the sender always stops at the edge,
+-            # which is false - measured, stops range from 440 bytes to 943,642
+-            # bytes short, 0.03% to 24%. No threshold covers both.
+-            #
+-            # So it no longer guesses where the end is: it watches the gap
+-            # between successful reads and waits a large multiple of the worst
+-            # gap seen so far. A steady link drops to the floor within
+-            # seconds; a choppy one lets the timeout climb on its own. The
+-            # floor stays ten times above the measured burst spacing (~450 ms,
+-            # 772 ms jitter), and the ceiling is the old value, so it can
+-            # never wait LONGER than before.
+-            _arm = lambda sec: self.connection.settimeout(sec)
+-            try:
+-                _arm(stall)
+-            except OSError:
+-                _arm = lambda sec: None
+-
+-            armed = stall
+-            worst = 0.0
+-            last = time.monotonic()
+             try:
+                 while True:
+                     buf = reader.read(65536)
+                     if not buf:
+                         break
+                     raw.write(buf)
+-
+-                    now = time.monotonic()
+-                    gap, last = now - last, now
+-                    if gap > worst:
+-                        worst = gap
+-                        want = min(max(worst * 6.0, floor), stall)
+-                        # Only re-arm on a real change: calling settimeout on
+-                        # every 64 KiB block would be one syscall per block for
+-                        # nothing.
+-                        if abs(want - armed) > 0.5:
+-                            try:
+-                                _arm(want)
+-                            except OSError:
+-                                pass
+-                            armed = want
++                    # A parsed CPIO trailer is authoritative even when the
++                    # phone loses the final HTTP zero chunk over AWDL.
++                    if storage.observe(buf):
++                        logger.info("Verified archive trailer received")
++                        break
+             except (socket.timeout, TimeoutError):
+-                logger.warning(
+-                    f"sender went quiet for {armed:.0f}s after {reader.total} B "
+-                    f"(worst gap seen {worst:.1f}s) - salvaging what arrived")
+-            except (ConnectionResetError, ValueError) as exc:
++                logger.warning(f"sender went quiet for {stall:.0f}s after {reader.total} B - salvaging")
++            except (OSError, ValueError) as exc:
+                 logger.warning(f"upload stream broke ({exc}) - salvaging")
+             finally:
+                 raw.flush()
+@@ -733,13 +571,15 @@
+                 # leading minus, and a negative filesize leaves `off` where it
+                 # was: the loop then spins forever IN THE REQUEST THREAD, on a
+                 # file crafted for it. A zero namesize does not advance either.
+-                if namesize <= 0 or filesize < 0:
++                if not 1 <= namesize <= 65536 or filesize < 0:
+                     break
+                 name_off = off + 76
++                if name_off + namesize > n or cpio[name_off + namesize - 1:name_off + namesize] != b"\0":
++                    break
+                 name = cpio[name_off:name_off + namesize].split(b"\0")[0]
+                 name = name.decode("utf-8", "replace")
+                 data_off = name_off + namesize
+-                if name == "TRAILER!!!":
++                if name == "TRAILER!!!" and filesize == 0:
+                     trailer = True
+                     break
+                 # The mode matters. An iOS archive starts with the WRAPPER
+@@ -781,15 +621,16 @@
+                 # os.replace() below, so an arbitrary file of the user's would
+                 # be renamed. Resolve it and require the result to stay under
+                 # the current directory.
+-                root = os.path.realpath(os.getcwd())
++                root = str(storage.root)
+                 path = os.path.realpath(os.path.join(root, name))
+                 if path != root and not path.startswith(root + os.sep):
+-                    logger.warning(f"refusing member outside the receive dir: {name}")
++                    bad.append(name)
+                     continue
+-                if not os.path.exists(path):
++                if not os.path.isfile(path) or os.path.islink(path):
++                    bad.append(name)
+                     continue
+-                if complete:
+-                    good.append(base)
++                if complete and os.path.getsize(path) == arrived:
++                    good.append(name)
+                 else:
+                     bad.append(base)
+                     # TRIM THE PADDING. Keeping it made the .partial claim
+@@ -817,100 +658,54 @@
+                         pass
+             return good, bad, trailer
+ 
+-        # TotalBytes describes the uncompressed archive on iOS 26, NOT the
+-        # compressed dvzip wire length. Only an intact cpio trailer and complete
+-        # extracted members can justify a success response.
+         complete = False
++        good = []
+         try:
+             if raw_path.endswith(".dvzip"):
+-                cpio_bytes = dvzip_to_cpio(raw_path)
+-                try:
+-                    libarchive.extract_memory(cpio_bytes)
+-                except Exception as e:  # noqa: BLE001
+-                    # A truncated archive raises AFTER writing the complete
+-                    # members, so nothing already on disk is lost.
+-                    logger.warning(f"archive ended early ({e}) - checking what landed")
+-                good, bad, trailer = verify_extracted(cpio_bytes)
+-                if bad:
+-                    logger.warning(f"incomplete, kept as .partial: {', '.join(bad)}")
+-                if not good:
+-                    raise ValueError("no complete file in the transfer")
+-                complete = not bad and trailer
+-                if not trailer:
+-                    logger.warning("upload archive has no verified trailer")
+-                logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+-                if complete:
+-                    os.remove(raw_path)
++                cpio_bytes = storage.decode_dvzip(raw_path)
++                extract_path = storage.decoded_path
++                container_complete = storage.container_complete
+             else:
+-                # THE SAME VERIFICATION AS FOR dvzip. This path used to extract
+-                # and then delete the raw bytes without checking anything - and
+-                # libarchive zero-pads a truncated member here too, so an
+-                # interrupted cpio came out "successful" with a file full of
+-                # zeros and its source destroyed. The .partial guarantee only
+-                # held for dvzip.
+-                #
+-                # The extraction failure stays LOCAL: on a cut archive
+-                # libarchive can raise after writing whole members, and letting
+-                # that reach the outer handler left those files unclassified -
+-                # so incomplete ones were never renamed .partial. Verify in
+-                # every case.
+-                try:
+-                    with open(raw_path, "rb") as raw:
+-                        extract_stream(raw)
+-                except Exception as exc:  # noqa: BLE001 - verification decides
+-                    logger.warning(f"archive ended early ({exc}) - checking what landed")
+-
+-                # x-cpio uploads are GZIP-COMPRESSED - opendrop's own sender
+-                # builds them with filter_name="gzip". Walking the raw bytes
+-                # for the ODC magic therefore finds nothing, `good` comes back
+-                # empty, and a perfectly good transfer is reported as "no
+-                # complete file" with its raw file kept beside the extracted
+-                # ones. Decompress first when the gzip magic is there.
+-                #
+-                # mmap rather than read() on the uncompressed path: it used to
+-                # stream, and loading it whole doubled the footprint on a 45 MB
+-                # video. odc_members only ever slices, so a mapping is enough.
+-                with open(raw_path, "rb") as fh:
+-                    size = os.fstat(fh.fileno()).st_size
+-                    if not size:
+-                        good, bad, trailer = [], [], False
+-                    elif fh.read(2) == b"\x1f\x8b":
+-                        # Not GzipFile.read(): on a cut-off transfer the gzip
+-                        # stream is truncated too, and read() raises EOFError.
+-                        # That skipped verification entirely, so the
+-                        # zero-padded members libarchive had written were never
+-                        # renamed .partial. A raw decompressobj returns every
+-                        # byte that did arrive without raising, and
+-                        # odc_members already reads a short buffer as
+-                        # incomplete members.
+-                        fh.seek(0)
+-                        gz = zlib.decompressobj(16 + zlib.MAX_WBITS)
+-                        good, bad, trailer = verify_extracted(gz.decompress(fh.read()))
+-                        trailer = trailer and gz.eof
+-                    else:
+-                        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as cpio_bytes:
+-                            good, bad, trailer = verify_extracted(cpio_bytes)
+-                if bad:
+-                    logger.warning(f"incomplete, kept as .partial: {', '.join(bad)}")
+-                if not good:
+-                    raise ValueError("no complete file in the transfer")
+-                complete = not bad and trailer
+-                if not trailer:
+-                    logger.warning("upload archive has no verified trailer")
+-                logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+-                if complete:
+-                    os.remove(raw_path)
+-        except Exception as e:  # noqa: BLE001 - any failure here must not lose the bytes
+-            logger.warning(f"Could not extract the archive ({e}).")
+-            logger.warning(f"The raw transfer is kept at {raw_path}")
++                with open(raw_path, "rb") as incoming:
++                    compressed = incoming.read(2) == b"\x1f\x8b"
++                if compressed:
++                    cpio_bytes, container_complete = storage.decode_gzip(raw_path)
++                    extract_path = storage.decoded_path
++                else:
++                    cpio_bytes = storage.map_cpio(raw_path)
++                    extract_path = raw_path
++                    container_complete = True
++            extracted = True
++            try:
++                storage.extract_file(extract_path)
++            except Exception as exc:
++                extracted = False
++                logger.warning(f"archive ended early ({exc}) - checking what landed")
++            good, bad, trailer = verify_extracted(cpio_bytes)
++            complete = not bad and trailer
++            complete = complete and container_complete and (bool(good) or storage.has_user_directories) and extracted
++            if bad:
++                logger.warning(f"incomplete, kept as .partial: {', '.join(bad)}")
++            if not trailer:
++                logger.warning("upload archive has no verified trailer")
++        except Exception as exc:
++            logger.warning(f"Could not extract the archive ({exc})")
++        try:
++            published = storage.finish(complete, good)
++            if published or complete:
++                logger.info(f"Extracted into {storage.destination}: {', '.join(published) or '(empty folders)'}")
++            if not complete:
++                logger.warning(f"Recovery files kept privately at {storage.directory}")
++        except Exception as exc:
++            complete = False
++            logger.warning(f"Could not publish files ({exc}); workspace preserved at {storage.directory}")
+ 
+         transferred = reader.total / 1024.0 / 1024.0
+-        speed = transferred / (time.time() - start)
++        speed = transferred / max(time.time() - start, 0.001)
+         logger.info(
+             f"File(s) {'received' if complete else 'incomplete'} "
+             f"(size {transferred:.02f} MB, speed {speed:.02f} MB/s)"
+         )
+-
+         self.send_response(200 if complete else 500)
+         self.send_header("Content-Length", 0)
+         self.send_header("Connection", "close")

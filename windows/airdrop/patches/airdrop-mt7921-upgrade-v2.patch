@@ -1,0 +1,88 @@
+--- a/daemon/airdrop-helper
++++ b/daemon/airdrop-helper
+@@ -188,6 +188,30 @@
+   return 1
+ }
+ 
++awdl_queue_tune() {
++  # Bound TAP queue latency without changing the station or its Wi-Fi policy.
++  ip link set dev awdl0 txqueuelen 8 || return 1
++  command -v tc >/dev/null 2>&1 || return 0
++  # cBPF generated from: ip6 and ip6[6] = 6 and ip6[40:2] = 8771
++  # and (ip6[53] & 0x3f) = 0x10
++  # and ip6[4:2] = ((ip6[52] & 0xf0) >> 2).
++  # The match returns -1 for tc's classid, not libpcap's snapshot length.
++  # Only EMPTY receiver TCP ACKs enter CAKE; file data, TLS handshakes,
++  # discovery, IPv6 control traffic and sends use the unshaped second band.
++  local ack_filter='19,40 0 0 12,21 0 16 34525,48 0 0 20,21 0 14 6,40 0 0 54,21 0 12 8771,48 0 0 67,84 0 0 63,21 0 9 16,40 0 0 18,2 0 0 8,48 0 0 66,84 0 0 240,116 0 0 2,7 0 0 0,96 0 0 8,29 0 1 0,6 0 0 4294967295,6 0 0 0'
++  if tc qdisc replace dev awdl0 root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 2>/dev/null &&
++     tc qdisc replace dev awdl0 parent 1:1 handle 10: cake bandwidth 32kbit besteffort ack-filter 2>/dev/null &&
++     tc qdisc replace dev awdl0 parent 1:2 handle 20: fq_codel 2>/dev/null &&
++     tc filter add dev awdl0 parent 1: protocol ipv6 prio 1 bpf bytecode "$ack_filter" flowid 1:1 2>/dev/null; then
++    return 0
++  fi
++  # Optional kernel qdiscs may be unavailable on another distribution. Keep
++  # the short queue and remove partial classification, never fail discovery.
++  tc qdisc del dev awdl0 root 2>/dev/null || true
++  echo 'airdrop-helper: ACK filtering unavailable; using short AWDL queue' >&2
++  return 0
++}
++
+ ap_channel() {
+   iw dev "$IFACE" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
+ }
+@@ -507,6 +531,7 @@
+       sleep 0.1
+     done
+     if ip link show awdl0 >/dev/null 2>&1; then
++      awdl_queue_tune || exit 1
+       ip link set awdl0 up 2>/dev/null
+       echo '{"awdl0":true}'
+     else
+--- a/daemon/airdropd
++++ b/daemon/airdropd
+@@ -625,6 +625,7 @@
+   # to be able to end the process with the card half torn down - in exclusive
+   # mode that is "Wi-Fi gone until you fix it by hand".
+   trap '' INT TERM
++  stop_receiver_wake
+   [ "$EXCL" = 1 ] && set_state restoring "bringing the Wi-Fi back"
+   teardown
+   [ -n "${BLE_PID:-}" ] && kill "$BLE_PID" 2>/dev/null
+@@ -1030,6 +1031,28 @@
+   return 1
+ }
+ 
++start_receiver_wake() {
++  # BlueZ owns the advertisement; never reset the shared Bluetooth controller.
++  # Keep it in the receiver service's cgroup so switching AirDrop off removes
++  # it even when a parent process is killed unexpectedly.
++  if [ -n "${RX_WAKE_PID:-}" ] && kill -0 "$RX_WAKE_PID" 2>/dev/null; then
++    return 0
++  fi
++  local script="$REPO/tools/blewake-dbus.py"
++  if [ -f "$script" ] && command -v python3 >/dev/null 2>&1; then
++    python3 "$script" >> "$LOG" 2>&1 &
++    RX_WAKE_PID=$!
++  fi
++}
++
++stop_receiver_wake() {
++  if [ -n "${RX_WAKE_PID:-}" ]; then
++    kill "$RX_WAKE_PID" 2>/dev/null || true
++    wait "$RX_WAKE_PID" 2>/dev/null || true
++    RX_WAKE_PID=""
++  fi
++}
++
+ serve_forever() {
+   log "always-on mode - bringing stack up"
+   set_state waking "switch"
+@@ -1049,6 +1072,7 @@
+   export AIRDROP_CONFIRM_TIMEOUT="${AIRDROP_CONFIRM_TIMEOUT:-15}"
+ 
+   while :; do
++    start_receiver_wake
+     # -d matches airdrop.sh's invocation. Without it opendrop logs only
+     # "File(s) received (size 0.00 MB)" with no request headers, so a transfer
+     # that arrives empty is indistinguishable from one that never carried a

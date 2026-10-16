@@ -1165,11 +1165,10 @@ function airDropSection(): HTMLElement {
     try {
       const nextName = name.value.trim();
       const nextFolder = folder.value.trim();
-      await Bridge.airdropValidate(nextName, nextFolder);
+      await Bridge.airdropSavePreferences(nextName, nextFolder);
       settings.airdropName = nextName;
       settings.airdropDirectory = nextFolder;
-      await save();
-      feedback.textContent = "Saved. Turn AirDrop off and on to apply these changes.";
+      feedback.textContent = "Saved across restarts and updates. If AirDrop is already on, its current transfer keeps using the old folder; turn it off and on after the transfer to apply this change.";
     } catch (err) {
       feedback.textContent = String(err);
     } finally { apply.disabled = false; }

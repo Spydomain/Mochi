@@ -136,6 +136,8 @@ export const Bridge = {
   airdropTransfer: () => call<AirDropTransfer | null>("airdrop_transfer"),
   airdropDecide: (id: string, accept: boolean) => callOrThrow<void>("airdrop_decide", { id, accept }),
   airdropValidate: (name: string, directory: string) => callOrThrow<void>("airdrop_validate", { name, directory }),
+  airdropSavePreferences: (name: string, directory: string) =>
+    callOrThrow<void>("airdrop_save_preferences", { name, directory }),
   airdropPeers: (named = false) => callOrThrow<AirDropPeer[]>("airdrop_peers", { named }),
   /** Open Omdrop's native multi-file chooser, then send to exactly this peer. */
   airdropSend: (mac: string) => callOrThrow<string>("airdrop_send", { mac }),

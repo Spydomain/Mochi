@@ -1006,7 +1006,11 @@ export class Island {
   onCursor(x: number, y: number) {
     // WebKitGTK can deliver a mousemove after the pointer has left the layer
     // surface; trusting it re-enters the island and the auto-close never runs.
-    if (this.pointerInside === false) {
+    // Linux parks its compositor pointer watch while hidden. Its last "outside"
+    // report is stale then, and the hidden island sits over the middle of the
+    // wake strip: rejecting a real WebKit mousemove makes that area impossible
+    // to wake after a long idle. Once opened, live compositor reports win again.
+    if (this.pointerInside === false && State.mode !== "hidden") {
       x = -10_000;
       y = -10_000;
     }

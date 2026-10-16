@@ -117,6 +117,21 @@ test("AirDrop reports its radio starting immediately", () => {
   assert.match(view.el.querySelector(".airdrop-view-power").textContent, /Turning on/);
 });
 
+test("a restarted app displays the live receiver folder, never invents Downloads", () => {
+  reset();
+  State.settings.airdropDirectory = "/user/selected/folder";
+  State.airdropStatus = { ...State.airdropStatus, receiving: true, visible: true,
+    directory: "/receiver/actual/folder" };
+  const view = buildAirDropView(() => {}, () => {});
+  view.sync();
+  assert.match(view.el.textContent, /Saves to \/receiver\/actual\/folder/);
+  assert.doesNotMatch(view.el.textContent, /Saves to \/user\/selected\/folder/);
+  State.airdropStatus = { ...State.airdropStatus, directory: null };
+  view.sync();
+  assert.match(view.el.textContent, /Configured save folder: \/user\/selected\/folder/);
+  assert.match(view.el.textContent, /destination unverified/);
+});
+
 test("AirDrop compact ring uses measured upload bytes, never fabricated progress", () => {
   reset();
   const indicator = buildAirDropCompactStatus();
@@ -277,18 +292,18 @@ test("incoming consent shows sender and requires explicit answer for the matchin
   } finally { internals.invoke = original; }
 });
 
-test("consent is polled on its own fast timer, never behind the transfer read", () => {
+test("consent gets a native wake event and an independent fallback poll, never behind transfer reads", () => {
   const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
-  // The consent poll must not share the status or archive-read guard: a slow
-  // archive read, an unfinished status poll, or a busy agent card used to leave
-  // the receiver's /Ask window waiting and the prompt never appeared.
+  // A hidden WebKit page may throttle timers. Rust watches the request file
+  // and emits an event; the fallback also covers startup and missed events.
   const consent = source.slice(
-    source.indexOf("if (State.os !== \"linux\" || checkingIncoming) return;"),
+    source.indexOf("const checkIncoming = () => {"),
     source.indexOf("window.setInterval(() => {\n    if (State.os !== \"linux\" || checkingTransfer)"),
   );
-  assert.ok(consent.length > 400, "consent callback must be its own interval");
+  assert.ok(consent.length > 500, "consent callback must be independent");
   assert.match(consent, /checkingIncoming = false;/);
-  assert.match(consent, /\}, 200\);/);
+  assert.match(consent, /onEvent<null>\("airdrop-incoming", checkIncoming\)/);
+  assert.match(consent, /window\.setInterval\(checkIncoming, 200\)/);
   assert.match(consent, /island\.alert\("airdropRequest"\)/);
   assert.doesNotMatch(consent, /if \(!State\.airdropStatus\?\.receiving\)|lastTransferCheck|Bridge\.airdropTransfer/);
 });
@@ -310,13 +325,14 @@ test("incoming consent preempts a busy or hover-open island and restores the pri
   const { Island } = await import("../src/island/island.ts");
   const { IslandStateMachine } = await import("../src/island/fsm.ts");
   reset();
-  State.mode = "expanded";
-  State.view = "overview";
+  State.mode = "hidden";
+  State.view = "approval";
   State.airdropRequest = { id: "f".repeat(32), sender: "Nearby iPhone", detail: "Photo" };
   State.pendingApproval = { questions: null };
   const island = Object.create(Island.prototype);
   island.fsm = new IslandStateMachine();
   island.fsm.openOnHover = true;
+  island.setMode = mode => { State.mode = mode; };
   island.animateGeometry = () => {};
   island.noticeTimer = null;
   island.noticeActive = false;
@@ -326,6 +342,7 @@ test("incoming consent preempts a busy or hover-open island and restores the pri
   island.wasInIsland = true;
   try {
     island.alert("overview");
+    assert.equal(State.mode, "expanded", "the prompt opens from a long-hidden island");
     assert.equal(State.view, "airdropRequest");
     assert.equal(island.fsm.pinned, true);
     island.setView("finished");
