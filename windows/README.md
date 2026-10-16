@@ -1,6 +1,6 @@
 # Mochi on Windows
 
-Mochi is a compact desktop companion for coding-agent activity, chat, media, shortcuts, and system status. This directory contains the shared web interface and Tauri desktop application. The [main guide](../README.md) covers the automated Linux installation; Windows is built from source here.
+Mochi is a Dynamic Island-style desktop companion for coding-agent activity, chat, media, shortcuts, and system status. This directory contains its shared TypeScript interface and Tauri/Rust desktop application. The [main guide](../README.md) covers the automated Linux installation; Windows is built from source here.
 
 ![Mochi's shared interface running on Linux](../docs/media/mochi-overview.png)
 

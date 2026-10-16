@@ -1,6 +1,6 @@
 # Mochi
 
-A small desktop companion that lives at the top edge of your screen. Mochi brings agent activity, media controls, system status, time and weather into one capsule that opens when you need it and stays out of the way when you do not.
+Mochi is a Linux-first, Dynamic Island-style desktop companion built with Tauri, Rust, and TypeScript. Its compact top-edge capsule brings OpenCode and coding-agent activity, MPRIS media controls, battery status, time, and weather together without taking over your desktop. On supported MediaTek MT7922 hardware, an experimental AirDrop/AWDL receiver can accept iPhone transfers with explicit consent. The repository also contains Windows and Apple-platform source.
 
 ![Mochi opening from its compact capsule on Linux](docs/media/mochi-demo.gif)
 
