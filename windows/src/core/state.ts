@@ -14,6 +14,7 @@ import { DEFAULT_OUTFIT, type Outfit } from "../mochi/wardrobe";
 import { pillColor } from "./pill-colors";
 import { Spotify, musicPlaying } from "./spotify";
 import type { WeatherLocation, WeatherReport } from "./weather";
+import type { AirDropPeer, AirDropStatus, AirDropTransfer } from "./bridge";
 
 export type AgentSource = "claudeCode" | "n8n" | "agent";
 export type PillBadge = "approval" | "finished" | "error";
@@ -130,6 +131,13 @@ export interface Settings {
   planRelayInstalled: boolean;
   /** Show the Codex plan pill in the island's header. */
   showCodexPlanInNotch: boolean;
+  /** Header indicator visibility. All are enabled on a fresh install. */
+  showAirDropInNotch: boolean;
+  showBatteryInNotch: boolean;
+  showKeepAwakeInNotch: boolean;
+  airdropName: string;
+  /** Empty uses ~/Downloads. Changes take effect the next time AirDrop starts. */
+  airdropDirectory: string;
   /** Who the chat talks to (see core/providers.ts); picked in the chat view. */
   chatProvider: ProviderId;
   /** The model picked for each provider other than Anthropic, by provider id. */
@@ -192,7 +200,12 @@ export const DEFAULT_SETTINGS: Settings = {
   model: "claude-opus-5",
   showPlanInNotch: false,
   planRelayInstalled: false,
-  showCodexPlanInNotch: false,
+  showCodexPlanInNotch: true,
+  showAirDropInNotch: true,
+  showBatteryInNotch: true,
+  showKeepAwakeInNotch: true,
+  airdropName: "Mochi",
+  airdropDirectory: "",
   chatProvider: "anthropic",
   chatModels: {},
   ollamaUrl: "",
@@ -284,6 +297,22 @@ class AppState {
   keepAwake = false;
   keepAwakePending = false;
   keepAwakeError = "";
+
+  /** Omdrop owns the radio and receiver; these are only its last reported state. */
+  airdropStatus: AirDropStatus | null = null;
+  airdropPeers: AirDropPeer[] = [];
+  airdropPending = false;
+  airdropScanning = false;
+  airdropSending = false;
+  airdropNotice = "";
+  airdropError = "";
+  airdropRequest: { id: string; sender: string; detail: string } | null = null;
+  airdropDeciding = false;
+  airdropAnsweredId: string | null = null;
+  airdropTransfer: "waiting" | "receiving" | "complete" | "failed" | null = null;
+  airdropProgress: Pick<AirDropTransfer, "receivedBytes" | "totalBytes"> | null = null;
+  airdropActiveName: string | null = null;
+  airdropActiveDirectory: string | null = null;
 
   /** Current battery reading, shared with the charging animation's poller. */
   powerStatus: PowerStatus | null = null;

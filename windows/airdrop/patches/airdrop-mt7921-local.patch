@@ -1,0 +1,275 @@
+diff --git a/README.md b/README.md
+index a82fb42..b4d6ff0 100644
+--- a/README.md
++++ b/README.md
+@@ -25,7 +25,8 @@ cd airdrop-mt7921
+ ./install.sh
+ ```
+ 
+-It builds [owl](https://github.com/jedbillyb/owl) and a patched OpenDrop,
++It builds [owl](https://github.com/jedbillyb/owl) with the local
++[TX backpressure fix](patches/README.md#owl-tx-backpressurepatch) and a patched OpenDrop,
+ installs a root-owned helper, adds one passwordless-sudo rule for it (it shows
+ you the rule and asks first), writes `~/.config/airdrop/config` and links the
+ waybar module. **Run it again after every `git pull`**: the owl build, the
+@@ -55,7 +56,7 @@ and tcpdump. waybar is optional.
+    for p in ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog \
+             upload-arms ask-confirm mdns-reannounce threaded-server url-items \
+             zeroconf-update-service salvage-truncated salvage-trim \
+-            send-multifile send-status send-stall; do
++            send-multifile send-status send-stall incomplete-response; do
+      GIT_DIR=/nonexistent git apply /path/to/airdrop-mt7921/patches/opendrop-$p.patch || break
+    done
+    ```
+diff --git a/daemon/README.md b/daemon/README.md
+index e2e88c7..e892025 100644
+--- a/daemon/README.md
++++ b/daemon/README.md
+@@ -248,6 +248,12 @@ The Wi-Fi association is **never dropped** — that is the whole point of P2P-GO
+ mode over `airdrop.sh`'s exclusive path. `go0` holds its own channel context
+ while `wlp2s0` stays associated somewhere else.
+ 
++The local Mochi coexistence update also suspends the managed station's 802.11
++power saving while the radio is shared. This is separate from the firmware's
++runtime-PM controls. The helper saves the original setting in a private,
++root-owned directory under `/run` and restores it on teardown, including
++repeated stops. It does not reactivate or disconnect the Wi-Fi connection.
++
+ **Measured cost while the switch is on:** uplink latency goes from ~2 ms to
+ roughly 200–400 ms, occasionally to ~590 ms, and stays there the entire time
+ `go0` is up. Packet loss stays at or near 0%. Toggling off returns it
+diff --git a/daemon/airdrop-helper b/daemon/airdrop-helper
+index 2d82eba..3f55d7b 100755
+--- a/daemon/airdrop-helper
++++ b/daemon/airdrop-helper
+@@ -192,6 +192,51 @@ ap_channel() {
+   iw dev "$IFACE" info 2>/dev/null | grep -oP 'channel \K[0-9]+'
+ }
+ 
++# Firmware runtime PM and the managed station's 802.11 power saving are
++# separate controls. Keep the station awake while it shares the radio with
++# AWDL, then restore the user's original setting without reassociating.
++COEX_STATE_DIR=/run/airdrop-coexistence
++wifi_coexistence_begin() {
++  local saved previous
++  [ -n "$IFACE" ] || return 1
++  case "$IFACE" in *[!a-zA-Z0-9_.-]*) return 1 ;; esac
++  if [ ! -e "$COEX_STATE_DIR" ]; then
++    mkdir -m 700 "$COEX_STATE_DIR" || return 1
++  fi
++  if [ -L "$COEX_STATE_DIR" ] || [ ! -d "$COEX_STATE_DIR" ] \
++     || [ "$(stat -c '%u %a' "$COEX_STATE_DIR")" != '0 700' ]; then
++    echo 'airdrop-helper: unsafe coexistence state directory' >&2
++    return 1
++  fi
++  saved="$COEX_STATE_DIR/$IFACE.powersave"
++  if [ ! -e "$saved" ]; then
++    previous=$(iw dev "$IFACE" get power_save | awk '/Power save:/{print $3}')
++    case "$previous" in on|off) ;; *) return 1 ;; esac
++    (umask 077; printf '%s\n' "$previous" > "$saved") || return 1
++  fi
++  if [ -L "$saved" ] || [ ! -f "$saved" ]; then return 1; fi
++  IFS= read -r previous < "$saved" || return 1
++  case "$previous" in on|off) ;; *) return 1 ;; esac
++  iw dev "$IFACE" set power_save off
++}
++
++wifi_coexistence_end() {
++  local saved previous
++  [ -n "$IFACE" ] || return 0
++  case "$IFACE" in *[!a-zA-Z0-9_.-]*) return 1 ;; esac
++  saved="$COEX_STATE_DIR/$IFACE.powersave"
++  [ -e "$saved" ] || return 0
++  if [ -L "$COEX_STATE_DIR" ] || [ -L "$saved" ] \
++     || [ "$(stat -c '%u %a' "$COEX_STATE_DIR")" != '0 700' ]; then return 1; fi
++  IFS= read -r previous < "$saved" || return 1
++  case "$previous" in on|off) ;; *) return 1 ;; esac
++  if iw dev "$IFACE" set power_save "$previous"; then
++    rm -f -- "$saved"
++  else
++    return 1
++  fi
++}
++
+ case "${1:-}" in
+   ap-channel)
+     ap_channel
+@@ -216,6 +261,7 @@ case "${1:-}" in
+       echo 0 > "$MT76/runtime-pm" 2>/dev/null
+       echo 0 > "$MT76/deep-sleep" 2>/dev/null
+     fi
++    wifi_coexistence_begin || exit 1
+     printf '{"iface":"%s","mon":"%s","active":%s,"chan":%s}\n' \
+       "$IFACE" "$MON" \
+       "$(ip link show $MONA >/dev/null 2>&1 && echo true || echo false)" \
+@@ -337,6 +383,7 @@ EOF
+ 
+     echo 0 > "$MT76/runtime-pm" 2>/dev/null
+     echo 0 > "$MT76/deep-sleep" 2>/dev/null
++    wifi_coexistence_begin || exit 1
+     printf '{"go":"%s","mon":"%s","ackvif":"%s","chan":%s}\n' \
+       "$GO" "$MON" "$ACKVIF" "$chan"
+     ;;
+@@ -373,6 +420,7 @@ EOF
+     rm -f "$GO_CONF"
+     echo 1 > "$MT76/runtime-pm" 2>/dev/null
+     echo 1 > "$MT76/deep-sleep" 2>/dev/null
++    wifi_coexistence_end || exit 1
+     echo '{"ok":true}'
+     ;;
+ 
+@@ -568,6 +616,7 @@ EOF
+     iw dev $MON del 2>/dev/null
+     echo 1 > "$MT76/runtime-pm" 2>/dev/null
+     echo 1 > "$MT76/deep-sleep" 2>/dev/null
++    wifi_coexistence_end || exit 1
+     # Deliberately does NOT touch $IFACE, NetworkManager or wpa_supplicant.
+     # Nothing here ever took them down, and bouncing a working association on
+     # the way out is the exact outage this design exists to avoid (§38).
+@@ -600,6 +649,7 @@ EOF
+         esac
+       done
+     fi
++    wifi_coexistence_end || exit 1
+     echo '{"ok":true}'
+     ;;
+ 
+diff --git a/daemon/airdropd b/daemon/airdropd
+index 0fa5176..c790ffb 100755
+--- a/daemon/airdropd
++++ b/daemon/airdropd
+@@ -786,13 +786,16 @@ stack_up() {
+   # nothing, silently, while still looking healthy. airdrop.sh only avoids
+   # this by accident, because its ping checks take ~20s first.
+   local i
+-  for i in $(seq 40); do
++  # DAD normally settles in about 1.5s. Poll at 100ms so the user-facing
++  # toggle starts opendrop as soon as the address is usable, but retain the
++  # original ten-second ceiling for slower hardware/roams.
++  for i in $(seq 100); do
+     ip -6 addr show dev awdl0 scope link 2>/dev/null \
+       | grep -q 'inet6 .*\(tentative\)' || \
+       { ip -6 addr show dev awdl0 scope link 2>/dev/null | grep -q inet6 && break; }
+-    sleep 0.25
++    sleep 0.1
+   done
+-  log "awdl0 link-local ready after $((i*250))ms"
++  log "awdl0 link-local ready after $((i*100))ms"
+ 
+   BUILT_CHAN="${chan:-?}"
+   return 0
+@@ -1368,11 +1371,16 @@ serve_forever() {
+ cmd_run() {
+   # Single instance. Without this a second toggle deletes the first's mon0
+   # mid-transfer, which presents as a mysterious mid-file failure.
+-  exec 9>"$LOCK"
++  # Opening with `>` truncates the PID before flock tells us another daemon
++  # owns the lock. That made a harmless second click erase the only PID that
++  # `stop` can signal, leaving the live radio session stranded. Append first,
++  # acquire the advisory lock, then replace the PID only after we own it.
++  exec 9>>"$LOCK"
+   if ! flock -n 9; then
+     echo "airdropd: already running" >&2
+     exit 1
+   fi
++  : > "$LOCK"
+   echo $$ >&9
+ 
+   # ble-watch is only needed by the BLE-triggered path; always-on never runs
+diff --git a/install.sh b/install.sh
+index 787962f..0426fc3 100755
+--- a/install.sh
++++ b/install.sh
+@@ -26,7 +26,7 @@ YES=0
+ PATCHES=(ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog
+          upload-arms ask-confirm mdns-reannounce threaded-server url-items
+          zeroconf-update-service salvage-truncated salvage-trim
+-         send-multifile send-status send-stall)
++         send-multifile send-status send-stall incomplete-response)
+ OPENDROP_VERSION=0.13.0
+ 
+ step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+@@ -68,6 +68,17 @@ if [ -z "$OWL_DIR" ]; then
+ fi
+ ok "using $OWL_DIR"
+ git -C "$OWL_DIR" submodule update --init --recursive >/dev/null 2>&1 || true
++for owl_patch in owl-tx-backpressure owl-ios26-action-trailer; do
++  owl_patch_file="$REPO/patches/$owl_patch.patch"
++  if git -C "$OWL_DIR" apply --unidiff-zero --reverse --check "$owl_patch_file" 2>/dev/null; then
++    ok "OWL $owl_patch patch already applied"
++  elif git -C "$OWL_DIR" apply --unidiff-zero --check "$owl_patch_file" 2>/dev/null; then
++    git -C "$OWL_DIR" apply --unidiff-zero "$owl_patch_file"
++    ok "OWL $owl_patch patch applied"
++  else
++    die "OWL source differs from the tested version; cannot safely apply $owl_patch_file"
++  fi
++done
+ [ -f "$OWL_DIR/build/CMakeCache.txt" ] \
+   || cmake -S "$OWL_DIR" -B "$OWL_DIR/build" -DCMAKE_BUILD_TYPE=Release >/dev/null
+ # Only the owl target. A full build also compiles the bundled googletest, which
+@@ -126,11 +137,11 @@ fi
+ step "Root-owned copies in /usr/local/bin"
+ install_root() {
+   local src="$1" dst="$2"
+-  if sudo cmp -s "$src" "$dst" 2>/dev/null; then
++  if cmp -s "$src" "$dst" 2>/dev/null; then
+     ok "$dst unchanged"
+   else
+     sudo install -o root -g root -m 755 "$src" "$dst"
+-    sudo cmp -s "$src" "$dst" || die "could not install $dst"
++    cmp -s "$src" "$dst" || die "could not install $dst"
+     ok "$dst updated"
+   fi
+ }
+diff --git a/patches/README.md b/patches/README.md
+index 1fbf64d..1dffdea 100644
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -1,5 +1,26 @@
+ # OpenDrop patches for iOS 26
+ 
++## owl-tx-backpressure.patch
++
++Applied to the OWL source by `install.sh` before building (it is not part of
++the OpenDrop patch series below). On the MT7922 monitor interface, a full
++nonblocking transmit queue returned `EAGAIN` and OWL discarded hundreds of
++outgoing TCP ACK frames. A large incoming upload then stopped despite a strong
++radio signal. Keep unicast and multicast frames queued and retry after 2 ms
++when injection reports backpressure; do not mutate a frame while attempting a
++send, since it must be safe to retry. The patch is idempotently checked against
++the OWL checkout so a later install does not double-apply it.
++
++## owl-ios26-action-trailer.patch
++
++Applied to OWL by `install.sh` before building. Current iPhone AWDL MIF and
++PSF frames carry two bytes after their last complete TLV. OWL used to reject
++every such frame before marking a peer's MIF as received, so the peer never
++became valid even while its channel sequence and data frames were visible.
++Accept exactly the observed two-byte trailer; retain rejection of all other
++incomplete TLV tails. Local regression tests cover the accepted and rejected
++cases.
++
+ These patch OpenDrop 0.13.0 in place, inside whatever virtualenv you installed
+ it into. That means they do not survive rebuilding the venv, so they live here
+ and get reapplied:
+@@ -19,7 +40,7 @@ with every earlier patch already applied, so they only apply in this order:
+ ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog
+ upload-arms ask-confirm mdns-reannounce threaded-server url-items
+ zeroconf-update-service salvage-truncated salvage-trim send-multifile
+-send-status send-stall
++send-status send-stall incomplete-response
+ ```
+ 
+ The install loop in the [main README](../README.md) uses exactly that order.
+@@ -502,3 +523,11 @@ without tripping it.
+ Only the raw-framed path is covered, since it is the one the default arm uses.
+ The response read after a complete upload stays unbounded: if the phone dies
+ after receiving every byte, that wait is still TCP's to end.
++
++## opendrop-incomplete-response.patch
++
++An interrupted upload used to return HTTP 200 and log "File(s) received" even
++when only half of the declared bytes arrived. Compare the received body with
++`TotalBytes`, retain the raw archive if any file or byte is missing, and return
++HTTP 500 with an explicit incomplete log entry. This reports failure honestly;
++it does not repair an AWDL link that stops delivering data.

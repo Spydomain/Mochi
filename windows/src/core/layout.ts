@@ -23,7 +23,9 @@ export type IslandViewName =
   | "settings"
   | "greeting"
   | "recap"
-  | "wardrobe";
+  | "wardrobe"
+  | "airdrop"
+  | "airdropRequest";
 
 export type BotStateName =
   | "idle"
@@ -93,6 +95,11 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   // to the shared image.
   recap: { height: 184, botX: 62, botY: null, botDiameter: 58, agentMode: "column" },
   wardrobe: { height: 160, botX: 68, botY: null, botDiameter: 58, agentMode: "none" },
+  // Keep AirDrop the same compact size as its original island card. It returns
+  // to the overview automatically, so diagnostics must be concise rather than
+  // making the island taller.
+  airdrop: { height: 182, botX: 66, botY: 96, botDiameter: 58, agentMode: "none" },
+  airdropRequest: { height: 182, botX: 66, botY: 96, botDiameter: 58, agentMode: "none" },
 };
 
 // The upload views above are only the fallback geometry. Once a file is actually

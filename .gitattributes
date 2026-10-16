@@ -1,2 +1,6 @@
 docs/** linguist-documentation
 design/** linguist-documentation
+# These files are patches against third-party sources; changing their context
+# whitespace can make a pinned patch fail to apply.
+windows/airdrop/patches/*.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab
+windows/scripts/airdrop-wifi-coexistence.patch whitespace=-blank-at-eol,-blank-at-eof,-space-before-tab

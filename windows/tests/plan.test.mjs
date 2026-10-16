@@ -202,9 +202,9 @@ beforeEach(() => {
   State.planDetailIsCodex = false;
 });
 
-test("both pills are off by default, so the header is as it shipped", () => {
+test("Claude is opt-in and the Codex header indicator is on by default", () => {
   assert.equal(claudePillVisible(), false);
-  assert.equal(codexPillVisible(), false);
+  assert.equal(codexPillVisible(), true);
 });
 
 test("the Claude pill needs the switch and the relay, and the overview", () => {
@@ -231,6 +231,7 @@ test("an open card follows its pill, and Mochi wears that plan's colour", () => 
   assert.equal(openPlanColor(), "#6B7079");
   // The Codex card cannot be open without its pill.
   State.planDetailIsCodex = true;
+  State.settings.showCodexPlanInNotch = false;
   assert.equal(planCardOpen(), false);
   State.settings.showCodexPlanInNotch = true;
   assert.equal(planCardOpen(), true);

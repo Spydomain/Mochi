@@ -2069,17 +2069,6 @@
    "ru": "Поделитесь своей неделей",
    "id": "Bagikan minggu Anda"
   },
-  "Show Codex plan in the notch": {
-   "zh-Hans": "在刘海中显示 Codex 套餐",
-   "hi": "नॉच में Codex प्लान दिखाएं",
-   "es": "Mostrar el plan de Codex en el notch",
-   "ar": "عرض خطة Codex في الشريط العلوي",
-   "fr": "Afficher le forfait Codex dans l'encoche",
-   "bn": "নচে Codex প্ল্যান দেখান",
-   "pt-BR": "Mostrar o plano Codex no notch",
-   "ru": "Показывать тариф Codex в нотче",
-   "id": "Tampilkan paket Codex di notch"
-  },
   "Show in folder": {
    "zh-Hans": "在文件夹中显示",
    "hi": "फ़ोल्डर में दिखाएँ",
@@ -2112,17 +2101,6 @@
    "pt-BR": "Mostra o uso do seu plano Claude (limites de 5 horas e semanal) no cabeçalho da ilha. O Mochi adiciona um relay de linha de status em ~/.claude/settings.json. Se você já tem uma linha de status, ela continua funcionando como antes. Apenas planos Pro e Max.",
    "ru": "Показывает использование тарифа Claude (лимиты на 5 часов и на неделю) в заголовке острова. Mochi добавляет ретранслятор строки состояния в ~/.claude/settings.json. Если у вас уже есть строка состояния, она работает как прежде. Только тарифы Pro и Max.",
    "id": "Menampilkan pemakaian paket Claude Anda (batas 5 jam dan mingguan) di header pulau. Mochi menambahkan relay baris status di ~/.claude/settings.json. Jika Anda sudah punya baris status, baris itu tetap berjalan seperti biasa. Khusus paket Pro dan Max."
-  },
-  "Shows your Codex plan usage (weekly limit and free resets left) in the island's header. Mochi asks the Codex CLI (codex app-server) when the pill shows; nothing is installed. Codex must be signed in with ChatGPT.": {
-   "zh-Hans": "在岛的顶栏显示你的 Codex 套餐用量（每周限额和剩余的免费重置次数）。标签显示时，Mochi 会询问 Codex CLI（codex app-server），不会安装任何东西。Codex 必须已用 ChatGPT 登录。",
-   "hi": "आइलैंड के हेडर में आपके Codex प्लान का उपयोग (साप्ताहिक सीमा और बचे मुफ़्त रीसेट) दिखाता है। टैब दिखने पर Mochi Codex CLI (codex app-server) से पूछता है; कुछ भी इंस्टॉल नहीं होता। Codex में ChatGPT से साइन इन होना ज़रूरी है।",
-   "es": "Muestra el uso de tu plan de Codex (límite semanal y reinicios gratuitos restantes) en la cabecera de la isla. Mochi consulta a la CLI de Codex (codex app-server) cuando aparece la pestaña; no se instala nada. Codex debe tener la sesión iniciada con ChatGPT.",
-   "ar": "يعرض استخدام خطة Codex (الحد الأسبوعي وإعادات التعيين المجانية المتبقية) في رأس الشريط. يسأل Mochi واجهة Codex CLI (codex app-server) عند ظهور التبويب، ولا يُثبَّت أي شيء. يجب تسجيل الدخول إلى Codex بحساب ChatGPT.",
-   "fr": "Affiche l'utilisation de ton forfait Codex (limite hebdomadaire et réinitialisations gratuites restantes) dans l'en-tête de l'île. Mochi interroge la CLI Codex (codex app-server) quand l'onglet s'affiche ; rien n'est installé. Codex doit être connecté avec ChatGPT.",
-   "bn": "আইল্যান্ডের হেডারে আপনার Codex প্ল্যানের ব্যবহার (সাপ্তাহিক সীমা ও বাকি ফ্রি রিসেট) দেখায়। ট্যাব দেখা গেলে Mochi Codex CLI (codex app-server)-কে জিজ্ঞেস করে; কিছুই ইনস্টল হয় না। Codex-এ ChatGPT দিয়ে সাইন ইন থাকতে হবে।",
-   "pt-BR": "Mostra o uso do seu plano Codex (limite semanal e redefinições grátis restantes) no cabeçalho da ilha. O Mochi consulta a CLI do Codex (codex app-server) quando a aba aparece; nada é instalado. O Codex precisa estar conectado com o ChatGPT.",
-   "ru": "Показывает использование тарифа Codex (недельный лимит и оставшиеся бесплатные сбросы) в заголовке острова. Mochi спрашивает Codex CLI (codex app-server), когда видна вкладка; ничего не устанавливается. В Codex нужно войти через ChatGPT.",
-   "id": "Menampilkan pemakaian paket Codex Anda (batas mingguan dan sisa reset gratis) di header pulau. Mochi menanyakan Codex CLI (codex app-server) saat tab tampil; tidak ada yang dipasang. Codex harus masuk dengan ChatGPT."
   },
   "Start a new Antigravity conversation to pick the hooks up.": {
    "zh-Hans": "开启新的 Antigravity 对话即可启用 hooks。",
@@ -3426,6 +3404,61 @@
    "pt-BR": "O OpenCode demorou demais para responder.",
    "ru": "OpenCode отвечал слишком долго.",
    "id": "OpenCode terlalu lama menjawab."
+  },
+  "Island header": {
+   "zh-Hans": "岛屿标题栏",
+   "hi": "आइलैंड हेडर",
+   "es": "Encabezado de la isla",
+   "ar": "رأس الجزيرة",
+   "fr": "En-tête de l’île",
+   "bn": "আইল্যান্ডের শিরোনাম",
+   "pt-BR": "Cabeçalho da ilha",
+   "ru": "Заголовок острова",
+   "id": "Header pulau"
+  },
+  "Choose which optional indicators appear beside the island controls. All are on by default.": {
+   "zh-Hans": "选择要显示在岛屿控制按钮旁的可选指示器。默认全部开启。",
+   "hi": "चुनें कि आइलैंड नियंत्रणों के पास कौन से वैकल्पिक संकेतक दिखें। सभी डिफ़ॉल्ट रूप से चालू हैं।",
+   "es": "Elige qué indicadores opcionales aparecen junto a los controles de la isla. Todos están activados de forma predeterminada.",
+   "ar": "اختر المؤشرات الاختيارية التي تظهر بجانب عناصر التحكم في الجزيرة. كلها مفعّلة افتراضيًا.",
+   "fr": "Choisissez les indicateurs facultatifs affichés à côté des commandes de l’île. Ils sont tous activés par défaut.",
+   "bn": "আইল্যান্ডের নিয়ন্ত্রণের পাশে কোন ঐচ্ছিক সূচক দেখাবে তা বেছে নিন। সবগুলো ডিফল্টভাবে চালু আছে।",
+   "pt-BR": "Escolha quais indicadores opcionais aparecem ao lado dos controles da ilha. Todos vêm ativados por padrão.",
+   "ru": "Выберите дополнительные индикаторы рядом с элементами управления островом. По умолчанию все включены.",
+   "id": "Pilih indikator opsional yang tampil di samping kontrol pulau. Semuanya aktif secara default."
+  },
+  "AirDrop": {
+   "zh-Hans": "隔空投送",
+   "hi": "एयरड्रॉप",
+   "es": "AirDrop",
+   "ar": "AirDrop",
+   "fr": "AirDrop",
+   "bn": "AirDrop",
+   "pt-BR": "AirDrop",
+   "ru": "AirDrop",
+   "id": "AirDrop"
+  },
+  "Battery": {
+   "zh-Hans": "电池",
+   "hi": "बैटरी",
+   "es": "Batería",
+   "ar": "البطارية",
+   "fr": "Batterie",
+   "bn": "ব্যাটারি",
+   "pt-BR": "Bateria",
+   "ru": "Батарея",
+   "id": "Baterai"
+  },
+  "Keep Awake": {
+   "zh-Hans": "保持唤醒",
+   "hi": "जागृत रखें",
+   "es": "Mantener despierto",
+   "ar": "إبقاء مستيقظًا",
+   "fr": "Garder éveillé",
+   "bn": "জাগ্রত রাখুন",
+   "pt-BR": "Manter ativo",
+   "ru": "Не давать уснуть",
+   "id": "Tetap aktif"
   }
  }
 }

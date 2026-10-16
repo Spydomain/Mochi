@@ -1,0 +1,70 @@
+diff --git a/daemon/core.c b/daemon/core.c
+--- a/daemon/core.c
++++ b/daemon/core.c
+@@ -28,0 +29 @@
++#include <errno.h>
+@@ -146 +146,0 @@ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+-	buf_strip(buf, ETHER_LENGTH);
+@@ -148 +148,2 @@ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+-	                                          buf_data(buf), buf_len(buf),
++	                                          buf_data(buf) + ETHER_LENGTH,
++	                                          buf_len(buf) - ETHER_LENGTH,
+@@ -156,2 +157,4 @@ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+-	awdl_state->stats.tx_data++;
+-	if (wlan_send(io_state, awdl_data, awdl_data_len) < 0)
++	int send_result = wlan_send(io_state, awdl_data, awdl_data_len);
++	if (send_result == -EAGAIN)
++		return TX_RETRY;
++	if (send_result < 0)
+@@ -158,0 +162 @@ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
++	awdl_state->stats.tx_data++;
+@@ -225,4 +229,12 @@ void awdl_send_unicast(struct ev_loop *loop, ev_timer *timer, int revents) {
+-				awdl_send_data(state->next, &state->io, &state->awdl_state, &state->ieee80211_state);
+-				buf_free(state->next);
+-				state->next = NULL;
+-				state->awdl_state.stats.tx_data_unicast++;
++				int result = awdl_send_data(state->next, &state->io,
++				                            &state->awdl_state, &state->ieee80211_state);
++				if (result == TX_RETRY) {
++					/* Keep the TCP ACK (or other frame) until the TX queue drains.
++					 * Dropping it here can stall a large incoming transfer. */
++					in = 0.002;
++				} else {
++					buf_free(state->next);
++					state->next = NULL;
++					if (result == TX_OK)
++						state->awdl_state.stats.tx_data_unicast++;
++				}
+@@ -257,4 +269,11 @@ void awdl_send_multicast(struct ev_loop *loop, ev_timer *timer, int revents) {
+-			circular_buf_get(state->tx_queue_multicast, &next, 0);
+-			awdl_send_data((struct buf *) next, &state->io, &state->awdl_state, &state->ieee80211_state);
+-			buf_free(next);
+-			state->awdl_state.stats.tx_data_multicast++;
++			circular_buf_get(state->tx_queue_multicast, &next, 1);
++			int result = awdl_send_data((struct buf *) next, &state->io,
++			                            &state->awdl_state, &state->ieee80211_state);
++			if (result == TX_RETRY) {
++				in = 0.002;
++			} else {
++				circular_buf_get(state->tx_queue_multicast, &next, 0);
++				buf_free(next);
++				if (result == TX_OK)
++					state->awdl_state.stats.tx_data_multicast++;
++			}
+diff --git a/daemon/io.c b/daemon/io.c
+--- a/daemon/io.c
++++ b/daemon/io.c
+@@ -386,0 +387,5 @@ int wlan_send(const struct io_state *state, const uint8_t *buf, int len) {
++		int saved_errno = errno;
++		/* The monitor socket is nonblocking. A full kernel TX queue is
++		 * temporary; callers must retain the frame and retry it. */
++		if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)
++			return -EAGAIN;
+@@ -388 +393 @@ int wlan_send(const struct io_state *state, const uint8_t *buf, int len) {
+-		return err;
++		return saved_errno ? -saved_errno : -EIO;
+diff --git a/src/tx.h b/src/tx.h
+--- a/src/tx.h
++++ b/src/tx.h
+@@ -28,0 +29 @@ enum TX_RESULT {
++	TX_RETRY = 1,

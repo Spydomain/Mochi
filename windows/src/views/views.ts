@@ -23,6 +23,7 @@ import { buildRecap } from "./recap";
 import { buildWardrobe } from "./wardrobe";
 import { buildSpotifyCard, buildSpotifyPill, type SpotifyPillHost } from "./spotify";
 import { buildClockCard } from "./clock";
+import { buildAirDrop, buildAirDropView, buildAirDropRequest } from "./airdrop";
 import { SPOTIFY_ID } from "../core/spotify";
 import type { Outfit, OutfitSelection } from "../mochi/wardrobe";
 import { language, t, tl, type Msg } from "../i18n/i18n";
@@ -114,9 +115,10 @@ export function buildHeader(actions: ViewActions): ViewHost {
 
   const gearBtn = h("button", { title: tl("Settings"), onclick: () => go("settings") }, svg(ICONS.gear, 14));
   const soundBtn = h("button", { title: tl("Mute"), onclick: () => actions.toggleSound() }, svg(ICONS.speakerOn, 14));
-  // Plan usage pills (off by default): before the gear, Claude first, as on the Mac.
+  // Plan usage pills: before the gear, Claude first, as on the Mac.
   const claudePill = buildPlanPill(false);
   const codexPill = buildPlanPill(true);
+  const airDrop = buildAirDrop(() => go("airdrop"));
   const batteryFill = h("span", { class: "battery-fill" });
   const batteryIcon = h("span", { class: "battery-icon" }, batteryFill);
   const batteryBolt = svg(ICONS.bolt, 11);
@@ -145,7 +147,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
       }
     },
   }, svg(ICONS.sun, 12), awakeLabel);
-  const planPills = h("div", { class: "plan-pills" }, claudePill.el, codexPill.el, batteryPill, awakeBtn);
+  const planPills = h("div", { class: "plan-pills" }, claudePill.el, codexPill.el, airDrop.pill, batteryPill, awakeBtn);
   let codexShown = false;
 
   function go(v: IslandViewName) {
@@ -159,7 +161,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
     h("div", { class: "tabs" }, tabHome, tabChat, tabDrop),
     h("div", { class: "header-actions" }, planPills, gearBtn, soundBtn),
   );
-  const headerActions = el.lastElementChild as HTMLElement;
+  const headerActions = el.children[1] as HTMLElement;
 
   return {
     el,
@@ -174,6 +176,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
       clear(soundBtn);
       soundBtn.append(svg(State.settings.soundEnabled ? ICONS.speakerOn : ICONS.speakerOff, 14));
       syncPlanPills();
+      airDrop.sync();
       el.style.opacity = v === "confused" ? "0" : "1";
     },
   };
@@ -184,7 +187,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
     claudePill.el.style.display = claudeOn ? "" : "none";
     codexPill.el.style.display = codexOn ? "" : "none";
     const power = State.powerStatus;
-    const batteryOn = State.view === "overview" && power !== null;
+    const batteryOn = State.settings.showBatteryInNotch && State.view === "overview" && power !== null;
     batteryPill.style.display = batteryOn ? "" : "none";
     if (power) {
       const level = Math.max(0, Math.min(100, Math.round(power.level)));
@@ -201,7 +204,11 @@ export function buildHeader(actions: ViewActions): ViewHost {
       batteryPill.title = `${status} · ${level}%`;
       batteryPill.setAttribute("aria-label", `${status}, ${level}%`);
     }
-    const awakeOn = State.os === "linux" && State.view === "overview" && (codexOn || State.keepAwake);
+    // Awake is independent of plan usage. In particular, people who turned off
+    // the Codex badge before this control existed must still be able to enable
+    // the session-only idle inhibitor after updating.
+    const awakeOn = State.settings.showKeepAwakeInNotch
+      && State.os === "linux" && State.view === "overview";
     awakeBtn.style.display = awakeOn ? "" : "none";
     awakeBtn.disabled = State.keepAwakePending;
     awakeBtn.classList.toggle("on", State.keepAwake);
@@ -212,7 +219,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
       ? "Keep awake is on. Click to use normal system idle settings."
       : "Keep screen awake until you turn this off or Mochi exits.");
     awakeLabel.textContent = State.keepAwakeError ? "Unavailable" : "Awake";
-    planPills.classList.toggle("on", claudeOn || codexOn || batteryOn || awakeOn);
+    planPills.classList.toggle("on", claudeOn || codexOn || batteryOn || awakeOn || (State.os === "linux" && State.view === "overview"));
     // Both pills: the right side tightens so it still clears the screen edge.
     headerActions.classList.toggle("both-plans", claudeOn && codexOn);
     headerActions.classList.toggle("with-battery", batteryOn);
@@ -892,6 +899,8 @@ export function buildViews(
   map.set("choose", buildChoose(actions));
   map.set("recap", buildRecap(actions));
   map.set("wardrobe", buildWardrobe(actions));
+  map.set("airdrop", buildAirDropView(actions.openSettingsWindow, () => actions.setView("overview")));
+  map.set("airdropRequest", buildAirDropRequest());
   // Not in the Windows v1: sending a file by email, window attach + web result.
   map.set("mail", buildPlaceholder(tl("Sending by email isn't in this version."), ""));
   map.set("searching", buildPlaceholder(tl("Claude is searching…"), ""));

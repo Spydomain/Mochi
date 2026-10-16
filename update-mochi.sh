@@ -22,18 +22,28 @@ remote_sha="$(printf '%s\n' "$remote_info" | awk '$2 == "HEAD" && $1 != "ref:" {
 local_sha="$(git -C "$MOCHI_DIR" rev-parse HEAD)" || die 'Could not read the local revision.'
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 INSTALLED_BINARY="$DATA_HOME/mochi/bin/mochi"
+INSTALLED_HOOK="$DATA_HOME/mochi/bin/mochi-hook"
+INSTALLED_CLEANUP="$DATA_HOME/mochi/bin/cleanup-opencode-sessions"
+INSTALLED_CONFIRM="$DATA_HOME/mochi/bin/mochi-airdrop-confirm"
 INSTALLED_REVISION="$DATA_HOME/mochi/installed-revision"
 installed_sha="$(sed -n '1p' "$INSTALLED_REVISION" 2>/dev/null || true)"
 
+installation_complete() {
+  [[ -x "$INSTALLED_BINARY" && -x "$INSTALLED_HOOK" && -x "$INSTALLED_CLEANUP" && -x "$INSTALLED_CONFIRM" ]] &&
+    cmp -s "$MOCHI_DIR/windows/scripts/mochi-airdrop-confirm.sh" "$INSTALLED_CONFIRM" &&
+    cmp -s "$MOCHI_DIR/windows/scripts/cleanup-opencode-sessions.sh" "$INSTALLED_CLEANUP" &&
+    bash "$MOCHI_DIR/windows/scripts/install-airdrop-mt7922.sh" --verify >/dev/null 2>&1
+}
+
 verify_install() {
   local expected="$1"
-  [[ -x "$INSTALLED_BINARY" ]] || die 'Setup returned without an installed Mochi executable.'
+  installation_complete || die 'Setup returned without the full app, relay, cleanup, and AirDrop consent hook.'
   [[ "$(sed -n '1p' "$INSTALLED_REVISION" 2>/dev/null || true)" == "$expected" ]] ||
     die 'Setup returned without confirming the installed revision; rerun setup or inspect its output.'
 }
 
 if [[ "$local_sha" == "$remote_sha" ]]; then
-  if [[ -x "$INSTALLED_BINARY" && "$installed_sha" == "$local_sha" ]]; then
+  if [[ "$installed_sha" == "$local_sha" ]] && installation_complete; then
     log 'No updates available. Current Mochi installation unchanged.'
     exit 0
   fi

@@ -21,6 +21,7 @@ import { UploadCanvas } from "../upload/canvas";
 import { USC, UploadSeq } from "../upload/sequence";
 import { closePlanCard, openPlanColor, planCardOpen } from "../views/usage";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
+import { buildAirDropCompactStatus } from "../views/airdrop";
 import { h } from "../views/dom";
 import { IslandStateMachine } from "./fsm";
 import { companionMoodState } from "./wellbeing";
@@ -84,6 +85,7 @@ export class Island {
   private botGlow!: HTMLElement;
   private greetingCanvas!: HTMLCanvasElement;
   private miniGrid!: HTMLElement;
+  private airDropIndicator!: ReturnType<typeof buildAirDropCompactStatus>;
   private countdown!: HTMLElement;
   private notice!: HTMLElement;
   private chargePop!: HTMLElement;
@@ -309,6 +311,7 @@ export class Island {
     this.botCanvas = h("canvas", { id: "bot-canvas" });
     this.greetingCanvas = h("canvas", { id: "greeting-canvas" });
     this.miniGrid = h("div", { id: "mini-grid" });
+    this.airDropIndicator = buildAirDropCompactStatus();
     this.countdown = h("div", { id: "countdown" });
     this.notice = h("div", { id: "companion-toast", role: "status", "aria-live": "polite" });
     this.chargeCanvas = h("canvas", { id: "charge-bot-canvas", "aria-hidden": "true" }) as HTMLCanvasElement;
@@ -352,6 +355,7 @@ export class Island {
       this.botGlow,
       this.botCanvas,
       this.miniGrid,
+      this.airDropIndicator.el,
       this.countdown,
     );
 
@@ -1485,7 +1489,7 @@ export class Island {
     const expanded = State.mode === "expanded";
     const greetingActive = expanded && State.view === "greeting";
 
-    const live = expanded && !greetingActive && !this.noticeActive;
+    const live = expanded && !greetingActive && (!this.noticeActive || State.view === "airdropRequest");
     this.contentEl.style.opacity = live ? "1" : "0";
     // While the drop sequence owns the body its buttons are painted on the canvas
     // underneath, so only the header may keep taking clicks up here.
@@ -1500,6 +1504,7 @@ export class Island {
     if (State.wardrobePreview && !(expanded && State.view === "wardrobe")) State.wardrobePreview = null;
 
     this.header.sync();
+    this.header.el.style.display = State.view === "airdrop" || State.view === "airdropRequest" ? "none" : "";
     for (const [name, view] of this.views) {
       const on = name === State.view;
       view.el.classList.toggle("on", on);
@@ -1521,6 +1526,7 @@ export class Island {
 
     // Compact mini grid
     const showGrid = State.mode === "compact";
+    this.airDropIndicator.sync(State.mode, State.airdropTransfer, State.airdropProgress);
     this.miniGrid.style.opacity = showGrid ? "1" : "0";
     if (showGrid) {
       const others = compactMiniTasks(State.otherTasks);

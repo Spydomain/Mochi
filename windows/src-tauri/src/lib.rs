@@ -1,6 +1,7 @@
 // Mochi for Windows — app wiring and the commands the island calls.
 
 mod agent_hooks;
+mod airdrop;
 mod agents;
 mod chat;
 mod claude;
@@ -458,6 +459,47 @@ async fn set_keep_awake(enabled: bool) -> Result<bool, String> {
         .map_err(|err| format!("Could not update keep awake: {err}"))?
 }
 
+#[tauri::command]
+async fn airdrop_status() -> Result<airdrop::Status, String> {
+    airdrop::status().await
+}
+
+#[tauri::command]
+async fn airdrop_set(enabled: bool, shared: State<'_, Shared>) -> Result<airdrop::Status, String> {
+    let settings = shared.settings.lock().unwrap().clone();
+    airdrop::set(enabled, &settings.airdrop_name, &settings.airdrop_directory).await
+}
+
+#[tauri::command]
+fn airdrop_incoming() -> Result<Option<airdrop::Incoming>, String> {
+    airdrop::incoming()
+}
+
+#[tauri::command]
+fn airdrop_decide(id: String, accept: bool) -> Result<(), String> {
+    airdrop::decide(id, accept)
+}
+
+#[tauri::command]
+fn airdrop_transfer() -> Option<airdrop::Transfer> {
+    airdrop::transfer()
+}
+
+#[tauri::command]
+fn airdrop_validate(name: String, directory: String) -> Result<(), String> {
+    airdrop::preferences(&name, &directory).map(|_| ())
+}
+
+#[tauri::command]
+async fn airdrop_peers(named: bool) -> Result<Vec<airdrop::Peer>, String> {
+    airdrop::peers(named).await
+}
+
+#[tauri::command]
+async fn airdrop_send(mac: String) -> Result<String, String> {
+    airdrop::send(mac).await
+}
+
 /// Tray → Pause. Paused means paused: the pollers stop talking to the network,
 /// not just the island stopping showing things.
 #[tauri::command]
@@ -904,6 +946,14 @@ pub fn run() {
             quit_app,
             keep_awake_status,
             set_keep_awake,
+            airdrop_status,
+            airdrop_set,
+            airdrop_incoming,
+            airdrop_decide,
+            airdrop_transfer,
+            airdrop_validate,
+            airdrop_peers,
+            airdrop_send,
             hooks_status,
             agent_hooks_status,
             hooks_preview,
@@ -1010,8 +1060,18 @@ pub fn run() {
             shortcuts::apply(&handle, &loaded.shortcuts);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Mochi");
+        .build(tauri::generate_context!())
+        .expect("error while building Mochi")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Run for Quit, tray Exit and window close alike. The backend
+                // stays untouched when it was started outside Mochi.
+                let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    airdrop::stop_if_owned(),
+                ));
+            }
+        });
 }
 
 #[cfg(test)]

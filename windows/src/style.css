@@ -446,6 +446,8 @@ body[data-weather-scene="cloudy"] .weather-backdrop {
 }
 
 #header {
+  position: relative;
+  z-index: 5;
   height: 34px;
   flex: 0 0 34px;
   display: flex;
@@ -2277,6 +2279,82 @@ input[type="range"]::-webkit-slider-thumb {
 .header-actions .keep-awake-pill:disabled {
   opacity: 0.55;
 }
+
+/* The receiver really joins AWDL; a badge is not a Bluetooth pairing switch. */
+.header-actions .airdrop-pill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 8px;
+  border: 1px solid rgba(45, 212, 191, 0.3);
+  border-radius: 999px;
+  background: #0e0f11;
+  color: var(--dim-3);
+  font: 600 10px/12px var(--font);
+  white-space: nowrap;
+}
+.airdrop-dot { width: 6px; height: 6px; border-radius: 50%; background: #6b7079; }
+.header-actions .airdrop-pill.on { color: #5eead4; border-color: #2dd4bf; background: rgba(45, 212, 191, 0.12); }
+.airdrop-pill.on .airdrop-dot { background: #2dd4bf; }
+.header-actions .airdrop-pill.failed { border-color: #f4505e; }
+.header-actions .airdrop-pill:focus:not(:focus-visible) { outline: none; }
+.header-actions .airdrop-pill:disabled { opacity: 0.6; }
+
+.airdrop-view, .airdrop-request-view {
+  width: 100%; height: 100%; border: 1px solid rgba(45, 212, 191, .3);
+  border-radius: 19px; background: radial-gradient(ellipse at 22% 55%, rgba(45, 212, 191, .12), transparent 45%), #141518;
+  padding: 13px 20px 11px 132px; overflow: hidden;
+}
+.airdrop-view-head { display: flex; align-items: center; color: #6ee7d6; }
+.airdrop-view-body { display: flex; flex-direction: column; gap: 5px; padding-top: 6px; min-height: 0; font: 12px/1.3 var(--font); }
+.airdrop-view-info { color: var(--ink); font-weight: 600; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.airdrop-view-destination, .airdrop-view-notice { color: var(--dim-3); }
+.airdrop-view-destination { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.airdrop-view-peers { min-height: 0; overflow: auto; max-height: 19px; }
+.airdrop-view-peer { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.airdrop-view-actions, .airdrop-request-actions { display: flex; flex-wrap: nowrap; gap: 5px; align-items: center; margin-top: auto; }
+.airdrop-view-actions button, .airdrop-view-peer button, .airdrop-request-actions button {
+  font: 600 11px var(--font); color: #b3fff2; background: rgba(45, 212, 191, .12);
+  border: 1px solid rgba(45, 212, 191, .34); border-radius: 999px; padding: 4px 8px; cursor: pointer; white-space: nowrap;
+}
+.airdrop-view-actions button:disabled, .airdrop-request-actions button:disabled { opacity: .5; }
+.airdrop-request-view { border-color: rgba(88, 166, 255, .4); padding-top: 22px; }
+.airdrop-request-body { display: flex; flex-direction: column; gap: 6px; }
+.airdrop-request-body strong { color: #8ac6ff; font-size: 17px; }
+.airdrop-request-from { font-size: 14px; font-weight: 600; color: var(--ink); }
+.airdrop-request-detail { color: var(--dim-3); text-overflow: ellipsis; overflow: hidden; white-space: nowrap; }
+.airdrop-request-feedback { color: var(--dim-3); font-size: 10px; }
+.airdrop-request-actions { margin-top: 4px; }
+.airdrop-request-actions .airdrop-decline { color: #ffd3d6; border-color: #f4505e; background: rgba(244,80,94,.12); }
+#content:has(.airdrop-view.on), #content:has(.airdrop-request-view.on) { padding: 8px 10px 10px; }
+#content:has(.airdrop-view.on) #views, #content:has(.airdrop-request-view.on) #views { flex: 1; }
+#airdrop-compact-status {
+  position: absolute; inset: 0; z-index: 9;
+  display: none; justify-content: space-between; align-items: center;
+  padding: 0 12px; border-radius: 0 0 14px 14px;
+  background: #000; pointer-events: none;
+}
+.airdrop-compact-icon { display: flex; align-items: center; color: #55aaff; }
+.airdrop-ring {
+  display: flex; align-items: center; justify-content: center;
+  width: 23px; height: 23px; border: 3px solid #173a66;
+  border-top-color: #58a6ff; border-right-color: #58a6ff;
+  border-radius: 50%; animation: airdrop-spin 1.15s linear infinite;
+}
+#airdrop-compact-status.determinate .airdrop-ring {
+  position: relative; border: 0; animation: none;
+  background: conic-gradient(from -90deg, #58a6ff var(--airdrop-progress), #173a66 var(--airdrop-progress));
+}
+#airdrop-compact-status.determinate .airdrop-ring::before {
+  content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #000;
+}
+#airdrop-compact-status.waiting .airdrop-ring { border-top-color: #367ac3; border-right-color: #367ac3; }
+#airdrop-compact-status.complete .airdrop-ring { border-color: #58a6ff; animation: none; }
+#airdrop-compact-status.complete .airdrop-ring::after { content: "✓"; color: #58a6ff; font: 700 15px/1 var(--font); }
+#airdrop-compact-status.failed .airdrop-ring { border-color: #fb7185; animation: none; }
+#airdrop-compact-status.failed .airdrop-ring::after { content: "!"; color: #fb7185; font: 700 15px/1 var(--font); }
+@keyframes airdrop-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .airdrop-ring { animation: none; } }
 
 .plan-card {
   position: relative;

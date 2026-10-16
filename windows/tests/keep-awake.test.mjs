@@ -8,7 +8,7 @@ import { buildHeader } from "../src/views/views.ts";
 
 installFakeDom();
 
-test("Awake button follows the Codex badge and releases the system policy on click", async () => {
+test("Awake button is independent of the Codex badge and releases the system policy on click", async () => {
   const originalInvoke = internals.invoke;
   State.settings = { ...DEFAULT_SETTINGS, showCodexPlanInNotch: true };
   State.view = "overview";
@@ -34,7 +34,7 @@ test("Awake button follows the Codex badge and releases the system policy on cli
     assert.equal(State.keepAwake, true);
     assert.equal(button.getAttribute("aria-pressed"), "true");
 
-    // The switch remains accessible if the Codex plan badge is later hidden.
+    // A user who has hidden Codex still keeps the independent Awake control.
     State.settings.showCodexPlanInNotch = false;
     header.sync();
     assert.equal(button.style.display, "");
@@ -42,6 +42,10 @@ test("Awake button follows the Codex badge and releases the system policy on cli
     await new Promise(setImmediate);
     header.sync();
     assert.equal(State.keepAwake, false);
+    assert.equal(button.style.display, "");
+    State.settings.showKeepAwakeInNotch = false;
+    State.keepAwake = true;
+    header.sync();
     assert.equal(button.style.display, "none");
     assert.deepEqual(calls.filter(([cmd]) => cmd === "set_keep_awake").map(([, args]) => args.enabled), [true, false]);
   } finally {

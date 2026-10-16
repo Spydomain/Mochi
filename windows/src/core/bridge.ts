@@ -33,6 +33,34 @@ export interface BootInfo {
   cursorPoll: boolean;
 }
 
+export interface AirDropStatus {
+  installed: boolean;
+  receiving: boolean;
+  visible: boolean;
+  name: string | null;
+  remaining: number | null;
+  directory: string | null;
+  /** This backend finds the recipient only after files have been chosen. */
+  canSendNearby: boolean;
+  message: string | null;
+}
+
+export interface AirDropPeer {
+  mac: string;
+  name: string | null;
+  rssi: number | null;
+}
+
+export interface AirDropIncoming { id: string; sender: string; detail: string }
+
+/** Raw upload bytes measured from the receiver's growing archive; nullable
+ * when the sender did not declare a usable wire payload size. */
+export interface AirDropTransfer {
+  state: "waiting" | "receiving" | "complete" | "failed";
+  receivedBytes: number | null;
+  totalBytes: number | null;
+}
+
 export const Bridge = {
   boot: () => call<BootInfo>("boot"),
   powerStatus: () => call<PowerStatus>("power_status"),
@@ -101,6 +129,16 @@ export const Bridge = {
   quit: () => call<void>("quit_app"),
   keepAwakeStatus: () => call<boolean>("keep_awake_status"),
   setKeepAwake: (enabled: boolean) => callOrThrow<boolean>("set_keep_awake", { enabled }),
+  /** Real Linux AirDrop via an installed Omdrop/OWL receiver; never a BLE-only emulation. */
+  airdropStatus: () => callOrThrow<AirDropStatus>("airdrop_status"),
+  airdropSet: (enabled: boolean) => callOrThrow<AirDropStatus>("airdrop_set", { enabled }),
+  airdropIncoming: () => callOrThrow<AirDropIncoming | null>("airdrop_incoming"),
+  airdropTransfer: () => call<AirDropTransfer | null>("airdrop_transfer"),
+  airdropDecide: (id: string, accept: boolean) => callOrThrow<void>("airdrop_decide", { id, accept }),
+  airdropValidate: (name: string, directory: string) => callOrThrow<void>("airdrop_validate", { name, directory }),
+  airdropPeers: (named = false) => callOrThrow<AirDropPeer[]>("airdrop_peers", { named }),
+  /** Open Omdrop's native multi-file chooser, then send to exactly this peer. */
+  airdropSend: (mac: string) => callOrThrow<string>("airdrop_send", { mac }),
 
   openSettingsWindow: () => call<void>("open_settings_window"),
 

@@ -9,7 +9,7 @@ installFakeDom();
 
 test("battery badge follows the current reading and charging state", () => {
   const previous = { settings: State.settings, view: State.view, power: State.powerStatus };
-  State.settings = { ...DEFAULT_SETTINGS, showCodexPlanInNotch: true };
+  State.settings = { ...DEFAULT_SETTINGS, showCodexPlanInNotch: true, showBatteryInNotch: true };
   State.view = "overview";
   try {
     const header = buildHeader({});
@@ -39,6 +39,11 @@ test("battery badge follows the current reading and charging state", () => {
     assert.equal(battery.getAttribute("aria-label"), "On battery, 15%");
     assert.equal(battery.classList.contains("low"), true);
     assert.equal(plug.style.display, "none");
+
+    State.settings.showBatteryInNotch = false;
+    header.sync();
+    assert.equal(battery.style.display, "none");
+    State.settings.showBatteryInNotch = true;
 
     State.view = "settings";
     header.sync();

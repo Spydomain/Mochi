@@ -1,0 +1,45 @@
+--- a/opendrop/server.py
++++ b/opendrop/server.py
+@@ -815,3 +815,11 @@
+             return good, bad
+ 
++        declared_total = self.headers.get("TotalBytes", "")
++        expected_total = int(declared_total) if declared_total.isdecimal() else None
++        body_complete = expected_total is None or reader.total >= expected_total
++        if not body_complete:
++            logger.warning(
++                f"upload ended after {reader.total} of {expected_total} declared bytes"
++            )
++        complete = False
+         try:
+@@ -827,5 +835,7 @@
+                 if not good:
+                     raise ValueError("no complete file in the transfer")
++                complete = not bad and body_complete
+                 logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+-                os.remove(raw_path)
++                if complete:
++                    os.remove(raw_path)
+             else:
+@@ -877,5 +887,7 @@
+                 if not good:
+                     raise ValueError("no complete file in the transfer")
++                complete = not bad and body_complete
+                 logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+-                os.remove(raw_path)
++                if complete:
++                    os.remove(raw_path)
+         except Exception as e:  # noqa: BLE001 - any failure here must not lose the bytes
+@@ -889,9 +901,10 @@
+         speed = transferred / (time.time() - start)
+         logger.info(
+-            f"File(s) received (size {transferred:.02f} MB, speed {speed:.02f} MB/s)"
++            f"File(s) {'received' if complete else 'incomplete'} "
++            f"(size {transferred:.02f} MB, speed {speed:.02f} MB/s)"
+         )
+ 
+-        self.send_response(200)
++        self.send_response(200 if complete else 500)
+         self.send_header("Content-Length", 0)
+         self.send_header("Connection", "close")
+         self.end_headers()

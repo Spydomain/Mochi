@@ -1,0 +1,17 @@
+diff --git a/src/rx.c b/src/rx.c
+--- a/src/rx.c
++++ b/src/rx.c
+@@ -321,7 +321,12 @@ int awdl_rx_action(const struct buf *frame, signed char rssi, uint64_t tsft,
+ 		buf_strip(frame, len);
+ 	}
+ 
+-	if (buf_len(frame) > 0) {
++	/* Recent iPhones append two bytes after the last complete AWDL TLV.
++	 * read_tlv() cannot consume them (a TLV header needs three bytes). Treat
++	 * only that observed two-byte trailer as padding; otherwise a malformed
++	 * action frame must still be rejected. Rejecting every MIF here leaves
++	 * sent_mif unset, so the peer never becomes valid for discovery. */
++	if (buf_len(frame) > 0 && buf_len(frame) != 2) {
+ 		log_debug("awdl_action: unexpected bytes (%d) at end of frame", buf_len(frame));
+ 		return RX_UNEXPECTED_FORMAT;
+ 	}

@@ -6,6 +6,14 @@ Mochi is a compact desktop companion for coding-agent activity, chat, media, sho
 
 *The screenshot shows the shared interface on Linux. Window behavior and available integrations can differ on Windows.*
 
+## Screenshots and video
+
+| Overview | Compact island | Settings |
+| --- | --- | --- |
+| ![Windows overview reference](screenshots/overview.png) | ![Windows compact island reference](screenshots/compact.png) | ![Windows settings reference](screenshots/settings.png) |
+
+These Windows captures are interface references, not screenshots of the latest Linux AirDrop implementation. For current Linux UI captures see the [overview](../docs/media/mochi-overview.png), [wardrobe](../docs/media/mochi-wardrobe.png), [animated demo](../docs/media/mochi-demo.gif), and [short MP4 video](../docs/media/mochi-demo.mp4).
+
 ## Requirements
 
 - Windows 10 or 11 with Microsoft Edge WebView2 Runtime.
@@ -47,8 +55,10 @@ npm run pack
 | Logs, inbox, and helper binaries | `%LOCALAPPDATA%\Mochi` |
 | App log | `%LOCALAPPDATA%\Mochi\mochi.log` |
 
-OpenCode and other coding-agent integrations use their own installed binaries and credentials. Mochi does not bundle a model or replace their permission controls. Feature availability varies by operating system: Linux MPRIS, Niri autostart, and Linux location-service notes in the [main guide](../README.md) are not Windows setup instructions.
+OpenCode and other coding-agent integrations use their own installed binaries and credentials. Mochi does not bundle a model or replace their permission controls. Feature availability varies by operating system: Linux MPRIS, Niri autostart, the experimental Linux AirDrop control, and Linux location-service notes in the [main guide](../README.md) are not Windows setup instructions.
 
 For the optional Apple Live Activity integration, see the separate [relay guide](../relay/README.md); it is not needed to build or use this Windows app.
+
+Found a bug? Open a [GitHub Issue](https://github.com/Spydomain/Mochi/issues) or email [contactme@bikashkumarsarraf.com.np](mailto:contactme@bikashkumarsarraf.com.np). Include the Windows version, app commit, reproduction steps, and a redacted screenshot or video when useful. The Linux AirDrop receiver is not a Windows feature.
 
 **Mochi is a modified version of [Coucou](https://github.com/Louis-CFM/coucou). Special thanks to [Louis-CFM](https://github.com/Louis-CFM) and the Coucou project for the original foundation.**

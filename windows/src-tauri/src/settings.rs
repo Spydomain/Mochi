@@ -40,8 +40,14 @@ pub struct Settings {
     /// Like `hooks_installed`, the real state wins at launch over what was stored.
     pub plan_relay_installed: bool,
     /// Show the Codex plan pill (5 h / weekly limits from `codex app-server`).
-    /// Off by default; nothing is installed for it.
     pub show_codex_plan_in_notch: bool,
+    /// Controls for the optional indicators in the island header.
+    pub show_air_drop_in_notch: bool,
+    pub show_battery_in_notch: bool,
+    pub show_keep_awake_in_notch: bool,
+    /// Optional Linux AirDrop preferences; empty destination means ~/Downloads.
+    pub airdrop_name: String,
+    pub airdrop_directory: String,
     /// Who the chat talks to: "anthropic", a cloud provider of
     /// openai_compat.rs ("openai", "google", "openrouter"), or a model server
     /// of local_chat.rs ("ollama", "lmstudio", "custom"). Picked in the chat view.
@@ -130,7 +136,12 @@ impl Default for Settings {
             model: default_model(),
             show_plan_in_notch: false,
             plan_relay_installed: false,
-            show_codex_plan_in_notch: false,
+            show_codex_plan_in_notch: true,
+            show_air_drop_in_notch: true,
+            show_battery_in_notch: true,
+            show_keep_awake_in_notch: true,
+            airdrop_name: "Mochi".into(),
+            airdrop_directory: String::new(),
             chat_provider: crate::chat::ANTHROPIC.into(),
             chat_models: BTreeMap::new(),
             ollama_url: String::new(),
@@ -244,7 +255,10 @@ fn load_from(path: &Path) -> Settings {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Settings::default(),
         Err(err) => {
-            note(format!("can't read {}: {err} — using the defaults", path.display()));
+            note(format!(
+                "can't read {}: {err} — using the defaults",
+                path.display()
+            ));
             protect(path);
             return Settings::default();
         }
@@ -257,7 +271,10 @@ fn load_from(path: &Path) -> Settings {
                 copy.display()
             )),
             Err(err) => {
-                note(format!("{} is not usable and could not be copied: {err}", path.display()));
+                note(format!(
+                    "{} is not usable and could not be copied: {err}",
+                    path.display()
+                ));
                 protect(path);
             }
         }
@@ -283,14 +300,21 @@ fn keep_what_was_not_loaded(path: &Path) -> std::io::Result<()> {
     match std::fs::read(path) {
         Ok(bytes) => {
             let copy = set_aside(path, "unread", &bytes)?;
-            note(format!("{} was never loaded — kept as {}", path.display(), copy.display()));
+            note(format!(
+                "{} was never loaded — kept as {}",
+                path.display(),
+                copy.display()
+            ));
         }
         // Gone since: nothing is left to protect.
         Err(err) if err.kind() == ErrorKind::NotFound => {}
         Err(err) => {
             return Err(std::io::Error::new(
                 err.kind(),
-                format!("{} still can't be read, so it is left as it is: {err}", path.display()),
+                format!(
+                    "{} still can't be read, so it is left as it is: {err}",
+                    path.display()
+                ),
             ));
         }
     }
@@ -321,7 +345,11 @@ fn same_copy(path: &Path, kind: &str, bytes: &[u8]) -> Option<PathBuf> {
         .ok()?
         .filter_map(Result::ok)
         .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
-        .filter(|entry| entry.metadata().is_ok_and(|m| m.len() == bytes.len() as u64))
+        .filter(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|m| m.len() == bytes.len() as u64)
+        })
         .map(|entry| entry.path())
         .find(|copy| std::fs::read(copy).is_ok_and(|held| held == bytes))
 }
@@ -364,7 +392,10 @@ fn set_aside_as(
             Err(err) => return Err(err),
         }
     }
-    Err(std::io::Error::new(ErrorKind::AlreadyExists, format!("too many copies named {base}")))
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        format!("too many copies named {base}"),
+    ))
 }
 
 /// Writes `bytes` to `file` and waits until they are on the disk.
@@ -397,7 +428,8 @@ fn save_to(path: &Path, settings: &Settings) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let written = options.open(&temp)
+    let written = options
+        .open(&temp)
         .and_then(|mut file| {
             // A leftover temporary file from an interrupted save may have an
             // older, weaker mode. Tighten it before writing anything private.
@@ -439,6 +471,11 @@ mod tests {
   "showPlanInNotch": true,
   "planRelayInstalled": true,
   "showCodexPlanInNotch": true,
+  "showAirDropInNotch": false,
+  "showBatteryInNotch": false,
+  "showKeepAwakeInNotch": false,
+  "airdropName": "My Laptop",
+  "airdropDirectory": "/tmp/my-airdrop-files",
   "chatProvider": "ollama",
   "chatModels": { "ollama": "llama3.2", "openai": "gpt-x" },
   "ollamaUrl": "http://127.0.0.1:11434",
@@ -482,8 +519,8 @@ mod tests {
 
     /// A fresh directory of our own, and the settings.json it will hold.
     fn scratch(name: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir()
-            .join(format!("mochi-settings-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mochi-settings-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("settings.json");
@@ -567,6 +604,24 @@ mod tests {
     }
 
     #[test]
+    fn older_settings_use_the_default_airdrop_identity_and_folder() {
+        let loaded = parse(&custom_with("airdropName", None)).unwrap();
+        assert_eq!(loaded.airdrop_name, "Mochi");
+        let loaded = parse(&custom_with("airdropDirectory", None)).unwrap();
+        assert!(loaded.airdrop_directory.is_empty());
+    }
+
+    #[test]
+    fn older_settings_show_the_new_header_indicators_by_default() {
+        let loaded = parse(&custom_with("showAirDropInNotch", None)).unwrap();
+        assert!(loaded.show_air_drop_in_notch);
+        let loaded = parse(&custom_with("showBatteryInNotch", None)).unwrap();
+        assert!(loaded.show_battery_in_notch);
+        let loaded = parse(&custom_with("showKeepAwakeInNotch", None)).unwrap();
+        assert!(loaded.show_keep_awake_in_notch);
+    }
+
+    #[test]
     fn a_file_from_before_the_desktop_mochi_keeps_him_in_the_island() {
         let loaded = parse(&custom_with("desktopMochi", None)).unwrap();
         assert_eq!(loaded.desktop_mochi, DesktopMochiPref::default());
@@ -585,7 +640,11 @@ mod tests {
         assert_eq!(loaded.desktop_mochi, DesktopMochiPref::default());
         assert_eq!(loaded.model, "some-model");
 
-        let loaded = parse(&custom_with("desktopMochi", Some(json!({ "onDesktop": true })))).unwrap();
+        let loaded = parse(&custom_with(
+            "desktopMochi",
+            Some(json!({ "onDesktop": true })),
+        ))
+        .unwrap();
         assert!(loaded.desktop_mochi.on_desktop);
         assert_eq!(loaded.desktop_mochi.spot, None);
     }
@@ -600,8 +659,15 @@ mod tests {
     #[test]
     fn pill_colours_are_kept_as_written_and_cost_nothing_else_when_unusable() {
         // A pill a newer build added keeps its colour through a save by this one.
-        let loaded = parse(&custom_with("pillColors", Some(json!({ "agent_new": "#abcdef" })))).unwrap();
-        assert_eq!(loaded.pill_colors.get("agent_new").map(String::as_str), Some("#abcdef"));
+        let loaded = parse(&custom_with(
+            "pillColors",
+            Some(json!({ "agent_new": "#abcdef" })),
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.pill_colors.get("agent_new").map(String::as_str),
+            Some("#abcdef")
+        );
         // Not a map of strings: the colours fall back, and nothing else does.
         let loaded = parse(&custom_with("pillColors", Some(json!(["#2DD4BF"])))).unwrap();
         assert!(loaded.pill_colors.is_empty());
@@ -616,7 +682,12 @@ mod tests {
         assert_eq!(loaded.mochi_outfit, "topHat");
         // The language too: "" (follow the system) when absent, as it comes otherwise.
         assert_eq!(parse(&custom_with("language", None)).unwrap().language, "");
-        assert_eq!(parse(&custom_with("language", Some(json!("xx")))).unwrap().language, "xx");
+        assert_eq!(
+            parse(&custom_with("language", Some(json!("xx"))))
+                .unwrap()
+                .language,
+            "xx"
+        );
     }
 
     #[test]
@@ -705,7 +776,11 @@ mod tests {
     #[cfg(windows)]
     fn locked(path: &Path) -> std::fs::File {
         use std::os::windows::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().read(true).share_mode(0).open(path).unwrap()
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
     }
 
     #[cfg(windows)]
@@ -798,7 +873,13 @@ mod tests {
             Err(std::io::Error::other("the disk is full"))
         }
         let (dir, file) = scratch("half");
-        let copy = set_aside_as(&file, "corrupt", "20260102-030405", b"all of it", half_then_fail);
+        let copy = set_aside_as(
+            &file,
+            "corrupt",
+            "20260102-030405",
+            b"all of it",
+            half_then_fail,
+        );
         assert!(copy.is_err());
         assert!(names(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -824,8 +905,14 @@ mod tests {
         std::os::unix::fs::symlink(&real, &file).unwrap();
 
         save_to(&file, &Settings::default()).unwrap();
-        assert!(std::fs::symlink_metadata(&file).unwrap().file_type().is_symlink());
-        assert_eq!(shown(&parse(&std::fs::read(&real).unwrap()).unwrap()), defaults());
+        assert!(std::fs::symlink_metadata(&file)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            shown(&parse(&std::fs::read(&real).unwrap()).unwrap()),
+            defaults()
+        );
         assert_eq!(names(&dir), ["dotfiles-settings.json", "settings.json"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -844,7 +931,12 @@ mod tests {
         let (dir, file) = scratch("keys");
         save_to(&file, &Settings::default()).unwrap();
         let written: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        let keys: Vec<&str> = written.as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             keys,
             [
@@ -864,6 +956,11 @@ mod tests {
                 "showPlanInNotch",
                 "planRelayInstalled",
                 "showCodexPlanInNotch",
+                "showAirDropInNotch",
+                "showBatteryInNotch",
+                "showKeepAwakeInNotch",
+                "airdropName",
+                "airdropDirectory",
                 "chatProvider",
                 "chatModels",
                 "ollamaUrl",
@@ -900,9 +997,16 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let (dir, file) = scratch("private");
         save_to(&file, &Settings::default()).unwrap();
-        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-        let copy = set_aside_as(&file, "corrupt", "20260102-030405", b"secret", write_whole).unwrap();
-        assert_eq!(std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let copy =
+            set_aside_as(&file, "corrupt", "20260102-030405", b"secret", write_whole).unwrap();
+        assert_eq!(
+            std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

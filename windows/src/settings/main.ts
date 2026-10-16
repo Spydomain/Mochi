@@ -13,7 +13,7 @@ import { DEFAULT_SETTINGS, type Settings } from "../core/state";
 import { weatherDescription, type WeatherLocation } from "../core/weather";
 import { SOUND_NAMES } from "../core/sound";
 import {
-  MAX_DECLARED, PILL_CATEGORIES, availablePills, chooseMainPill, isComingSoon, mainPillChoices,
+  HOST_OS, MAX_DECLARED, PILL_CATEGORIES, availablePills, chooseMainPill, isComingSoon, mainPillChoices,
   sanitizeDeclared, toggleDeclared, type PillDefinition,
 } from "../core/pills";
 import { h, clear } from "../views/dom";
@@ -240,8 +240,6 @@ function claudeSection(status: HookStatus): HTMLElement {
 const PLAN_SETTINGS_TEXT = {
   get claude() { return t("Shows your Claude plan usage (5-hour and weekly limits) in the island's header. Mochi adds a status line relay in ~/.claude/settings.json. If you already have a status line, it keeps working as before. Pro and Max plans only."); },
   get showClaude() { return t("Show in notch"); },
-  get codex() { return t("Shows your Codex plan usage (weekly limit and free resets left) in the island's header. Mochi asks the Codex CLI (codex app-server) when the pill shows; nothing is installed. Codex must be signed in with ChatGPT."); },
-  get showCodex() { return t("Show Codex plan in the notch"); },
 };
 
 function planSection(status: HookStatus): HTMLElement {
@@ -301,20 +299,32 @@ function planSection(status: HookStatus): HTMLElement {
               onclick: () => void reviewChange(body, STATUS_LINE_CHANGE, true, redraw, () => void rebuild()),
             }),
       ),
-      // Codex: nothing to install, Mochi asks the Codex CLI when the pill shows.
-      h("div", { class: "hint", text: PLAN_SETTINGS_TEXT.codex }),
-      h("div", { class: "row" },
-        h("label", { text: PLAN_SETTINGS_TEXT.showCodex }),
-        toggle(settings.showCodexPlanInNotch, (on) => {
-          settings.showCodexPlanInNotch = on;
-          void save();
-        }),
-      ),
     );
   }
 
   draw();
   return section;
+}
+
+// ── Island header ─────────────────────────────────────────────────────────────
+
+function islandHeaderSection(): HTMLElement {
+  type HeaderIndicator = "showCodexPlanInNotch" | "showAirDropInNotch" | "showBatteryInNotch" | "showKeepAwakeInNotch";
+  const indicator = (label: string, key: HeaderIndicator) => h("div", { class: "row" },
+    h("label", { text: label }),
+    toggle(settings[key], (on) => {
+      settings[key] = on;
+      void save();
+    }),
+  );
+  return h("section", {},
+    h("h2", { text: t("Island header") }),
+    h("div", { class: "hint", text: t("Choose which optional indicators appear beside the island controls. All are on by default.") }),
+    indicator(t("Codex plan"), "showCodexPlanInNotch"),
+    indicator(t("AirDrop"), "showAirDropInNotch"),
+    indicator(t("Battery"), "showBatteryInNotch"),
+    indicator(t("Keep Awake"), "showKeepAwakeInNotch"),
+  );
 }
 
 // ── Claude API section ────────────────────────────────────────────────────────
@@ -1142,6 +1152,35 @@ function generalSection(): HTMLElement {
   );
 }
 
+function airDropSection(): HTMLElement {
+  const name = h("input", { type: "text", maxlength: "48", value: settings.airdropName || "Mochi",
+    placeholder: "Mochi", style: "min-width:240px" }) as HTMLInputElement;
+  const folder = h("input", { type: "text", value: settings.airdropDirectory || "",
+    placeholder: "Empty = ~/Downloads; otherwise enter an absolute path", style: "min-width:330px" }) as HTMLInputElement;
+  const feedback = h("div", { class: "hint", role: "status" });
+  const apply = h("button", { class: "primary", text: "Save AirDrop preferences" });
+  apply.addEventListener("click", async () => {
+    apply.disabled = true;
+    feedback.textContent = "";
+    try {
+      const nextName = name.value.trim();
+      const nextFolder = folder.value.trim();
+      await Bridge.airdropValidate(nextName, nextFolder);
+      settings.airdropName = nextName;
+      settings.airdropDirectory = nextFolder;
+      await save();
+      feedback.textContent = "Saved. Turn AirDrop off and on to apply these changes.";
+    } catch (err) {
+      feedback.textContent = String(err);
+    } finally { apply.disabled = false; }
+  });
+  return h("section", {}, h("h2", { text: "AirDrop (Linux)" }),
+    h("div", { class: "hint", text: "Your device name and incoming file folder. The folder must already exist and belong to you. These settings apply to the experimental MT7922 receiver at its next start." }),
+    h("div", { class: "row" }, h("label", { text: "Device name" }), name),
+    h("div", { class: "row" }, h("label", { text: "Save received files to" }), folder),
+    h("div", { class: "row" }, apply, feedback));
+}
+
 /**
  * Settings → General → Language, as on the Mac: "System" follows the
  * system's language when Mochi has it (else English), or one of the ten.
@@ -1541,12 +1580,14 @@ async function render() {
     claudeSection(status),
     agentsSection(agents),
     planSection(status),
+    islandHeaderSection(),
     apiSection(hasKey),
     chatProvidersSection(chatKeys, keyChanged),
     localSection(customKey),
     activePillsSection(connected),
     integrationsSection(present),
     weatherSection(),
+    ...(HOST_OS === "linux" ? [airDropSection()] : []),
     generalSection(),
     shortcutsSection(shortcutReport),
     h("div", {

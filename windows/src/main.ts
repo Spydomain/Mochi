@@ -13,6 +13,7 @@ import { applySpotify, registerSpotifyHandlers } from "./island/spotify";
 import { SPOTIFY_ID } from "./core/spotify";
 import { Recap } from "./recap/recap";
 import { onLanguageChange, resolveLanguage, setLanguage, systemLanguages } from "./i18n/i18n";
+import { refreshAirDrop } from "./views/airdrop";
 
 /** Shows the language Settings asks for ("" = the system's, when Mochi has it). */
 function applyLanguage() {
@@ -36,6 +37,73 @@ async function main() {
       State.notify();
     }
   });
+  void refreshAirDrop();
+  window.setInterval(() => {
+    if (State.os !== "linux") return;
+    void refreshAirDrop();
+  }, 8_000);
+  let checkingAirDrop = false;
+  let completedAt = 0;
+  let lastTransferCheck = 0;
+  window.setInterval(() => {
+    if (State.os !== "linux" || checkingAirDrop ||
+        (!State.airdropStatus?.receiving && !State.airdropRequest)) return;
+    checkingAirDrop = true;
+    void (async () => {
+      try {
+        const pending = await Bridge.airdropIncoming();
+        if (!pending) State.airdropAnsweredId = null;
+        const request = pending?.id === State.airdropAnsweredId ? null : pending;
+        if (State.airdropAnsweredId && !State.airdropRequest && State.view === "airdropRequest") {
+          island.setView("overview");
+          if (State.airdropTransfer) island.collapse();
+        }
+        if (request?.id !== State.airdropRequest?.id) {
+          const hadRequest = !!State.airdropRequest;
+          State.airdropRequest = request;
+          if (request && !State.pendingApproval && !State.paused) {
+            State.airdropError = "";
+            island.alert("airdropRequest");
+          } else if (hadRequest && State.view === "airdropRequest") {
+            island.setView("overview");
+            if (State.airdropTransfer) island.collapse();
+          }
+          State.notify();
+        }
+        if (!State.airdropStatus?.receiving) {
+          if (State.airdropTransfer || State.airdropProgress) {
+            State.airdropTransfer = null;
+            State.airdropProgress = null;
+            State.notify();
+          }
+          return;
+        }
+        const now = Date.now();
+        if (now - lastTransferCheck < (State.airdropTransfer === "receiving" ? 500 : 1_000)) return;
+        lastTransferCheck = now;
+        const transfer = await Bridge.airdropTransfer();
+        const previous = State.airdropTransfer;
+        const previousReceived = State.airdropProgress?.receivedBytes;
+        const previousTotal = State.airdropProgress?.totalBytes;
+        if (transfer?.state === "complete" || transfer?.state === "failed") {
+          if (!completedAt) completedAt = Date.now();
+          if (transfer.state === "failed" && State.airdropTransfer !== "failed") {
+            State.airdropError = "AirDrop transfer incomplete. The partial file was kept in your save folder; try sending it again.";
+          }
+          State.airdropTransfer = Date.now() - completedAt < 5000 ? transfer.state : null;
+        } else {
+          completedAt = 0;
+          State.airdropTransfer = transfer?.state ?? null;
+        }
+        State.airdropProgress = State.airdropTransfer && transfer
+          ? { receivedBytes: transfer.receivedBytes, totalBytes: transfer.totalBytes } : null;
+        if (State.airdropTransfer !== previous || State.airdropProgress?.receivedBytes !== previousReceived ||
+            State.airdropProgress?.totalBytes !== previousTotal) State.notify();
+      } catch (err) {
+        console.error("[mochi] AirDrop consent check failed", err);
+      } finally { checkingAirDrop = false; }
+    })();
+  }, 350);
   // A language change redraws the island in place: the texts given as tl(…)
   // relabel themselves (views/dom.ts) and the views redraw the rest on this
   // sync. Nothing is rebuilt, so tasks, steps and the chat stay as they are.

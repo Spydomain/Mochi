@@ -25,6 +25,7 @@ SETTINGS_FILE="$CONFIG_HOME/mochi/settings.json"
 PLUGIN_FILE="$CONFIG_HOME/opencode/plugins/mochi.js"
 HOOK_FILE="$DATA_HOME/mochi/bin/mochi-hook"
 CLEANUP_FILE="$DATA_HOME/mochi/bin/cleanup-opencode-sessions"
+AIRDROP_CONFIRM_FILE="$DATA_HOME/mochi/bin/mochi-airdrop-confirm"
 SYSTEMD_DIR="$CONFIG_HOME/systemd/user"
 AUTOSTART_BACKUP_DIR="$CONFIG_HOME/mochi/autostart-backups"
 # One-time upgrade from the earlier local install. These old paths are used
@@ -36,6 +37,7 @@ OLD_AUTOSTART_FILE="$CONFIG_HOME/autostart/coucou.desktop"
 OLD_APP_SERVICE="coucou-app.service"
 OLD_CLEANUP_TIMER="coucou-opencode-cleanup.timer"
 NO_LAUNCH=0
+NO_AIRDROP=0
 CHECK_ONLY=0
 CHECK_MISSING=0
 NODE_VERSION="v24.21.0"
@@ -45,9 +47,10 @@ DISTRO_NAME=""
 for arg in "$@"; do
   case "$arg" in
     --no-launch) NO_LAUNCH=1 ;;
+    --no-airdrop) NO_AIRDROP=1 ;;
     --check) CHECK_ONLY=1 ;;
     --build) ;; # Older quickstart entry point accepted this; setup always builds.
-    *) printf 'Unknown option: %s\nUsage: %s [--check] [--no-launch] [--build]\n' "$arg" "$0" >&2; exit 2 ;;
+    *) printf 'Unknown option: %s\nUsage: %s [--check] [--no-launch] [--no-airdrop] [--build]\n' "$arg" "$0" >&2; exit 2 ;;
   esac
 done
 
@@ -84,6 +87,16 @@ detect_linux() {
   [[ -n "$PACKAGE_MANAGER" ]] || die "Unsupported Linux distribution: $DISTRO_NAME ($id, ID_LIKE=$like). No packages were changed."
   command -v "$PACKAGE_MANAGER" >/dev/null 2>&1 || die "$DISTRO_NAME requires $PACKAGE_MANAGER, but it is not installed."
   log "Detected $DISTRO_NAME; using $PACKAGE_MANAGER."
+}
+
+has_mt7922() {
+  local nic
+  for nic in /sys/class/net/*; do
+    [[ -r "$nic/device/vendor" && -r "$nic/device/device" ]] || continue
+    [[ "$(< "$nic/device/vendor")" == 0x14c3 && "$(< "$nic/device/device")" == 0x0616 ]] || continue
+    [[ "$(basename "$(readlink -f "$nic/device/driver")")" == mt7921e ]] && return 0
+  done
+  return 1
 }
 
 has_user_systemd() {
@@ -175,6 +188,16 @@ install_system_dependencies() {
       gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugins-bad)
     ;;
   esac
+  # Only the tested MT7922 route needs radio build dependencies. Never
+  # provision the experimental receiver on an unrelated network adapter.
+  if (( !NO_AIRDROP )) && has_mt7922; then
+    case "$PACKAGE_MANAGER" in
+      pacman) packages+=(cmake python python-pip python-dbus iw tcpdump libnl libarchive patch sudo) ;;
+      apt-get) packages+=(cmake python3 python3-venv python3-pip python3-dbus iw tcpdump libpcap-dev libnl-3-dev libnl-genl-3-dev libarchive-dev patch sudo) ;;
+      dnf) packages+=(cmake python3 python3-pip python3-dbus iw tcpdump libpcap-devel libnl3-devel libarchive-devel patch sudo) ;;
+      zypper) packages+=(cmake python3 python3-pip iw tcpdump libpcap-devel libnl3-devel libarchive-devel patch sudo) ;;
+    esac
+  fi
   mapfile -t missing < <(missing_packages "${packages[@]}")
   if ((${#missing[@]} == 0)); then
     log 'System dependencies are installed.'
@@ -243,6 +266,27 @@ build_app() {
   log 'Installing JavaScript dependencies, checking app behaviour, and building release app.'
   (cd "$WINDOWS_DIR" && npm ci && npm test && ./node_modules/.bin/tauri build --no-bundle)
   [[ -x "$BUILT_BINARY" && -x "$WINDOWS_DIR/target/release/mochi-hook" ]] || die 'Release app or relay is missing.'
+  bash -n "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" || die 'AirDrop consent hook failed syntax check.'
+}
+
+install_airdrop() {
+  if ((NO_AIRDROP)); then
+    log 'MT7922 backend skipped (--no-airdrop).'
+    return
+  fi
+  bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" ||
+    die 'The tested AirDrop receiver could not be installed; no app revision was marked complete.'
+  bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" --verify ||
+    die 'The installed AirDrop receiver failed verification.'
+}
+
+install_executable() {
+  local source="$1" destination="$2" staged
+  staged="$(mktemp "$(dirname "$destination")/.mochi-install.XXXXXXXX")"
+  if ! install -m 755 "$source" "$staged" || ! mv -f -- "$staged" "$destination"; then
+    rm -f -- "$staged"
+    die "Could not install $destination"
+  fi
 }
 
 migrate_previous_settings() {
@@ -279,20 +323,22 @@ install_files() {
   [[ -z "${NIRI_SOCKET:-}" ]] || desktop_session="niri"
   mkdir -p "$(dirname "$DESKTOP_FILE")" "$(dirname "$AUTOSTART_FILE")" "$(dirname "$ICON_FILE")" "$(dirname "$SETTINGS_FILE")" "$(dirname "$PLUGIN_FILE")" "$(dirname "$HOOK_FILE")" "$SYSTEMD_DIR"
   migrate_previous_settings
-  local staged_binary="$DATA_HOME/mochi/bin/.mochi-new.$$"
-  install -m 755 "$BUILT_BINARY" "$staged_binary"
-  mv -f -- "$staged_binary" "$BINARY"
-  install -m 755 "$WINDOWS_DIR/target/release/mochi-hook" "$HOOK_FILE"
-  install -m 755 "$WINDOWS_DIR/scripts/cleanup-opencode-sessions.sh" "$CLEANUP_FILE"
+  install_executable "$BUILT_BINARY" "$BINARY"
+  install_executable "$WINDOWS_DIR/target/release/mochi-hook" "$HOOK_FILE"
+  install_executable "$WINDOWS_DIR/scripts/cleanup-opencode-sessions.sh" "$CLEANUP_FILE"
+  # Replace by rename: a running receiver can finish using its old consent
+  # hook, while the next /Ask gets a complete, executable progress-aware hook.
+  install_executable "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE"
+  cmp -s "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE" || die 'AirDrop consent hook did not install correctly.'
   install -m 644 "$WINDOWS_DIR/src-tauri/icons/128x128.png" "$ICON_FILE"
   if [[ ! -e "$SETTINGS_FILE" ]]; then
-    printf '{"chatProvider":"opencode","chatModels":{"opencode":"opencode/nemotron-3-ultra-free"},"language":"en"}\n' > "$SETTINGS_FILE"
+    printf '{"chatProvider":"opencode","chatModels":{"opencode":"opencode/nemotron-3-ultra-free"},"language":"en","showCodexPlanInNotch":true,"showAirDropInNotch":true,"showBatteryInNotch":true,"showKeepAwakeInNotch":true}\n' > "$SETTINGS_FILE"
     log 'Created English/OpenCode defaults.'
   else
     log 'Preserved existing settings.'
   fi
   # Keep the user's settings intact while making the installed app persistent.
-  node -e 'const fs=require("node:fs"); const p=process.argv[1]; const v=JSON.parse(fs.readFileSync(p,"utf8")); v.autostart=true; v.openOnHover=true; v.language="en"; v.chatProvider="opencode"; v.chatModels={...(v.chatModels||{}), opencode:(v.chatModels?.opencode||"opencode/nemotron-3-ultra-free")}; fs.writeFileSync(p,JSON.stringify(v,null,2)+"\n",{mode:0o600});' "$SETTINGS_FILE" || die 'Settings JSON is invalid; kept it intact for repair.'
+  node -e 'const fs=require("node:fs"); const p=process.argv[1]; const v=JSON.parse(fs.readFileSync(p,"utf8")); v.autostart=true; v.openOnHover=true; v.language="en"; v.chatProvider="opencode"; v.chatModels={...(v.chatModels||{}), opencode:(v.chatModels?.opencode||"opencode/nemotron-3-ultra-free")}; for(const k of ["showCodexPlanInNotch","showAirDropInNotch","showBatteryInNotch","showKeepAwakeInNotch"]) if(typeof v[k]!=="boolean") v[k]=true; fs.writeFileSync(p,JSON.stringify(v,null,2)+"\n",{mode:0o600});' "$SETTINGS_FILE" || die 'Settings JSON is invalid; kept it intact for repair.'
   chmod 600 "$SETTINGS_FILE"
   if [[ ! -e "$PLUGIN_FILE" ]] || grep -q 'generated by Mochi' "$PLUGIN_FILE"; then
     node -e 'const fs=require("node:fs"); const [src,dst,hook]=process.argv.slice(1); const js=fs.readFileSync(src,"utf8").replace("{HOOK}",JSON.stringify(hook)); fs.writeFileSync(dst,js,{mode:0o600});' \
@@ -349,7 +395,9 @@ install_files() {
         log "Retired duplicate autostart entry: $entry"
       fi
     done
-    printf '[Unit]\nDescription=Mochi desktop companion\nPartOf=graphical-session.target\nAfter=graphical-session.target\n\n[Service]\nType=simple\nWorkingDirectory=%%h\nExecStart=%s\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=graphical-session.target\n' "$BINARY" > "$SYSTEMD_DIR/mochi-app.service"
+    # Let child processes handle SIGTERM before systemd kills the whole cgroup.
+    # In particular, the optional AirDrop daemon restores its radio in a trap.
+    printf '[Unit]\nDescription=Mochi desktop companion\nPartOf=graphical-session.target\nAfter=graphical-session.target\n\n[Service]\nType=simple\nWorkingDirectory=%%h\nExecStart=%s\nKillMode=mixed\nTimeoutStopSec=30s\nRestart=on-failure\nRestartSec=2\n\n[Install]\nWantedBy=graphical-session.target\n' "$BINARY" > "$SYSTEMD_DIR/mochi-app.service"
   else
     printf '[Desktop Entry]\nType=Application\nName=Mochi\nExec="%s"\nHidden=false\nX-GNOME-Autostart-enabled=true\n' "$BINARY" > "$AUTOSTART_FILE"
     chmod 644 "$AUTOSTART_FILE"
@@ -371,9 +419,15 @@ install_files() {
 }
 
 start_app() {
-  local pid path
+  local pid path service_pid=''
+  if systemctl --user is-enabled --quiet mochi-app.service 2>/dev/null; then
+    service_pid="$(systemctl --user show -p MainPID --value mochi-app.service 2>/dev/null || true)"
+  fi
   while read -r pid; do
     [[ -n "$pid" ]] || continue
+    # Let systemd stop its own app. Killing its PID first can trigger a
+    # Restart=on-failure race while the new executable is being launched.
+    [[ "$pid" != "$service_pid" ]] || continue
     path="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
     case "$path" in
       "$BINARY"|"$BINARY (deleted)"|"$BUILT_BINARY"|"$BUILT_BINARY (deleted)"|"$OLD_BINARY"|"$OLD_BINARY (deleted)")
@@ -427,6 +481,7 @@ ensure_node
 ensure_rust
 ensure_opencode
 build_app
+install_airdrop
 install_files
 opencode service start >/dev/null || die 'Could not start the OpenCode background service.'
 if ((NO_LAUNCH)); then

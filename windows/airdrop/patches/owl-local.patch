@@ -1,0 +1,145 @@
+diff --git a/daemon/core.c b/daemon/core.c
+index bb8bdb9..feba0be 100644
+--- a/daemon/core.c
++++ b/daemon/core.c
+@@ -26,6 +26,7 @@
+ #include "tx.h"
+ #include "schedule.h"
+ 
++#include <errno.h>
+ #include <signal.h>
+ 
+ #ifdef __APPLE__
+@@ -143,9 +144,9 @@ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+ 	READ_ETHER_ADDR(buf, ETHER_DST_OFFSET, &dst);
+ 	READ_ETHER_ADDR(buf, ETHER_SRC_OFFSET, &src);
+ 
+-	buf_strip(buf, ETHER_LENGTH);
+ 	awdl_data_len = awdl_init_full_data_frame(awdl_data, &src, &dst,
+-	                                          buf_data(buf), buf_len(buf),
++	                                          buf_data(buf) + ETHER_LENGTH,
++	                                          buf_len(buf) - ETHER_LENGTH,
+ 	                                          awdl_state, ieee80211_state);
+ 	now = clock_time_us();
+ 	period = awdl_sync_current_eaw(now, &awdl_state->sync) / AWDL_CHANSEQ_LENGTH;
+@@ -153,9 +154,12 @@ int awdl_send_data(const struct buf *buf, const struct io_state *io_state,
+ 	tu = awdl_sync_next_aw_tu(now, &awdl_state->sync);
+ 	log_trace("Send data (len %d) to %s (%u.%u.%u)", awdl_data_len,
+ 	          ether_ntoa(&dst), period, slot, tu);
+-	awdl_state->stats.tx_data++;
+-	if (wlan_send(io_state, awdl_data, awdl_data_len) < 0)
++	int send_result = wlan_send(io_state, awdl_data, awdl_data_len);
++	if (send_result == -EAGAIN)
++		return TX_RETRY;
++	if (send_result < 0)
+ 		return TX_FAIL;
++	awdl_state->stats.tx_data++;
+ 	return TX_OK;
+ 
+ wire_error:
+@@ -222,10 +226,18 @@ void awdl_send_unicast(struct ev_loop *loop, ev_timer *timer, int revents) {
+ 		} else {
+ 			in = awdl_can_send_unicast_in(awdl_state, peer, now, AWDL_UNICAST_GUARD_TU);
+ 			if (in == 0) { /* send now */
+-				awdl_send_data(state->next, &state->io, &state->awdl_state, &state->ieee80211_state);
+-				buf_free(state->next);
+-				state->next = NULL;
+-				state->awdl_state.stats.tx_data_unicast++;
++				int result = awdl_send_data(state->next, &state->io,
++				                            &state->awdl_state, &state->ieee80211_state);
++				if (result == TX_RETRY) {
++					/* Keep the TCP ACK (or other frame) until the TX queue drains.
++					 * Dropping it here can stall a large incoming transfer. */
++					in = 0.002;
++				} else {
++					buf_free(state->next);
++					state->next = NULL;
++					if (result == TX_OK)
++						state->awdl_state.stats.tx_data_unicast++;
++				}
+ 			} else { /* try later */
+ 				if (in < 0) /* we are at the end of slot but within guard */
+ 					in = -in + usec_to_sec(ieee80211_tu_to_usec(AWDL_UNICAST_GUARD_TU));
+@@ -254,10 +266,17 @@ void awdl_send_multicast(struct ev_loop *loop, ev_timer *timer, int revents) {
+ 		in = awdl_can_send_in(awdl_state, now, AWDL_MULTICAST_GUARD_TU);
+ 		if (awdl_is_multicast_eaw(awdl_state, now) && (in == 0)) { /* we can send now */
+ 			void *next;
+-			circular_buf_get(state->tx_queue_multicast, &next, 0);
+-			awdl_send_data((struct buf *) next, &state->io, &state->awdl_state, &state->ieee80211_state);
+-			buf_free(next);
+-			state->awdl_state.stats.tx_data_multicast++;
++			circular_buf_get(state->tx_queue_multicast, &next, 1);
++			int result = awdl_send_data((struct buf *) next, &state->io,
++			                            &state->awdl_state, &state->ieee80211_state);
++			if (result == TX_RETRY) {
++				in = 0.002;
++			} else {
++				circular_buf_get(state->tx_queue_multicast, &next, 0);
++				buf_free(next);
++				if (result == TX_OK)
++					state->awdl_state.stats.tx_data_multicast++;
++			}
+ 		} else { /* try later */
+ 			if (in == 0) /* try again next EAW */
+ 				in = usec_to_sec(ieee80211_tu_to_usec(64));
+diff --git a/daemon/io.c b/daemon/io.c
+index 46c8cc7..8f6a052 100644
+--- a/daemon/io.c
++++ b/daemon/io.c
+@@ -384,8 +384,13 @@ int wlan_send(const struct io_state *state, const uint8_t *buf, int len) {
+ 		return -EINVAL;
+ 	err = pcap_inject(state->wlan_handle, buf, len);
+ 	if (err < 0) {
++		int saved_errno = errno;
++		/* The monitor socket is nonblocking. A full kernel TX queue is
++		 * temporary; callers must retain the frame and retry it. */
++		if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)
++			return -EAGAIN;
+ 		log_error("unable to inject packet (%s)", pcap_geterr(state->wlan_handle));
+-		return err;
++		return saved_errno ? -saved_errno : -EIO;
+ 	}
+ 	return 0;
+ }
+diff --git a/src/rx.c b/src/rx.c
+index 4581ae5..d05d39e 100644
+--- a/src/rx.c
++++ b/src/rx.c
+@@ -321,7 +321,12 @@ int awdl_rx_action(const struct buf *frame, signed char rssi, uint64_t tsft,
+ 		buf_strip(frame, len);
+ 	}
+ 
+-	if (buf_len(frame) > 0) {
++	/* Recent iPhones append two bytes after the last complete AWDL TLV.
++	 * read_tlv() cannot consume them (a TLV header needs three bytes). Treat
++	 * only that observed two-byte trailer as padding; otherwise a malformed
++	 * action frame must still be rejected. Rejecting every MIF here leaves
++	 * sent_mif unset, so the peer never becomes valid for discovery. */
++	if (buf_len(frame) > 0 && buf_len(frame) != 2) {
+ 		log_debug("awdl_action: unexpected bytes (%d) at end of frame", buf_len(frame));
+ 		return RX_UNEXPECTED_FORMAT;
+ 	}
+diff --git a/src/tx.h b/src/tx.h
+index 9af9daa..be504a0 100644
+--- a/src/tx.h
++++ b/src/tx.h
+@@ -26,6 +26,7 @@
+ 
+ enum TX_RESULT {
+ 	TX_OK = 0,
++	TX_RETRY = 1,
+ 	TX_FAIL = -1,
+ };
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index a81d1f2..a552200 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -12,6 +12,7 @@ target_sources(tests PRIVATE
+         test_awdl_election.cpp
+         test_awdl_channel.cpp
+         test_awdl_txgate.cpp
++        test_awdl_rx.cpp
+ )
+ 
+ target_include_directories(tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
