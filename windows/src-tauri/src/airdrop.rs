@@ -187,9 +187,15 @@ mod linux {
     }
 
     fn upload_total_bytes(log: &str) -> Option<u64> {
-        // TotalBytes is the sender's declared wire payload size, not a
-        // Content-Length (iOS uploads using chunked encoding).
-        log.lines()
+        // PROGRESS ONLY. The receiver decides success from the parsed archive
+        // trailer, never from this number - that comparison was what reported
+        // a complete transfer as failed, because iOS 26's TotalBytes measures
+        // the decoded archive while the raw file on disk is the compressed
+        // dvzip. For the ring it is still sound: both are byte counts of the
+        // same transfer, the ratio only ever climbs, and the UI caps it below
+        // 100% until extraction is verified, so it cannot claim completion.
+        let upload = log.rsplit("POST request at /Upload").next()?;
+        upload.lines()
             .filter_map(|line| line.strip_prefix("TotalBytes: ")?.trim().parse::<u64>().ok())
             .filter(|total| (1..=1_000_000_000_000).contains(total))
             .last()
@@ -226,8 +232,8 @@ mod linux {
         if log.contains("File(s) incomplete") {
             Some("failed")
         } else if log.contains("File(s) received") {
-            // The patched OpenDrop receiver logs this even when it salvaged
-            // only a .partial file, and currently answers HTTP 200 either way.
+            // Older OpenDrop builds logged success for salvaged partial files;
+            // never promote such a result to a completed transfer.
             if log.contains("incomplete, kept as .partial")
                 || log.contains("Could not extract the archive")
                 || !log.contains("Extracted into")
@@ -1120,6 +1126,15 @@ mod linux {
             use super::{archive_received, upload_total_bytes};
             let log = "POST request at /Upload\nTotalBytes: 186876480\nTransfer-Encoding: chunked\nReceiving file(s) ...";
             assert_eq!(upload_total_bytes(log), Some(186876480));
+            // iOS 26 sends dvzip. Its TotalBytes still drives the ring, so a
+            // real transfer shows measured progress instead of an endless
+            // spinner. Success comes from the trailer, never from this.
+            assert_eq!(
+                upload_total_bytes(
+                    "POST request at /Upload\nContent-Type: application/x-dvzip\nTotalBytes: 456877337\nReceiving file(s) ..."
+                ),
+                Some(456_877_337)
+            );
             assert_eq!(upload_total_bytes("TotalBytes: 0\nTotalBytes: rubbish"), None);
             assert_eq!(upload_total_bytes("Content-Length: 500\nReceiving file(s) ..."), None);
 

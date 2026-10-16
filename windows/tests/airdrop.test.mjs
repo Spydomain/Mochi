@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { installFakeDom } from "./fakedom.mjs";
 import { calls, internals } from "./tauri.mjs";
@@ -145,6 +146,14 @@ test("AirDrop compact ring uses measured upload bytes, never fabricated progress
   indicator.sync("compact", "receiving", { receivedBytes: null, totalBytes: 100 });
   assert.equal(indicator.el.classList.contains("determinate"), false);
   assert.equal(indicator.el.getAttribute("aria-valuenow"), null);
+  // A real iOS 26 dvzip transfer: the ring must move, not spin forever. This
+  // regressed once because the declared total was suppressed for dvzip.
+  indicator.sync("compact", "receiving", { receivedBytes: 16_286_916, totalBytes: 456_877_337 });
+  assert.equal(indicator.el.classList.contains("determinate"), true, "dvzip still reports measured progress");
+  assert.equal(indicator.el.style["--airdrop-progress"], "3%", "3.4% of a stalled 457 MB transfer rounds to 3%");
+  // A stalled transfer never claims to be finished before it is verified.
+  indicator.sync("compact", "receiving", { receivedBytes: 456_800_000, totalBytes: 456_877_337 });
+  assert.equal(indicator.el.style["--airdrop-progress"], "99%");
   indicator.sync("compact", "complete");
   assert.equal(indicator.el.classList.contains("complete"), true);
   assert.equal(indicator.el.classList.contains("receiving"), false);
@@ -266,4 +275,94 @@ test("incoming consent shows sender and requires explicit answer for the matchin
     assert.deepEqual(calls, [["airdrop_decide", { id: "f".repeat(32), accept: false }]]);
     assert.equal(State.airdropRequest, null);
   } finally { internals.invoke = original; }
+});
+
+test("consent is polled on its own fast timer, never behind the transfer read", () => {
+  const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  // The consent poll must not share the status or archive-read guard: a slow
+  // archive read, an unfinished status poll, or a busy agent card used to leave
+  // the receiver's /Ask window waiting and the prompt never appeared.
+  const consent = source.slice(
+    source.indexOf("if (State.os !== \"linux\" || checkingIncoming) return;"),
+    source.indexOf("window.setInterval(() => {\n    if (State.os !== \"linux\" || checkingTransfer)"),
+  );
+  assert.ok(consent.length > 400, "consent callback must be its own interval");
+  assert.match(consent, /checkingIncoming = false;/);
+  assert.match(consent, /\}, 200\);/);
+  assert.match(consent, /island\.alert\("airdropRequest"\)/);
+  assert.doesNotMatch(consent, /if \(!State\.airdropStatus\?\.receiving\)|lastTransferCheck|Bridge\.airdropTransfer/);
+});
+
+test("the consent card is released as soon as the request file is gone", () => {
+  const source = readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  // A decline clears State.airdropRequest inside decide() before the file is
+  // observed. Keying the release on a *changed* request id never fired, and
+  // the pinned island stayed open on a dead card for the rest of the session.
+  const start = source.indexOf("const request = pending?.id === State.airdropAnsweredId");
+  const consent = source.slice(start, source.indexOf("checkingIncoming = false;", start));
+  assert.match(consent, /else if \(State\.airdropRequest \|\| State\.view === "airdropRequest"\)/);
+  assert.match(consent, /island\.finishAirDropRequest\(\)/);
+  // The release must not depend on the request id differing.
+  assert.doesNotMatch(consent, /hadRequest/);
+});
+
+test("incoming consent preempts a busy or hover-open island and restores the prior approval", async () => {
+  const { Island } = await import("../src/island/island.ts");
+  const { IslandStateMachine } = await import("../src/island/fsm.ts");
+  reset();
+  State.mode = "expanded";
+  State.view = "overview";
+  State.airdropRequest = { id: "f".repeat(32), sender: "Nearby iPhone", detail: "Photo" };
+  State.pendingApproval = { questions: null };
+  const island = Object.create(Island.prototype);
+  island.fsm = new IslandStateMachine();
+  island.fsm.openOnHover = true;
+  island.animateGeometry = () => {};
+  island.noticeTimer = null;
+  island.noticeActive = false;
+  island.notice = { classList: { remove() {} } };
+  island.root = { classList: { remove() {} } };
+  island.powerActive = false;
+  island.wasInIsland = true;
+  try {
+    island.alert("overview");
+    assert.equal(State.view, "airdropRequest");
+    assert.equal(island.fsm.pinned, true);
+    island.setView("finished");
+    assert.equal(State.view, "airdropRequest", "other agent events cannot hide consent");
+    island.collapse();
+    assert.equal(State.view, "airdropRequest");
+    State.airdropRequest = null;
+    island.finishAirDropRequest();
+    assert.equal(State.view, "approval");
+    assert.equal(island.fsm.pinned, true);
+  } finally {
+    State.airdropRequest = null;
+    State.pendingApproval = null;
+    State.mode = "hidden";
+    State.view = "overview";
+  }
+});
+
+test("finishing a request always unpins the island when nothing is waiting", async () => {
+  const { Island } = await import("../src/island/island.ts");
+  const { IslandStateMachine } = await import("../src/island/fsm.ts");
+  reset();
+  State.mode = "expanded";
+  State.view = "airdropRequest";
+  State.airdropRequest = null;
+  const island = Object.create(Island.prototype);
+  island.fsm = new IslandStateMachine();
+  island.fsm.pinned = true;
+  island.animateGeometry = () => {};
+  island.wasInIsland = false;
+  State.pendingApproval = null;
+  try {
+    island.finishAirDropRequest();
+    assert.equal(island.fsm.pinned, false, "a finished consent must not keep the bar pinned open");
+    assert.notEqual(State.view, "airdropRequest", "the dead consent card must be left");
+  } finally {
+    State.mode = "hidden";
+    State.view = "overview";
+  }
 });

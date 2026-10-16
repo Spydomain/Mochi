@@ -24,6 +24,15 @@ Wi-Fi coexistence. The tested radio is **only** MT7922 (`14c3:0616`,
 `mt7921e`). Do not broaden the hardware gate or replace these revisions with
 unreviewed HEADs. Unknown local source edits are left intact and stop setup.
 
+`opendrop-verified-archive.patch` follows the existing incomplete-response
+patch. iOS 26 can declare the decoded cpio size in `TotalBytes` while sending
+a smaller compressed dvzip payload. Success now requires a parsed cpio trailer
+and intact extracted files, not equality between unlike byte counts. Missing
+trailers, broken gzip streams and partial members still fail closed. The
+`airdrop-mt7921-upgrade-v1.patch` migrates **only** the exact previous Mochi
+checkout to this patch series. Turn AirDrop off after any transfers finish
+before installing; the installer refuses to replace an active receiver.
+
 Rebuilding and consent tests are in `../../tests/airdrop-stack-test.sh` and
 `../tests/airdrop-confirm.test.mjs`. Installing does not start a receiver;
 an iPhone transfer is still needed to test the link and progress display.

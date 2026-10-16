@@ -330,6 +330,12 @@ install_files() {
   # hook, while the next /Ask gets a complete, executable progress-aware hook.
   install_executable "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE"
   cmp -s "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE" || die 'AirDrop consent hook did not install correctly.'
+  # Now that the hook exists, re-check that the receiver really uses it. A
+  # receiver pointed at any other hook refuses every transfer in silence.
+  if (( ! NO_AIRDROP )); then
+    bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" --verify ||
+      die 'The installed AirDrop receiver does not use Mochi'"'"'s consent hook.'
+  fi
   install -m 644 "$WINDOWS_DIR/src-tauri/icons/128x128.png" "$ICON_FILE"
   if [[ ! -e "$SETTINGS_FILE" ]]; then
     printf '{"chatProvider":"opencode","chatModels":{"opencode":"opencode/nemotron-3-ultra-free"},"language":"en","showCodexPlanInNotch":true,"showAirDropInNotch":true,"showBatteryInNotch":true,"showKeepAwakeInNotch":true}\n' > "$SETTINGS_FILE"

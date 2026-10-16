@@ -39,6 +39,25 @@ for item in 'airdrop-mt7921:airdrop-mt7921-local' 'owl:owl-local'; do
   git -C "$tmp/$name" diff --binary | cmp - "$patches/$delta.patch"
   git -C "$tmp/$name" apply --reverse --check "$patches/$delta.patch"
 done
+# An installed v1 tree upgrades only through the reviewed, exact patch delta.
+git -C "$tmp/airdrop-mt7921" apply --reverse "$patches/airdrop-mt7921-upgrade-v1.patch"
+[[ "$(git -C "$tmp/airdrop-mt7921" diff --binary | sha256sum | cut -d' ' -f1)" == bb5c8a5f308361d765ae32d1ee30624830372340ecc36794422e13f12cb0446a ]]
+git -C "$tmp/airdrop-mt7921" apply --check "$patches/airdrop-mt7921-upgrade-v1.patch"
+git -C "$tmp/airdrop-mt7921" apply "$patches/airdrop-mt7921-upgrade-v1.patch"
+git -C "$tmp/airdrop-mt7921" diff --binary | cmp - "$patches/airdrop-mt7921-local.patch"
+installed_opendrop="${XDG_DATA_HOME:-$HOME/.local/share}/mochi/owl/.venv-opendrop"
+opendrop_source="$(find "$installed_opendrop" -path '*/site-packages/opendrop/server.py' -print -quit 2>/dev/null || true)"
+if [[ -n "$opendrop_source" ]]; then
+  mkdir -p "$tmp/opendrop/opendrop"
+  cp "$opendrop_source" "$tmp/opendrop/opendrop/server.py"
+  # An already-installed receiver carries this patch. Applying it twice would
+  # reverse it, so accept whichever state the copy is actually in.
+  if ! patch --batch -d "$tmp/opendrop" -p1 --dry-run --reverse \
+      < "$patches/opendrop-verified-archive.patch" >/dev/null 2>&1; then
+    patch --batch -d "$tmp/opendrop" -p1 < "$patches/opendrop-verified-archive.patch" >/dev/null
+  fi
+  python3 "$repo/tests/opendrop-archive-test.py" "$tmp/opendrop/opendrop/server.py"
+fi
 if [[ -n "${MOCHI_TEST_HOSTAPD_TARBALL:-}" ]]; then
   printf '%s  %s\n' '2b3facb632fd4f65e32f4bf82a76b4b72c501f995a4f62e330219fe7aed1747a' \
     "$MOCHI_TEST_HOSTAPD_TARBALL" | sha256sum -c --status

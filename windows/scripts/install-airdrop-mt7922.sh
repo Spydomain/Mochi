@@ -47,7 +47,7 @@ if ((verify)); then
   [[ "$(git -C "$owl" rev-parse HEAD 2>/dev/null)" == "$owl_sha" ]] &&
     git -C "$owl" diff --binary | cmp -s - "$patches/owl-local.patch" ||
     die 'OWL does not match the tested patch set.'
-  for name in opendrop-incomplete-response owl-ios26-action-trailer owl-tx-backpressure; do
+  for name in opendrop-incomplete-response opendrop-verified-archive owl-ios26-action-trailer owl-tx-backpressure; do
     cmp -s "$patches/$name.patch" "$backend/patches/$name.patch" || die "AirDrop patch $name is missing or changed."
   done
   for installed in /usr/local/bin/airdrop-helper /usr/local/bin/airdrop-owl /usr/local/bin/airdrop-go-hostapd; do
@@ -60,6 +60,15 @@ if ((verify)); then
     die 'A root-owned radio component is missing or stale.'
   grep -q 'application/x-dvzip' "$owl/.venv-opendrop/lib"/python*/site-packages/opendrop/server.py ||
     die 'OpenDrop is missing iPhone upload support.'
+  # The receiver silently declines every transfer when its confirm hook cannot
+  # ask anyone. Prove the hook is what the receiver will use. Its freshness is
+  # the setup script's job: it installs the hook AFTER this backend step.
+  confirm_hook="$data/bin/mochi-airdrop-confirm"
+  config="${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config"
+  effective="$( { printf 'AIRDROP_CONFIRM=%s\n' "$confirm_hook"; cat "$config"; } 2>/dev/null |
+    sed -n 's/^[[:space:]]*AIRDROP_CONFIRM="\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | tail -1 )"
+  [[ "$effective" == "$confirm_hook" ]] ||
+    die "The AirDrop receiver would prompt with '$effective', not Mochi's island hook."
   exit 0
 fi
 [[ "$(id -u)" != 0 ]] || die 'Run as the desktop user, not root.'
@@ -98,6 +107,11 @@ prepare_repo() {
     die "Source revision changed in $path; review before updating it."
   if git -C "$path" apply --reverse --check "$delta" 2>/dev/null; then
     log "Tested patch already applied to $path"
+  elif [[ "$path" == "$backend" &&
+          "$(git -C "$path" diff --binary | sha256sum | cut -d' ' -f1)" == bb5c8a5f308361d765ae32d1ee30624830372340ecc36794422e13f12cb0446a ]] &&
+       git -C "$path" apply --check "$patches/airdrop-mt7921-upgrade-v1.patch"; then
+    # Only the exact previously shipped tree may be upgraded in place.
+    git -C "$path" apply "$patches/airdrop-mt7921-upgrade-v1.patch"
   elif git -C "$path" apply --check "$delta" 2>/dev/null; then
     [[ -z "$(git -C "$path" diff --binary)" ]] || die "Other local edits in $path; preserved."
     git -C "$path" apply "$delta"
@@ -111,7 +125,7 @@ prepare_repo() {
 mkdir -p "$data"
 prepare_repo "$backend" "$backend_url" "$backend_sha" "$patches/airdrop-mt7921-local.patch"
 prepare_repo "$owl" "$owl_url" "$owl_sha" "$patches/owl-local.patch"
-for name in opendrop-incomplete-response owl-ios26-action-trailer owl-tx-backpressure; do
+for name in opendrop-incomplete-response opendrop-verified-archive owl-ios26-action-trailer owl-tx-backpressure; do
   target="$backend/patches/$name.patch"
   if [[ -e "$target" ]]; then
     cmp -s "$patches/$name.patch" "$target" || die "Existing $target differs; preserved."
@@ -125,6 +139,18 @@ config="${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config"
 if [[ ! -e "$config" ]]; then
   install -d -m 700 "$(dirname "$config")"
   (umask 077; printf '%s\n' '# Mochi: keep the existing Wi-Fi station connected.' 'AIRDROP_MODE="${AIRDROP_MODE:-shared}"' > "$config")
+fi
+# airdrop sources this file and defaults CONFIRM to its own notification-based
+# hook. On a desktop with no matching notifier that hook declines in under a
+# second with nothing shown anywhere, so every transfer was silently refused
+# while Mochi's island prompt sat unused. Point the receiver at Mochi's hook.
+# An AIRDROP_CONFIRM the user set themselves is left alone.
+confirm_hook="$data/bin/mochi-airdrop-confirm"
+[[ -x "$confirm_hook" ]] || die "Mochi's AirDrop consent hook is missing: $confirm_hook"
+if ! grep -q '^[[:space:]]*AIRDROP_CONFIRM=' "$config" 2>/dev/null; then
+  ( umask 077; printf '\n# Mochi: prompt the island, not a notification daemon.\nAIRDROP_CONFIRM="%s"\n' \
+    "$confirm_hook" >> "$config" )
+  log 'Configured the island consent hook in the receiver config.'
 fi
 
 # Build the P2P-GO hostapd extension from a checksum-verified upstream source.

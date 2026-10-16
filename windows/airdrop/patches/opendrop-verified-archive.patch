@@ -1,0 +1,105 @@
+--- a/opendrop/server.py
++++ b/opendrop/server.py
+@@ -717,6 +717,7 @@
+             actually being present in the archive proves anything.
+             """
+             out, off, n = [], 0, len(cpio)
++            trailer = False
+             while off + 76 <= n:
+                 if cpio[off:off + 6] != b"070707":
+                     break
+@@ -739,6 +740,7 @@
+                 name = name.decode("utf-8", "replace")
+                 data_off = name_off + namesize
+                 if name == "TRAILER!!!":
++                    trailer = True
+                     break
+                 # The mode matters. An iOS archive starts with the WRAPPER
+                 # DIRECTORY, which has no data and is therefore always
+@@ -757,7 +759,7 @@
+                 arrived = min(filesize, max(0, n - data_off))
+                 out.append((name, data_off + filesize <= n, regular, arrived))
+                 off = data_off + filesize
+-            return out
++            return out, trailer
+ 
+         def verify_extracted(cpio_bytes):
+             """Separate what arrived whole from what did not.
+@@ -767,7 +769,8 @@
+             failure.
+             """
+             good, bad = [], []
+-            for name, complete, regular, arrived in odc_members(cpio_bytes):
++            members, trailer = odc_members(cpio_bytes)
++            for name, complete, regular, arrived in members:
+                 base = os.path.basename(name)
+                 if not base or base == "." or base.startswith("._"):
+                     continue
+@@ -812,15 +815,11 @@
+                         os.replace(path, path + ".partial")
+                     except OSError:
+                         pass
+-            return good, bad
++            return good, bad, trailer
+ 
+-        declared_total = self.headers.get("TotalBytes", "")
+-        expected_total = int(declared_total) if declared_total.isdecimal() else None
+-        body_complete = expected_total is None or reader.total >= expected_total
+-        if not body_complete:
+-            logger.warning(
+-                f"upload ended after {reader.total} of {expected_total} declared bytes"
+-            )
++        # TotalBytes describes the uncompressed archive on iOS 26, NOT the
++        # compressed dvzip wire length. Only an intact cpio trailer and complete
++        # extracted members can justify a success response.
+         complete = False
+         try:
+             if raw_path.endswith(".dvzip"):
+@@ -831,12 +830,14 @@
+                     # A truncated archive raises AFTER writing the complete
+                     # members, so nothing already on disk is lost.
+                     logger.warning(f"archive ended early ({e}) - checking what landed")
+-                good, bad = verify_extracted(cpio_bytes)
++                good, bad, trailer = verify_extracted(cpio_bytes)
+                 if bad:
+                     logger.warning(f"incomplete, kept as .partial: {', '.join(bad)}")
+                 if not good:
+                     raise ValueError("no complete file in the transfer")
+-                complete = not bad and body_complete
++                complete = not bad and trailer
++                if not trailer:
++                    logger.warning("upload archive has no verified trailer")
+                 logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+                 if complete:
+                     os.remove(raw_path)
+@@ -872,7 +873,7 @@
+                 with open(raw_path, "rb") as fh:
+                     size = os.fstat(fh.fileno()).st_size
+                     if not size:
+-                        good, bad = [], []
++                        good, bad, trailer = [], [], False
+                     elif fh.read(2) == b"\x1f\x8b":
+                         # Not GzipFile.read(): on a cut-off transfer the gzip
+                         # stream is truncated too, and read() raises EOFError.
+@@ -884,15 +885,18 @@
+                         # incomplete members.
+                         fh.seek(0)
+                         gz = zlib.decompressobj(16 + zlib.MAX_WBITS)
+-                        good, bad = verify_extracted(gz.decompress(fh.read()))
++                        good, bad, trailer = verify_extracted(gz.decompress(fh.read()))
++                        trailer = trailer and gz.eof
+                     else:
+                         with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as cpio_bytes:
+-                            good, bad = verify_extracted(cpio_bytes)
++                            good, bad, trailer = verify_extracted(cpio_bytes)
+                 if bad:
+                     logger.warning(f"incomplete, kept as .partial: {', '.join(bad)}")
+                 if not good:
+                     raise ValueError("no complete file in the transfer")
+-                complete = not bad and body_complete
++                complete = not bad and trailer
++                if not trailer:
++                    logger.warning("upload archive has no verified trailer")
+                 logger.info(f"Extracted into {os.getcwd()}: {', '.join(good)}")
+                 if complete:
+                     os.remove(raw_path)

@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index a82fb42..b4d6ff0 100644
+index a82fb42..c05317e 100644
 --- a/README.md
 +++ b/README.md
 @@ -25,7 +25,8 @@ cd airdrop-mt7921
@@ -17,7 +17,7 @@ index a82fb42..b4d6ff0 100644
              upload-arms ask-confirm mdns-reannounce threaded-server url-items \
              zeroconf-update-service salvage-truncated salvage-trim \
 -            send-multifile send-status send-stall; do
-+            send-multifile send-status send-stall incomplete-response; do
++            send-multifile send-status send-stall incomplete-response verified-archive; do
       GIT_DIR=/nonexistent git apply /path/to/airdrop-mt7921/patches/opendrop-$p.patch || break
     done
     ```
@@ -177,7 +177,7 @@ index 0fa5176..c790ffb 100755
  
    # ble-watch is only needed by the BLE-triggered path; always-on never runs
 diff --git a/install.sh b/install.sh
-index 787962f..0426fc3 100755
+index 787962f..a6d0781 100755
 --- a/install.sh
 +++ b/install.sh
 @@ -26,7 +26,7 @@ YES=0
@@ -185,7 +185,7 @@ index 787962f..0426fc3 100755
           upload-arms ask-confirm mdns-reannounce threaded-server url-items
           zeroconf-update-service salvage-truncated salvage-trim
 -         send-multifile send-status send-stall)
-+         send-multifile send-status send-stall incomplete-response)
++         send-multifile send-status send-stall incomplete-response verified-archive)
  OPENDROP_VERSION=0.13.0
  
  step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -222,7 +222,7 @@ index 787962f..0426fc3 100755
    fi
  }
 diff --git a/patches/README.md b/patches/README.md
-index 1fbf64d..1dffdea 100644
+index 1fbf64d..249208a 100644
 --- a/patches/README.md
 +++ b/patches/README.md
 @@ -1,5 +1,26 @@
@@ -257,11 +257,11 @@ index 1fbf64d..1dffdea 100644
  upload-arms ask-confirm mdns-reannounce threaded-server url-items
  zeroconf-update-service salvage-truncated salvage-trim send-multifile
 -send-status send-stall
-+send-status send-stall incomplete-response
++send-status send-stall incomplete-response verified-archive
  ```
  
  The install loop in the [main README](../README.md) uses exactly that order.
-@@ -502,3 +523,11 @@ without tripping it.
+@@ -502,3 +523,22 @@ without tripping it.
  Only the raw-framed path is covered, since it is the one the default arm uses.
  The response read after a complete upload stays unbounded: if the phone dies
  after receiving every byte, that wait is still TCP's to end.
@@ -273,3 +273,14 @@ index 1fbf64d..1dffdea 100644
 +`TotalBytes`, retain the raw archive if any file or byte is missing, and return
 +HTTP 500 with an explicit incomplete log entry. This reports failure honestly;
 +it does not repair an AWDL link that stops delivering data.
++
++
++## opendrop-verified-archive.patch
++
++On iOS 26 `TotalBytes` can describe the uncompressed archive, while the
++`dvzip` bytes on the wire are smaller. Treat a transfer as complete only
++when the decoded cpio has its parsed `TRAILER!!!` and all extracted file
++members arrived whole. For gzip uploads, also require the gzip end marker.
++A missing trailer or incomplete member retains the raw archive and returns
++HTTP 500. A complete compressed archive returns HTTP 200 even when its wire
++size differs from `TotalBytes`.

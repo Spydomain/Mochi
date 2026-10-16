@@ -42,42 +42,58 @@ async function main() {
     if (State.os !== "linux") return;
     void refreshAirDrop();
   }, 8_000);
-  let checkingAirDrop = false;
+  let checkingIncoming = false;
+  let checkingTransfer = false;
   let completedAt = 0;
   let lastTransferCheck = 0;
   window.setInterval(() => {
-    if (State.os !== "linux" || checkingAirDrop ||
-        (!State.airdropStatus?.receiving && !State.airdropRequest)) return;
-    checkingAirDrop = true;
+    // The receiver's /Ask clock is short. Do not wait for the slower radio
+    // status poll (or a busy agent card) before checking private consent.
+    if (State.os !== "linux" || checkingIncoming) return;
+    checkingIncoming = true;
     void (async () => {
       try {
         const pending = await Bridge.airdropIncoming();
         if (!pending) State.airdropAnsweredId = null;
         const request = pending?.id === State.airdropAnsweredId ? null : pending;
-        if (State.airdropAnsweredId && !State.airdropRequest && State.view === "airdropRequest") {
-          island.setView("overview");
-          if (State.airdropTransfer) island.collapse();
-        }
-        if (request?.id !== State.airdropRequest?.id) {
-          const hadRequest = !!State.airdropRequest;
-          State.airdropRequest = request;
-          if (request && !State.pendingApproval && !State.paused) {
+        if (request) {
+          if (request.id !== State.airdropRequest?.id) {
+            State.airdropRequest = request;
             State.airdropError = "";
             island.alert("airdropRequest");
-          } else if (hadRequest && State.view === "airdropRequest") {
-            island.setView("overview");
-            if (State.airdropTransfer) island.collapse();
+            State.notify();
+          }
+        } else if (State.airdropRequest || State.view === "airdropRequest") {
+          // Answered, declined or expired: the request file is gone, so release
+          // the pinned consent card. This must not depend on a *change* in
+          // request id - decide() already cleared State.airdropRequest, which
+          // left the island pinned open on a dead card forever.
+          State.airdropRequest = null;
+          if (State.view === "airdropRequest") {
+            island.finishAirDropRequest();
+            if (State.airdropTransfer && !State.pendingApproval) island.collapse();
           }
           State.notify();
         }
-        if (!State.airdropStatus?.receiving) {
-          if (State.airdropTransfer || State.airdropProgress) {
-            State.airdropTransfer = null;
-            State.airdropProgress = null;
-            State.notify();
-          }
-          return;
-        }
+      } catch (err) {
+        console.error("[mochi] AirDrop consent check failed", err);
+      } finally { checkingIncoming = false; }
+    })();
+  }, 200);
+  window.setInterval(() => {
+    if (State.os !== "linux" || checkingTransfer) return;
+    if (!State.airdropStatus?.receiving) {
+      if (State.airdropTransfer || State.airdropProgress) {
+        State.airdropTransfer = null;
+        State.airdropProgress = null;
+        State.notify();
+      }
+      return;
+    }
+    // Archive reads may be slow. They must never delay the consent poll.
+    checkingTransfer = true;
+    void (async () => {
+      try {
         const now = Date.now();
         if (now - lastTransferCheck < (State.airdropTransfer === "receiving" ? 500 : 1_000)) return;
         lastTransferCheck = now;
@@ -100,8 +116,8 @@ async function main() {
         if (State.airdropTransfer !== previous || State.airdropProgress?.receivedBytes !== previousReceived ||
             State.airdropProgress?.totalBytes !== previousTotal) State.notify();
       } catch (err) {
-        console.error("[mochi] AirDrop consent check failed", err);
-      } finally { checkingAirDrop = false; }
+        console.error("[mochi] AirDrop transfer check failed", err);
+      } finally { checkingTransfer = false; }
     })();
   }, 350);
   // A language change redraws the island in place: the texts given as tl(…)

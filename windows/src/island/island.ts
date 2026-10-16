@@ -446,6 +446,7 @@ export class Island {
   }
 
   expand(view: IslandViewName) {
+    if (State.airdropRequest) view = "airdropRequest";
     this.stopSequenceIfLeaving(view);
     if (view !== "overview") closePlanCard();
     State.view = view;
@@ -456,6 +457,7 @@ export class Island {
   }
 
   setView(view: IslandViewName) {
+    if (State.airdropRequest) view = "airdropRequest";
     this.stopSequenceIfLeaving(view);
     if (view !== "overview") closePlanCard();
     if (State.mode !== "expanded") {
@@ -473,6 +475,7 @@ export class Island {
   }
 
   collapse() {
+    if (State.airdropRequest) return;
     // A waiting card is only ever folded, never dropped by a close.
     if (State.pendingApproval) {
       this.foldApproval();
@@ -488,9 +491,30 @@ export class Island {
 
   /** Alert from the hook server: open on this view. Pinned alerts never auto-close. */
   alert(view: IslandViewName) {
-    this.fsm.pinned = State.isPinned;
+    if (State.airdropRequest) {
+      view = "airdropRequest";
+      if (this.noticeTimer != null) window.clearTimeout(this.noticeTimer);
+      this.noticeTimer = null;
+      this.noticeActive = false;
+      this.notice.classList.remove("show");
+      this.root.classList.remove("notice-active");
+      if (this.powerActive) this.stopChargingPop();
+    }
+    this.fsm.pinned = !!State.airdropRequest || State.isPinned;
     this.fsm.forceHome();
     this.expand(view);
+  }
+
+  /** Release the temporary consent pin and restore any interrupted agent card. */
+  finishAirDropRequest() {
+    // Drop the consent pin first. A waiting agent card re-pins itself below; if
+    // nothing is waiting the island must be free to fold again, or it stays
+    // open over a dead card until the app restarts.
+    this.fsm.pinned = false;
+    const approval = State.pendingApproval;
+    if (approval) this.fsm.pinned = true;
+    this.setView(approval ? (approval.questions ? "question" : "approval") : State.defaultView());
+    if (!this.wasInIsland) this.fsm.mouseLeft();
   }
 
   reveal() {
@@ -506,7 +530,7 @@ export class Island {
 
   /** A short message inside the opened capsule, with Mochi still visible. */
   showNotice(message: string, durationMs = 5500) {
-    if (State.paused || State.pendingApproval) return;
+    if (State.paused || State.pendingApproval || State.airdropRequest) return;
     this.fsm.forceHome();
     this.noticeActive = true;
     this.root.classList.add("notice-active");
@@ -1352,7 +1376,7 @@ export class Island {
 
   /** A brief Mochi performance inside the opened bar, in either power direction. */
   private startPowerAnimation(pluggedIn: boolean, level: number, lowBattery = false) {
-    if (State.paused || State.pendingApproval) return;
+    if (State.paused || State.pendingApproval || State.airdropRequest) return;
     // forceHome cancels a pending collapse, so even a short auto-close setting
     // cannot fold the bar halfway through the power reaction.
     this.fsm.forceHome();

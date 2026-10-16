@@ -1,0 +1,48 @@
+--- a/README.md
++++ b/README.md
+@@ -56,7 +56,7 @@
+    for p in ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog \
+             upload-arms ask-confirm mdns-reannounce threaded-server url-items \
+             zeroconf-update-service salvage-truncated salvage-trim \
+-            send-multifile send-status send-stall incomplete-response; do
++            send-multifile send-status send-stall incomplete-response verified-archive; do
+      GIT_DIR=/nonexistent git apply /path/to/airdrop-mt7921/patches/opendrop-$p.patch || break
+    done
+    ```
+--- a/install.sh
++++ b/install.sh
+@@ -26,7 +26,7 @@
+ PATCHES=(ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog
+          upload-arms ask-confirm mdns-reannounce threaded-server url-items
+          zeroconf-update-service salvage-truncated salvage-trim
+-         send-multifile send-status send-stall incomplete-response)
++         send-multifile send-status send-stall incomplete-response verified-archive)
+ OPENDROP_VERSION=0.13.0
+ 
+ step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+--- a/patches/README.md
++++ b/patches/README.md
+@@ -40,7 +40,7 @@
+ ios26-airdrop recv-window py314-send mdns-repeat find-report tls-keylog
+ upload-arms ask-confirm mdns-reannounce threaded-server url-items
+ zeroconf-update-service salvage-truncated salvage-trim send-multifile
+-send-status send-stall incomplete-response
++send-status send-stall incomplete-response verified-archive
+ ```
+ 
+ The install loop in the [main README](../README.md) uses exactly that order.
+@@ -531,3 +531,14 @@
+ `TotalBytes`, retain the raw archive if any file or byte is missing, and return
+ HTTP 500 with an explicit incomplete log entry. This reports failure honestly;
+ it does not repair an AWDL link that stops delivering data.
++
++
++## opendrop-verified-archive.patch
++
++On iOS 26 `TotalBytes` can describe the uncompressed archive, while the
++`dvzip` bytes on the wire are smaller. Treat a transfer as complete only
++when the decoded cpio has its parsed `TRAILER!!!` and all extracted file
++members arrived whole. For gzip uploads, also require the gzip end marker.
++A missing trailer or incomplete member retains the raw archive and returns
++HTTP 500. A complete compressed archive returns HTTP 200 even when its wire
++size differs from `TotalBytes`.
