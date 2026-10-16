@@ -1,0 +1,289 @@
+--- a/server.py
++++ b/server.py
+@@ -45,6 +45,19 @@
+ URL_SCHEMES = ("http://", "https://")
+ 
+ 
++def safe_url(url):
++    """Never hand an arbitrary desktop scheme or control characters to an opener."""
++    from urllib.parse import urlsplit
++    if (not isinstance(url, str) or len(url) > 8192
++            or any(ord(char) <= 32 or ord(char) == 127 for char in url)):
++        return False
++    try:
++        parts = urlsplit(url)
++        return parts.scheme.lower() in ("http", "https") and bool(parts.hostname)
++    except ValueError:
++        return False
++
++
+ def ask_items(req):
+     """URLs from an /Ask body. Empty for a normal file transfer."""
+     items = req.get("Items") or []
+@@ -57,7 +70,7 @@
+             item = item.decode("utf-8", "replace")
+         elif isinstance(item, dict):
+             item = item.get("URL") or item.get("url") or ""
+-        if isinstance(item, str) and item.lower().startswith(URL_SCHEMES):
++        if safe_url(item):
+             out.append(item)
+     return out
+ 
+@@ -70,6 +83,9 @@
+     succeeded, and blocking it on a browser start would stall the transfer and
+     time the sender out.
+     """
++    if not safe_url(url):
++        logger.warning("refusing unsafe AirDrop URL")
++        return
+     import shutil
+     import subprocess
+ 
+@@ -202,6 +218,8 @@
+         # A genuine bind conflict must be reported, not silently move the
+         # receiver to a different port that the island reports as offline.
+         httpd = self.ServerClass(self.serveraddress, self.Handler)
++        from .mochi_receive import UploadPermissions
++        httpd.mochi_upload_permissions = UploadPermissions()
+ 
+         # Adapt socket for awdl0
+         if self.config.interface == "awdl0" and platform.system() == "Darwin":
+@@ -298,28 +316,44 @@
+         self.wfile.write(body)
+ 
+     def _read_request_body(self):
+-        """
+-        Read a request body sent either with Content-Length or chunked.
++        from .mochi_receive import read_control_body, RequestBodyTooLarge
++        try:
++            # Duplicate framing headers are ambiguous even when get() selects
++            # a harmless first value. The actual headers are an HTTPMessage.
++            for name in ("Content-Length", "Transfer-Encoding"):
++                if len(self.headers.get_all(name, [])) > 1:
++                    raise ValueError("duplicate request framing header")
++            return read_control_body(self.rfile, self.headers)
++        except RequestBodyTooLarge:
++            self._reject_request(413)
++        except (socket.timeout, TimeoutError):
++            self._reject_request(408)
++        except ValueError:
++            self._reject_request(400)
++        return None
+ 
+-        iOS 26 sends Discover and Ask with `Transfer-Encoding: chunked` and no
+-        Content-Length, which made `int(self.headers["Content-Length"])` raise
+-        TypeError on None and kill the connection before any reply was written.
+-        handle_upload already coped with chunked; these two paths did not.
+-        """
+-        if self.headers.get("transfer-encoding", "").lower() == "chunked":
+-            body = b""
+-            while True:
+-                length = int(self.rfile.readline().rstrip() or b"0", 16)
+-                if length == 0:
+-                    self.rfile.readline()  # trailing CRLF of the final chunk
+-                    break
+-                body += self.rfile.read(length)
+-                self.rfile.readline()  # CRLF after each chunk
+-            return body
+-        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
++    def _reject_request(self, status):
++        self.close_connection = True
++        try:
++            self.send_response(status)
++            self.send_header("Content-Length", "0")
++            self.send_header("Connection", "close")
++            self.end_headers()
++        except OSError:
++            pass
++
++    def handle_expect_100(self):
++        # BaseHTTPRequestHandler otherwise acknowledges an Upload before its
++        # consent gate runs. Upload sends Continue only after authorization;
++        # control requests retain the normal HTTP Expect handshake.
++        if self.path == "/Upload":
++            return True
++        return super().handle_expect_100()
+ 
+     def handle_discover(self):
+         post_data = self._read_request_body()
++        if post_data is None:
++            return
+ 
+         AirDropUtil.write_debug(
+             self.config, post_data, "receive_discover_request.plist"
+@@ -394,7 +428,8 @@
+     def _ask_user(self, post_data):
+         hook = os.environ.get("AIRDROP_CONFIRM")
+         if not hook:
+-            return True
++            logger.warning("no confirmation hook configured - DECLINING")
++            return False
+         sender = "unknown sender"
+         detail = ""
+         try:
+@@ -431,60 +466,61 @@
+         return True
+ 
+     def handle_ask(self):
++        permissions = self.server.mochi_upload_permissions
++        ticket = permissions.begin(self.client_address)
++        if ticket is None:
++            self._reject_request(503)
++            return
++        keep_permission = False
+         try:
+             post_data = self._read_request_body()
+-        except (socket.timeout, TimeoutError):
+-            # Without this the exception escapes into the request thread: the
+-            # phone gets nothing and the user never sees the prompt at all.
+-            #
+-            # And returning is not enough: with no status and no close, a
+-            # keep-alive connection is left open, the handler stays busy
+-            # waiting for a following request until another timeout, and the
+-            # phone never learns it was refused. So terminate explicitly.
+-            logger.warning("sender went quiet during /Ask - no prompt shown")
++            if post_data is None:
++                return
+             try:
+-                self.send_response(408)
+-                self.send_header("Content-Length", "0")
+-                self.send_header("Connection", "close")
+-                self.end_headers()
++                request = plistlib.loads(post_data)
++                if not isinstance(request, dict):
++                    raise ValueError("Ask must be a dictionary")
++                files = request.get("Files") or []
++                if not isinstance(files, list) or any(not isinstance(item, dict) for item in files):
++                    raise ValueError("invalid Ask files")
++                urls = ask_items(request)
++                if not files and not urls:
++                    raise ValueError("Ask contains no items")
++            except Exception:  # plistlib XML and binary decoders use different exception types
++                self._reject_request(400)
++                return
++
++            AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
++            if not self._ask_user(post_data):
++                self._reject_request(403)
++                return
++
++            ask_response = {
++                "ReceiverModelName": self.config.computer_model,
++                "ReceiverComputerName": self.config.computer_name,
++            }
++            ask_resp_binary = plistlib.dumps(ask_response, fmt=plistlib.FMT_BINARY)
++            AirDropUtil.write_debug(self.config, ask_resp_binary, "receive_ask_response.plist")
++            # Only file transfers receive an upload grant. Link consent must
++            # never authorize a later file upload. Publish before replying so
++            # the next TCP connection can consume it immediately.
++            if files and not permissions.accept(self.client_address, ticket):
++                self._reject_request(403)
++                return
++            try:
++                self._set_response(len(ask_resp_binary))
++                self.wfile.write(ask_resp_binary)
+             except OSError:
+-                pass
+-            self.close_connection = True
+-            return
+-
+-        AirDropUtil.write_debug(self.config, post_data, "receive_ask_request.plist")
+-
+-        if not self._ask_user(post_data):
+-            self.send_response(403)
+-            self.send_header("Content-Length", 0)
+-            self.end_headers()
+-            return
+-
+-        # A shared link never reaches /Upload - iOS puts it in the /Ask body's
+-        # "Items" and considers the transfer done the moment we answer 200. So
+-        # this is the only place a URL can be delivered from, and doing it
+-        # after the consent check means a declined share opens nothing.
+-        try:
+-            urls = ask_items(plistlib.loads(post_data))
+-        except Exception:
+-            urls = []
+-        for url in urls:
+-            open_url(url)
+-
+-        ask_response = {
+-            "ReceiverModelName": self.config.computer_model,
+-            "ReceiverComputerName": self.config.computer_name,
+-        }
+-        ask_resp_binary = plistlib.dumps(
+-            ask_response, fmt=plistlib.FMT_BINARY  # pylint: disable=no-member
+-        )
+-
+-        AirDropUtil.write_debug(
+-            self.config, ask_resp_binary, "receive_ask_response.plist"
+-        )
+-
+-        self._set_response(len(ask_resp_binary))
+-        self.wfile.write(ask_resp_binary)
++                permissions.cancel(self.client_address, ticket)
++                raise
++            keep_permission = bool(files)
++            for url in urls:
++                open_url(url)
++        finally:
++            # Accepted grants remain until consumed or expired. All other
++            # exits revoke this ticket, without revoking a newer Ask's ticket.
++            if not keep_permission:
++                permissions.cancel(self.client_address, ticket)
+ 
+     # iOS 26 sends photos as application/x-dvzip, not the application/x-cpio
+     # OpenDrop 0.13.0 hardcodes. Everything else about the transfer is identical,
+@@ -496,6 +532,13 @@
+     def handle_upload(self):
+         from .mochi_receive import HTTPChunkedReader, ReceiveWorkspace
+ 
++        # Consume atomically before opening a workspace, reading the body, or
++        # sending 100 Continue. A denied, missing, expired or replayed Ask is
++        # never permission to write, even if the archive would be valid.
++        if not self.server.mochi_upload_permissions.consume(self.client_address):
++            self._reject_request(403)
++            return
++
+         content_type = self.headers.get("content-type", "").lower()
+         if content_type not in self.UPLOAD_CONTENT_TYPES:
+             self.send_response(406)
+@@ -629,33 +672,15 @@
+                 if not os.path.isfile(path) or os.path.islink(path):
+                     bad.append(name)
+                     continue
+-                if complete and os.path.getsize(path) == arrived:
++                if complete and os.path.getsize(path) == arrived and storage.verified_file(name):
+                     good.append(name)
+                 else:
+                     bad.append(base)
+-                    # TRIM THE PADDING. Keeping it made the .partial claim
+-                    # technically true and practically useless: the reader
+-                    # cannot tell 512 KB of photo from 1.2 MB of nulls behind
+-                    # it, and every tool that opens the file walks into the
+-                    # padding. `arrived` comes from the archive, so this cuts at
+-                    # the real end rather than stripping trailing zeros a file
+-                    # may legitimately have.
+-                    try:
+-                        if arrived < os.path.getsize(path):
+-                            os.truncate(path, arrived)
+-                    except OSError:
+-                        pass
+-                    # A SEPARATE try, because the rename IS the guarantee. Shared
+-                    # with the truncate, a failure there - read-only mount,
+-                    # ENOSPC on the metadata update, a file already unlinked -
+-                    # skipped the rename and left an incomplete file under its
+-                    # real name, looking whole to everything downstream. Worst
+-                    # case now is a padded .partial, which is where this started,
+-                    # rather than a truncated one nothing marks as short.
+-                    try:
+-                        os.replace(path, path + ".partial")
+-                    except OSError:
+-                        pass
++                    # Extraction writes only bytes that arrived. Quarantine
++                    # outside `files`: an archive may itself contain a whole
++                    # member named video.mov.partial, so suffixing in place
++                    # could replace a verified member with unfinished bytes.
++                    storage.quarantine_partial(name)
+             return good, bad, trailer
+ 
+         complete = False

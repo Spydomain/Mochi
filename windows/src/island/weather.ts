@@ -15,8 +15,12 @@ const LOCATION_RETRY = 60 * 60_000;
 // Keep these retries bounded so a machine with only a coarse fix stays quiet.
 const STARTUP_RETRY_DELAYS = [2 * 60_000, 10 * 60_000];
 
+// Shared with the Clock card; an attempt timestamp does not mean it has failed.
+export const weatherForecastStatus = { loading: false };
+
 export class WeatherBackdrop {
   private report: WeatherReport | null = null;
+  private reportKey = "";
   private fetchedAt = 0;
   private attemptedAt = 0;
   private key = "";
@@ -51,13 +55,19 @@ export class WeatherBackdrop {
       this.nextStartupAttemptAt = 0;
     }
     this.previousLocateMe = State.settings.weatherLocateMe;
+    const location = State.settings.weatherLocation;
+    const keepReport = State.settings.weatherEnabled && location
+      && this.reportKey === `${location.latitude},${location.longitude}`;
     this.generation++;
-    this.fetchedAt = 0;
     this.attemptedAt = 0;
     this.key = "";
-    this.report = null;
-    State.weatherReport = null;
-    State.weatherFetchedAt = 0;
+    if (!keepReport) {
+      this.fetchedAt = 0;
+      this.report = null;
+      this.reportKey = "";
+      State.weatherReport = null;
+      State.weatherFetchedAt = 0;
+    }
     State.weatherAttemptedAt = 0;
     this.sync();
     State.notify();
@@ -133,19 +143,31 @@ export class WeatherBackdrop {
     this.attemptedAt = Date.now();
     State.weatherAttemptedAt = this.attemptedAt;
     const generation = this.generation;
+    weatherForecastStatus.loading = true;
+    State.notify();
     try {
       const report = await Bridge.weatherForecast();
-      if (generation !== this.generation || !State.settings.weatherEnabled) return;
+      const currentLocation = State.settings.weatherLocation;
+      if (generation !== this.generation || !State.settings.weatherEnabled
+        || !currentLocation || key !== `${currentLocation.latitude},${currentLocation.longitude}`) return;
       if (report) {
         this.report = report;
+        this.reportKey = key;
         this.fetchedAt = Date.now();
         State.weatherReport = report;
         State.weatherFetchedAt = this.fetchedAt;
         this.sync();
       }
-      State.notify();
+    } catch (err) {
+      if (generation === this.generation) console.warn("[mochi] Weather forecast unavailable", err);
     } finally {
       this.pending = false;
+      weatherForecastStatus.loading = false;
+      // settingsChanged invalidates this request, but its replacement could
+      // not start while pending. Drain the latest settings without a timer tick.
+      if (generation !== this.generation) void this.refresh();
+      this.sync();
+      State.notify();
     }
   }
 }

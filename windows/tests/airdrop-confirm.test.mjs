@@ -1,12 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { setTimeout as delay } from "node:timers/promises";
 
 const script = resolve("scripts/mochi-airdrop-confirm.sh");
+
+function answer(runtime, value, id = JSON.parse(readFileSync(join(runtime, "mochi-airdrop/active/request.json"), "utf8")).id) {
+  const file = join(runtime, `mochi-airdrop/active/decision-${id}`);
+  writeFileSync(`${file}.tmp`, `${id} ${value}`, { mode: 0o600 });
+  renameSync(`${file}.tmp`, file);
+}
 
 async function attempt(answer) {
   const runtime = mkdtempSync(join(tmpdir(), "mochi-airdrop-"));
@@ -21,7 +27,11 @@ async function attempt(answer) {
     const data = JSON.parse(readFileSync(request, "utf8"));
     assert.equal(data.sender, "A nearby iPhone");
     assert.equal(data.detail, "Photo.JPG");
-    if (answer !== null) writeFileSync(join(runtime, "mochi-airdrop/active/decision"), answer, { mode: 0o600 });
+    if (answer !== null) {
+      const file = join(runtime, `mochi-airdrop/active/decision-${data.id}`);
+      writeFileSync(`${file}.tmp`, `${data.id} ${answer}`, { mode: 0o600 });
+      renameSync(`${file}.tmp`, file);
+    }
     const result = await new Promise(resolve => child.once("exit", resolve));
     if (answer === "accept") {
       const transfer = JSON.parse(readFileSync(join(runtime, "mochi-airdrop/transfer.json"), "utf8"));
@@ -54,7 +64,7 @@ test("a stale transfer marker from an earlier request never leaks into a decline
     });
     const request = join(base, "active/request.json");
     for (let i = 0; i < 50 && !existsSync(request); i++) await delay(20);
-    writeFileSync(join(base, "active/decision"), "decline", { mode: 0o600 });
+    answer(runtime, "decline");
     assert.equal(await new Promise(resolve => child.once("exit", resolve)), 1);
     // A decline writes no marker, and the previous run's must be gone, so the
     // island cannot keep reporting an older completed or failed transfer.
@@ -115,7 +125,7 @@ test("a leftover active directory from a killed hook does not decline every tran
     const request = join(stale, "request.json");
     for (let i = 0; i < 50 && !existsSync(request); i++) await delay(20);
     assert.ok(existsSync(request), "a stale active dir must not block the new prompt");
-    writeFileSync(join(stale, "decision"), "accept", { mode: 0o600 });
+    answer(runtime, "accept");
     result = await new Promise(resolve => child.once("exit", resolve));
   } finally { rmSync(runtime, { recursive: true, force: true }); }
   assert.equal(result, 0);
@@ -134,11 +144,62 @@ test("overlapping requests cannot replace the visible request or inherit its ans
     const second = spawn("bash", [script, "Second sender", "second"], { env });
     assert.equal(await new Promise(resolve => second.once("exit", resolve)), 1);
     assert.equal(JSON.parse(readFileSync(request, "utf8")).id, id);
-    writeFileSync(join(runtime, "mochi-airdrop/active/decision"), "accept", { mode: 0o600 });
+    answer(runtime, "accept");
     assert.equal(await new Promise(resolve => first.once("exit", resolve)), 0);
     assert.match(readFileSync(join(runtime, "mochi-airdrop/hook.log"), "utf8"), /another request is awaiting consent/);
   } finally {
     if (first.exitCode === null) first.kill();
+    rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
+test("an expired request's late answer cannot decide its successor", async () => {
+  const runtime = mkdtempSync(join(tmpdir(), "mochi-airdrop-"));
+  chmodSync(runtime, 0o700);
+  const env = { ...process.env, XDG_RUNTIME_DIR: runtime, AIRDROP_CONFIRM_TIMEOUT: "1" };
+  const request = join(runtime, "mochi-airdrop/active/request.json");
+  try {
+    const first = spawn("bash", [script, "First", "one"], { env });
+    const firstExit = new Promise(resolve => first.once("exit", resolve));
+    for (let i = 0; i < 50 && !existsSync(request); i++) await delay(20);
+    const oldId = JSON.parse(readFileSync(request, "utf8")).id;
+    assert.equal(await firstExit, 1);
+    const second = spawn("bash", [script, "Second", "two"], { env });
+    const secondExit = new Promise(resolve => second.once("exit", resolve));
+    for (let i = 0; i < 50 && !existsSync(request); i++) await delay(20);
+    assert.notEqual(JSON.parse(readFileSync(request, "utf8")).id, oldId);
+    // Simulate a writer suspended AFTER validating A, resuming after B starts.
+    answer(runtime, "accept", oldId);
+    assert.equal(await secondExit, 1);
+    assert.equal(existsSync(join(runtime, "mochi-airdrop/transfer.json")), false);
+  } finally { rmSync(runtime, { recursive: true, force: true }); }
+});
+
+test("an unfinished answer is not an implicit decline, and Unicode prompts fit the native limit", async () => {
+  const runtime = mkdtempSync(join(tmpdir(), "mochi-airdrop-"));
+  chmodSync(runtime, 0o700);
+  const request = join(runtime, "mochi-airdrop/active/request.json");
+  const sender = "😀".repeat(80);
+  const detail = "🌙".repeat(140);
+  const child = spawn("bash", [script, sender, detail], {
+    env: { ...process.env, XDG_RUNTIME_DIR: runtime, AIRDROP_CONFIRM_TIMEOUT: "2" },
+  });
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  try {
+    for (let i = 0; i < 50 && !existsSync(request); i++) await delay(20);
+    const data = JSON.parse(readFileSync(request, "utf8"));
+    assert.equal(data.sender, sender);
+    assert.equal(data.detail, detail);
+    assert.ok(statSync(request).size <= 2048, "native reader must be able to display the entire prompt");
+    const file = join(runtime, `mochi-airdrop/active/decision-${data.id}`);
+    writeFileSync(`${file}.tmp`, "", { mode: 0o600 });
+    await delay(200);
+    assert.equal(child.exitCode, null, "an unpublished answer cannot decline the request");
+    writeFileSync(`${file}.tmp`, `${data.id} accept`, { mode: 0o600 });
+    renameSync(`${file}.tmp`, file);
+    assert.equal(await exited, 0);
+  } finally {
+    if (child.exitCode === null) child.kill();
     rmSync(runtime, { recursive: true, force: true });
   }
 });

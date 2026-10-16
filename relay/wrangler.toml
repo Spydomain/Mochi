@@ -4,6 +4,10 @@ name = "mochi-relay"
 main = "src/index.ts"
 compatibility_date = "2026-09-01"
 workers_dev = true
+send_metrics = false
+
+[dependencies_instrumentation]
+enabled = false
 
 [vars]
 APNS_TEAM_ID = "256AUJ9555"

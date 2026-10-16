@@ -4,8 +4,11 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/Spydomain/Mochi.git"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if [[ -f "$SCRIPT_DIR/windows/package-lock.json" ]]; then
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+fi
+if [[ -n "$SCRIPT_DIR" && -f "$SCRIPT_DIR/windows/package-lock.json" ]]; then
   MOCHI_DIR="$SCRIPT_DIR"
 else
   MOCHI_DIR="${MOCHI_DIR:-$HOME/mochi}"
@@ -274,10 +277,32 @@ install_airdrop() {
     log 'MT7922 backend skipped (--no-airdrop).'
     return
   fi
-  bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" ||
-    die 'The tested AirDrop receiver could not be installed; no app revision was marked complete.'
-  bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" --verify ||
-    die 'The installed AirDrop receiver failed verification.'
+  if ! has_mt7922; then
+    log 'No supported MT7922 detected; experimental AirDrop backend skipped.'
+    return
+  fi
+  # An up-to-date receiver belongs to its own user service and may be serving
+  # a large upload. A normal app update must neither reinstall its root-owned
+  # radio components nor require the user to turn it off.
+  if bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" --verify >/dev/null 2>&1; then
+    log 'AirDrop receiver already current; left its running session untouched.'
+    return
+  fi
+  # On first install the backend checks for this hook before the rest of the
+  # app is installed. Never touch it when an active receiver needs a backend
+  # upgrade: stop there so a failed update leaves the old session intact.
+  # Keep the lock in a subshell: nested installers inherit it, but the later
+  # app/OpenCode launch must never retain a descriptor owning the radio lock.
+  (
+    source "$WINDOWS_DIR/scripts/airdrop-install-common.sh"
+    airdrop_install_lock && airdrop_require_idle ||
+      die 'AirDrop receiver needs an update. Finish the active transfer, turn AirDrop off, and rerun setup; Wi-Fi was not changed.'
+    install_consent_hook
+    bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" ||
+      die 'The tested AirDrop receiver could not be installed; no app revision was marked complete.'
+    bash "$WINDOWS_DIR/scripts/install-airdrop-mt7922.sh" --verify ||
+      die 'The installed AirDrop receiver failed verification.'
+  )
 }
 
 install_executable() {
@@ -287,6 +312,17 @@ install_executable() {
     rm -f -- "$staged"
     die "Could not install $destination"
   fi
+}
+
+install_consent_hook() {
+  mkdir -p "$(dirname "$AIRDROP_CONFIRM_FILE")"
+  if [[ ! -x "$AIRDROP_CONFIRM_FILE" ]] ||
+     ! cmp -s "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE"; then
+    install_executable "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE"
+  fi
+  [[ -x "$AIRDROP_CONFIRM_FILE" ]] &&
+    cmp -s "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE" ||
+    die 'AirDrop consent hook did not install correctly.'
 }
 
 migrate_previous_settings() {
@@ -328,8 +364,7 @@ install_files() {
   install_executable "$WINDOWS_DIR/scripts/cleanup-opencode-sessions.sh" "$CLEANUP_FILE"
   # Replace by rename: a running receiver can finish using its old consent
   # hook, while the next /Ask gets a complete, executable progress-aware hook.
-  install_executable "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE"
-  cmp -s "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" "$AIRDROP_CONFIRM_FILE" || die 'AirDrop consent hook did not install correctly.'
+  install_consent_hook
   # Now that the hook exists, re-check that the receiver really uses it. A
   # receiver pointed at any other hook refuses every transfer in silence.
   if (( ! NO_AIRDROP )); then

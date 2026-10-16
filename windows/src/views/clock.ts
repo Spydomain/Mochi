@@ -4,6 +4,7 @@ import { ICONS } from "./icons";
 import { createWeatherLayer } from "./weather-layer";
 import { State } from "../core/state";
 import { weatherDescription, type WeatherLocation, type WeatherReport } from "../core/weather";
+import { weatherForecastStatus } from "../island/weather";
 
 export function clockText(now: Date): string {
   return `${now.getHours() % 12 || 12}:${String(now.getMinutes()).padStart(2, "0")} ${now.getHours() < 12 ? "AM" : "PM"}`;
@@ -35,14 +36,19 @@ export function buildClockCard() {
       cardWeather.title = "";
       return;
     }
-    if (report && Date.now() - State.weatherFetchedAt < 45 * 60_000) {
-      cardWeather.textContent = clockWeatherText(location, report);
+    if (report) {
+      const stale = Date.now() - State.weatherFetchedAt >= 45 * 60_000;
+      cardWeather.textContent = `${clockWeatherText(location, report)}${stale ? " · Stale" : ""}`;
       const range = report.highC != null && report.lowC != null
         ? ` · High ${Math.round(report.highC)}°C · Low ${Math.round(report.lowC)}°C`
         : "";
-      cardWeather.title = `${cardWeather.textContent}${range}`;
+      const updated = stale
+        ? ` · Last updated ${new Date(State.weatherFetchedAt).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`
+        : "";
+      cardWeather.title = `${cardWeather.textContent}${range}${updated}`;
     } else {
-      cardWeather.textContent = State.weatherAttemptedAt ? "Weather unavailable" : "Loading weather…";
+      cardWeather.textContent = weatherForecastStatus.loading || !State.weatherAttemptedAt
+        ? "Loading weather…" : "Weather unavailable";
       cardWeather.title = cardWeather.textContent;
     }
   }

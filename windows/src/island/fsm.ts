@@ -31,6 +31,16 @@ export class IslandStateMachine {
   greetHoverCollapseDelay = 10;
   /** An alert waiting for an answer stays open, even when the mouse leaves. */
   pinned = false;
+  /** Keep a live compact status visible without pinning the expanded panel. */
+  get keepCompact(): boolean {
+    return this.compactHeld;
+  }
+  set keepCompact(on: boolean) {
+    if (on === this.compactHeld) return;
+    this.compactHeld = on;
+    this.clear("petitHide");
+    if (!on && this.state === "petit" && !this.pointerInside) this.schedulePetitHide();
+  }
   /**
    * Hovering opens the island all the way instead of peeking (Settings →
    * General → Open on hover, off by default), as IslandStateMachine.openOnHover.
@@ -51,6 +61,8 @@ export class IslandStateMachine {
   homeCollapseDueAt: number | null = null;
 
   private homeDelay = 15;
+  private compactHeld = false;
+  private pointerInside = false;
   private byHover = false;
   private petitHide: number | null = null;
   private homeCollapse: number | null = null;
@@ -64,6 +76,7 @@ export class IslandStateMachine {
   }
 
   mouseEntered() {
+    this.pointerInside = true;
     if (this.openOnHover && (this.state === "hidden" || this.state === "petit") && !this.pinned) {
       this.cancelTimers();
       this.byHover = true;
@@ -88,6 +101,7 @@ export class IslandStateMachine {
   }
 
   mouseLeft() {
+    this.pointerInside = false;
     switch (this.state) {
       case "hidden":
         break;
@@ -162,10 +176,10 @@ export class IslandStateMachine {
     this.clear("petitHide");
     // A card folded away while it waits for an answer keeps the compact island
     // on screen, so it can be reopened (isHeldOpen on macOS).
-    if (this.pinned) return;
+    if (this.pinned || this.keepCompact) return;
     this.petitHide = window.setTimeout(() => {
       this.petitHide = null;
-      if (this.state === "petit" && !this.pinned) this.transition("hidden");
+      if (this.state === "petit" && !this.pinned && !this.keepCompact) this.transition("hidden");
     }, this.petitToHiddenDelay * 1000);
   }
 

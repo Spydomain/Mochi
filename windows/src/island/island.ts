@@ -180,6 +180,7 @@ export class Island {
       this.onGreetingDone?.();
     };
     State.subscribe(() => {
+      this.syncAirDropTransfer();
       this.dirty = true;
       // A hidden, fully retracted island waits for an actual wake event.
       // Integration reports can arrive every two seconds without drawing.
@@ -519,6 +520,13 @@ export class Island {
 
   reveal() {
     this.fsm.reveal();
+  }
+
+  /** A live transfer owns compact visibility, not the expanded panel's pin. */
+  private syncAirDropTransfer() {
+    const active = !State.paused && State.airdropTransfer !== null;
+    this.fsm.keepCompact = active;
+    if (active && this.fsm.state === "hidden") this.revealSilently();
   }
 
   /** Music started playing: the compact island, without the peek sound (musicReveal). */

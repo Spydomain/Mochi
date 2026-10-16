@@ -1,6 +1,8 @@
-# Mochi on Windows
+# Mochi desktop client — Windows and development
 
-Mochi is a Dynamic Island-style desktop companion for coding-agent activity, chat, media, shortcuts, and system status. This directory contains its shared TypeScript interface and Tauri/Rust desktop application. The [main guide](../README.md) covers the automated Linux installation; Windows is built from source here.
+This directory contains Mochi's shared TypeScript interface and Tauri/Rust desktop application. Linux users should start with the [automated installation guide](../README.md#install-on-linux); the Windows build and contributor workflow are documented here. The directory name is historical: it also contains the Linux desktop implementation.
+
+[Project overview](../README.md) · [Linux AirDrop](airdrop/README.md) · [Optional iPhone relay](../relay/README.md)
 
 ![Mochi's shared interface running on Linux](../docs/media/mochi-overview.png)
 
@@ -12,12 +14,12 @@ Mochi is a Dynamic Island-style desktop companion for coding-agent activity, cha
 | --- | --- | --- |
 | ![Windows overview reference](screenshots/overview.png) | ![Windows compact island reference](screenshots/compact.png) | ![Windows settings reference](screenshots/settings.png) |
 
-These Windows captures are interface references, not screenshots of the latest Linux AirDrop implementation. For current Linux UI captures see the [overview](../docs/media/mochi-overview.png), [wardrobe](../docs/media/mochi-wardrobe.png), [animated demo](../docs/media/mochi-demo.gif), and [short MP4 video](../docs/media/mochi-demo.mp4).
+These older Windows captures are interface references, not evidence of a newly tested Windows release. The latest Linux captures, recorded October 16, 2026, show [Clock and weather](../docs/media/mochi-overview.png), an actual [incoming iPhone request](../docs/media/mochi-airdrop-request.png), and verified receipt in the [animated demo](../docs/media/mochi-demo.gif) and [MP4 video](../docs/media/mochi-demo.mp4). Linux AirDrop is not a Windows feature.
 
 ## Requirements
 
 - Windows 10 or 11 with Microsoft Edge WebView2 Runtime.
-- Node.js 20 or newer and npm.
+- Node.js and npm. Node.js 24.12+ matches the Linux setup's supported 24.x toolchain; the Linux installer also accepts 22.20+.
 - Rust and Cargo installed through [rustup](https://rustup.rs/).
 - Visual Studio Build Tools with the **Desktop development with C++** workload and a compatible Windows SDK.
 
@@ -34,6 +36,21 @@ npm run tauri dev
 
 `npm run tauri dev` builds the hook and launches the development app. If the Rust toolchain or C++ workload is missing, resolve that prerequisite before retrying.
 
+## Development workflow
+
+| Command | Purpose |
+| --- | --- |
+| `npm test` | Run the shared interface regression tests. |
+| `npm run build` | Prepare the Cargo cache, build the release hook, type-check TypeScript, and build frontend assets. |
+| `npm run tauri dev` | Start the complete desktop app with its frontend development server. |
+| `npm run dev` | Start only the frontend server; this does not launch the native app. |
+| `cargo test --manifest-path src-tauri/Cargo.toml --lib` | Run native library tests for the host platform. |
+| `npm run pack` | Build and collect host-platform release packages. |
+
+The frontend development URL is `http://localhost:1420`. A connection-refused page there usually means the development server is not running; the installed release application uses bundled assets and does not depend on that server. OpenCode's local service is a separate integration—check `opencode service status` for chat connection failures.
+
+On Linux, first install native prerequisites through the [main setup script](../README.md#install-on-linux), then run development commands from this directory. Tests on one operating system do not verify platform-specific integrations on another.
+
 ## Test and package
 
 From the `windows` directory:
@@ -47,11 +64,26 @@ npm run pack
 
 `npm run pack` builds release bundles and copies the Windows installers to `windows\release\`. Tauri's raw release artifacts remain under `windows\target\release\`. Packaging availability depends on the Windows build environment; inspect the command's output for the actual installer paths.
 
+### After moving or renaming a checkout
+
+Tauri's generated permission metadata can contain absolute build paths. The `predev` and `prebuild` hooks run `scripts/prepare-cargo-target.mjs`, which invalidates the generated `windows/target` cache when the workspace path changes. Run the normal npm/Tauri commands after a move instead of copying an old target cache into a fresh checkout. The next native build may take longer; source files and saved app preferences are not removed by that cache preparation.
+
+## Source layout
+
+| Directory | Contents |
+| --- | --- |
+| `src/` | Shared interface, companion views, settings, and animations. |
+| `src-tauri/` | Native commands and operating-system integration. |
+| `scripts/` | Hook preparation, packaging, Linux helpers, and recovery tools. |
+| `tests/` | Interface tests with mocked native APIs. |
+| `airdrop/` | Optional Linux receiver code, pinned patches, and bundle documentation. |
+
 ## Configuration and local data
 
 | Item | Path |
 | --- | --- |
 | Preferences and custom sounds | `%APPDATA%\Mochi` |
+| Preferences file | `%APPDATA%\Mochi\settings.json` |
 | Logs, inbox, and helper binaries | `%LOCALAPPDATA%\Mochi` |
 | App log | `%LOCALAPPDATA%\Mochi\mochi.log` |
 

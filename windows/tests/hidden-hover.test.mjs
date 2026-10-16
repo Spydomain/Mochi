@@ -14,7 +14,36 @@ beforeEach(() => {
 });
 afterEach(() => {
   State.mode = previousMode;
+  State.airdropTransfer = null;
+  State.paused = false;
   mock.timers.reset();
+});
+
+test("AirDrop progress wakes and holds compact, but idle radio and pause do not", () => {
+  const island = Object.create(Island.prototype);
+  island.fsm = new IslandStateMachine();
+  State.mode = "hidden";
+  State.airdropTransfer = null;
+  State.paused = false;
+  island.syncAirDropTransfer();
+  assert.equal(island.fsm.state, "hidden");
+  State.airdropTransfer = "receiving";
+  island.syncAirDropTransfer();
+  assert.equal(island.fsm.state, "petit");
+  mock.timers.tick(60_000);
+  assert.equal(island.fsm.state, "petit");
+  State.airdropTransfer = "complete";
+  island.syncAirDropTransfer();
+  mock.timers.tick(5_000);
+  assert.equal(island.fsm.state, "petit");
+  State.airdropTransfer = null;
+  island.syncAirDropTransfer();
+  mock.timers.tick(2_000);
+  assert.equal(island.fsm.state, "hidden");
+  State.paused = true;
+  State.airdropTransfer = "receiving";
+  island.syncAirDropTransfer();
+  assert.equal(island.fsm.state, "hidden");
 });
 
 test("compositor enter after an idle wake cancels a stale leave countdown", () => {

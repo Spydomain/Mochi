@@ -141,16 +141,33 @@ mod linux {
         if incoming()?.is_none_or(|item| item.id != id) {
             return Err("This AirDrop request has expired.".into());
         }
+        write_decision(&consent_dir()?, &id, accept)
+    }
+
+    fn write_decision(dir: &std::path::Path, id: &str, accept: bool) -> Result<(), String> {
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Invalid AirDrop request.".into());
+        }
+        // Bind the filename AND contents to the request. Even if A expires and
+        // B reuses active/ between checking and writing, A cannot answer B.
+        // Publish only a complete answer; the shell must never see an empty file.
+        let temporary = dir.join(format!("decision-{id}.tmp"));
+        let decision = dir.join(format!("decision-{id}"));
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(consent_dir()?.join("decision"))
+            .open(&temporary)
             .map_err(|_| "This AirDrop request was already answered or has expired.".to_string())?;
-        file.write_all(if accept { b"accept" } else { b"decline" })
-            .map_err(|e| format!("Could not answer AirDrop: {e}"))?;
-        Ok(())
+        let result = (|| {
+            write!(file, "{id} {}", if accept { "accept" } else { "decline" })?;
+            // A hard link is atomic and, unlike rename, never replaces a prior
+            // explicit answer if two button events race.
+            std::fs::hard_link(&temporary, &decision)
+        })().map_err(|e| format!("Could not answer AirDrop: {e}"));
+        let _ = std::fs::remove_file(temporary);
+        result
     }
 
     pub fn transfer() -> Option<Transfer> {
@@ -229,7 +246,7 @@ mod linux {
         upload.lines()
             .filter_map(|line| line.strip_prefix("TotalBytes: ")?.trim().parse::<u64>().ok())
             .filter(|total| (1..=1_000_000_000_000).contains(total))
-            .last()
+            .next_back()
     }
 
     fn private_archive_received(path: &std::path::Path, start: u64, now: u64) -> Option<u64> {
@@ -337,8 +354,11 @@ mod linux {
     }
 
     fn mt7922_daemon() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        let daemon = PathBuf::from(home).join(".local/share/mochi/airdrop-mt7921/daemon/airdropd");
+        executable_daemon_in(&crate::platform::local_dir())
+    }
+
+    fn executable_daemon_in(data: &std::path::Path) -> Option<PathBuf> {
+        let daemon = data.join("airdrop-mt7921/daemon/airdropd");
         use std::os::unix::fs::PermissionsExt;
         daemon
             .metadata()
@@ -542,10 +562,77 @@ mod linux {
         // HTTPS listening socket; this avoids claiming "Receiving" from a
         // stale daemon state file plus orphaned helpers.
         Command::new("ss")
-            .args(["-ltnH", "( sport = :8771 )"])
+            .args(["-ltnpH", "( sport = :8771 )"])
             .output()
             .await
-            .is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
+            .is_ok_and(|out| out.status.success() && receiver_socket_owned(
+                &String::from_utf8_lossy(&out.stdout), std::path::Path::new("/proc"),
+                &crate::platform::local_dir().join("owl/.venv-opendrop/bin/opendrop"),
+            ))
+    }
+
+    fn receiver_socket_owned(sockets: &str, proc_root: &std::path::Path, opendrop: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        sockets.split("pid=").skip(1).filter_map(|part| {
+            part.split(|c: char| !c.is_ascii_digit()).next()?.parse::<u32>().ok()
+        }).any(|pid| {
+            let worker = proc_root.join(pid.to_string());
+            if !worker.metadata().is_ok_and(|m| m.uid() == unsafe { libc::geteuid() }) { return false; }
+            let Ok(argv) = std::fs::read(worker.join("cmdline")) else { return false };
+            let args: Vec<&[u8]> = argv.split(|b| *b == 0).collect();
+            args.contains(&opendrop.as_os_str().as_encoded_bytes()) && args.contains(&b"receive".as_slice())
+        })
+    }
+
+    async fn mt7922_port_in_use() -> bool {
+        // An unrelated listener is not our receiver and must never be stopped,
+        // but it still prevents a new receiver from binding this port.
+        Command::new("ss").args(["-ltnH", "( sport = :8771 )"])
+            .output().await.is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
+    }
+
+    fn lock_idle_receiver_at(directory: &std::path::Path) -> Result<std::fs::File, String> {
+        use std::os::{fd::AsRawFd, unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt}};
+        if !directory.exists() {
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)
+                .map_err(|e| format!("Could not prepare the AirDrop session lock: {e}"))?;
+        }
+        if !directory.symlink_metadata().is_ok_and(|m| m.is_dir()
+            && m.uid() == unsafe { libc::geteuid() } && m.permissions().mode() & 0o022 == 0) {
+            return Err("The AirDrop session lock directory is unsafe.".into());
+        }
+        let file = OpenOptions::new().append(true).create(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory.join("lock"))
+            .map_err(|e| format!("Could not open the AirDrop session lock: {e}"))?;
+        if !file.metadata().is_ok_and(|m| m.is_file()
+            && m.uid() == unsafe { libc::geteuid() } && m.permissions().mode() & 0o022 == 0) {
+            return Err("The AirDrop session lock is unsafe.".into());
+        }
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err("An AirDrop session is starting, running, or being updated. Mochi will not interrupt it.".into());
+        }
+        Ok(file)
+    }
+
+    fn lock_idle_receiver() -> Result<std::fs::File, String> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("No private runtime directory is available.")?;
+        lock_idle_receiver_at(&PathBuf::from(runtime).join("airdropd"))
+    }
+
+    async fn mt7922_service_running() -> bool {
+        Command::new("systemctl").args(["--user", "show", "mochi-airdrop.service", "-p", "MainPID", "--value"])
+            .output().await.is_ok_and(|out| out.status.success()
+                && String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().is_ok_and(|pid| pid != 0))
+    }
+
+    async fn stop_mt7922_service() -> Result<(), String> {
+        let output = tokio::time::timeout(Duration::from_secs(35),
+            Command::new("systemctl").args(["--user", "stop", "mochi-airdrop.service"])
+                .kill_on_drop(true).output()).await
+            .map_err(|_| "The AirDrop service did not stop in time.".to_string())?
+            .map_err(|e| format!("Could not stop the AirDrop service: {e}"))?;
+        if !output.status.success() { return Err("Could not stop the AirDrop user service.".into()); }
+        Ok(())
     }
 
     /// The receiver survives Mochi UI restarts. Read its actual OpenDrop
@@ -567,8 +654,7 @@ mod linux {
             return None;
         }
         let children = std::fs::read_to_string(process.join(format!("task/{pid}/children"))).ok()?;
-        let home = std::env::var_os("HOME")?;
-        let opendrop = PathBuf::from(home).join(".local/share/mochi/owl/.venv-opendrop/bin/opendrop");
+        let opendrop = crate::platform::local_dir().join("owl/.venv-opendrop/bin/opendrop");
         for child in children.split_whitespace().filter_map(|s| s.parse::<u32>().ok()) {
             let worker = PathBuf::from(format!("/proc/{child}"));
             let Ok(args) = std::fs::read(worker.join("cmdline")) else { continue };
@@ -589,7 +675,8 @@ mod linux {
         loop {
             let radio = mt7922_radio_state().await?;
             let listener = mt7922_receiver_listening().await;
-            let active = radio.mon && radio.active && radio.go && listener;
+            let active = radio.mon && radio.active && radio.go && listener
+                && mt7922_live_directory().await.is_some();
             let stopped = !radio.mon && !radio.active && !radio.go && !listener;
             if (running && active) || (!running && stopped) {
                 return Ok(());
@@ -662,11 +749,18 @@ mod linux {
 
     async fn mt7922_set(enabled: bool, name: &str, directory: &str) -> Result<Status, String> {
         let _guard = SWITCH.get_or_init(|| Mutex::new(())).lock().await;
-        let daemon = mt7922_ready()?;
         if enabled {
+            let daemon = mt7922_ready()?;
             let (name, directory) = preferences(name, directory)?;
             if mt7922_status().await?.receiving {
                 return mt7922_status().await;
+            }
+            // A startup/send session owns this lock before it opens a socket.
+            // Hold it through orphan cleanup; a missing listener is NOT proof
+            // that an existing standalone daemon is abandoned.
+            let idle_guard = lock_idle_receiver()?;
+            if mt7922_port_in_use().await {
+                return Err("TCP port 8771 is already in use. Mochi will not replace another receiver or stop an unrelated service.".into());
             }
             if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
                 let _ = std::fs::remove_file(
@@ -731,6 +825,9 @@ mod linux {
                     receiver.arg(format!("--setenv=AIRDROP_CONFIRM={}", confirm.display()));
                 }
             }
+            // The daemon takes the same lock itself. If another session wins
+            // this handoff, it must not be torn down by our failure cleanup.
+            drop(idle_guard);
             let output = tokio::time::timeout(
                 Duration::from_secs(8),
                 receiver.arg(daemon).arg("run").kill_on_drop(true).output(),
@@ -744,13 +841,21 @@ mod linux {
             }
             STARTED_BY_MOCHI.store(true, Ordering::Relaxed);
             if let Err(err) = wait_for_mt7922_session(true, 10).await {
-                let _ = run_mt7922(&["stop"], 10).await;
-                let _ = mt7922_stop_radio_helpers().await;
+                let _ = stop_mt7922_service().await;
+                if let Ok(_idle_guard) = lock_idle_receiver() {
+                    let _ = mt7922_stop_radio_helpers().await;
+                }
                 STARTED_BY_MOCHI.store(false, Ordering::Relaxed);
                 return Err(err);
             }
         } else {
-            let (ok, output) = run_mt7922(&["stop"], 10).await?;
+            let (ok, output) = if mt7922_service_running().await {
+                // Service ownership survives a removed/non-executable daemon.
+                stop_mt7922_service().await?;
+                (true, String::new())
+            } else {
+                run_mt7922(&["stop"], 10).await?
+            };
             // "not running" is harmless here: it means the process already
             // died and only its helpers may remain, which we clean next.
             if !ok && !output.contains("not running") {
@@ -760,6 +865,7 @@ mod linux {
                     output
                 });
             }
+            let _idle_guard = lock_idle_receiver()?;
             mt7922_stop_radio_helpers().await?;
             wait_for_mt7922_session(false, 8).await?;
             STARTED_BY_MOCHI.store(false, Ordering::Relaxed);
@@ -769,7 +875,11 @@ mod linux {
                 );
             }
         }
-        let status = mt7922_status().await?;
+        let status = if mt7922_daemon().is_some() { mt7922_status().await? } else {
+            Status { installed: false, receiving: false, visible: false,
+                message: Some("AirDrop stopped. Reinstall the missing MT7922 backend before starting it again.".into()),
+                ..Status::default() }
+        };
         if enabled && !status.receiving {
             return Err(status
                 .message
@@ -851,9 +961,7 @@ mod linux {
     }
 
     async fn start_ble_wake() -> Result<tokio::process::Child, String> {
-        let home = std::env::var_os("HOME").ok_or("HOME is unavailable.")?;
-        let script =
-            PathBuf::from(home).join(".local/share/mochi/airdrop-mt7921/tools/blewake-dbus.py");
+        let script = crate::platform::local_dir().join("airdrop-mt7921/tools/blewake-dbus.py");
         if !script.is_file() {
             return Err("The AirDrop Bluetooth wake helper is missing. Reinstall the optional MT7922 backend.".into());
         }
@@ -903,9 +1011,7 @@ mod linux {
                 "Turn on AirDrop and wait until its radio is visible before scanning.".into(),
             );
         }
-        let home = std::env::var_os("HOME").ok_or("HOME is unavailable.")?;
-        let opendrop =
-            PathBuf::from(home).join(".local/share/mochi/owl/.venv-opendrop/bin/opendrop");
+        let opendrop = crate::platform::local_dir().join("owl/.venv-opendrop/bin/opendrop");
         if !opendrop.is_file() {
             return Err("The MT7922 AirDrop discovery tool is missing.".into());
         }
@@ -968,6 +1074,12 @@ mod linux {
         if mt7922_daemon().is_some() {
             return mt7922_status().await;
         }
+        if mt7922_service_running().await {
+            let active = mt7922_radio_active().await.unwrap_or(false) && mt7922_receiver_listening().await;
+            return Ok(Status { installed: true, receiving: active, visible: active,
+                message: Some("The MT7922 backend is missing, but its service is still running. Turn AirDrop off, then reinstall the backend.".into()),
+                ..Status::default() });
+        }
         if executable().is_none() {
             return Ok(Status {
                 message: Some(SETUP.into()),
@@ -999,7 +1111,7 @@ mod linux {
     }
 
     pub async fn set(enabled: bool, name: &str, directory: &str) -> Result<Status, String> {
-        if mt7922_daemon().is_some() {
+        if mt7922_daemon().is_some() || (!enabled && mt7922_service_running().await) {
             return mt7922_set(enabled, name, directory).await;
         }
         if enabled && (name.trim() != "Mochi" || !directory.is_empty()) {
@@ -1106,10 +1218,10 @@ mod linux {
                 );
             }
             let daemon = mt7922_ready()?;
-            let picker = std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".local/share/mochi/omdrop-plugin/bin/pick.py"))
-                .filter(|p| p.is_file())
-                .ok_or("The desktop file picker is not installed.")?;
+            let picker = crate::platform::local_dir().join("omdrop-plugin/bin/pick.py");
+            if !picker.is_file() {
+                return Err("The desktop file picker is not installed.".into());
+            }
             let output = Command::new("python3")
                 .arg(picker)
                 .args(["files", "", "Send via AirDrop"])
@@ -1214,6 +1326,85 @@ mod linux {
 
     #[cfg(test)]
     mod tests {
+        fn fixture_root(label: &str) -> std::path::PathBuf {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("mochi-{label}-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            root
+        }
+
+        #[test]
+        fn consent_answers_are_atomic_bound_to_id_and_never_replaced() {
+            let root = fixture_root("decision");
+            let id = "0123456789abcdef0123456789abcdef";
+            super::write_decision(&root, id, true).unwrap();
+            let final_path = root.join(format!("decision-{id}"));
+            assert_eq!(std::fs::read_to_string(&final_path).unwrap(), format!("{id} accept"));
+            assert!(!root.join(format!("decision-{id}.tmp")).exists());
+            assert!(super::write_decision(&root, id, false).is_err());
+            assert_eq!(std::fs::read_to_string(&final_path).unwrap(), format!("{id} accept"));
+            assert!(!root.join(format!("decision-{id}.tmp")).exists());
+            assert!(super::write_decision(&root, "../../outside", true).is_err());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn receiver_discovery_uses_the_selected_data_directory() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = fixture_root("custom-data");
+            let daemon = root.join("airdrop-mt7921/daemon/airdropd");
+            std::fs::create_dir_all(daemon.parent().unwrap()).unwrap();
+            std::fs::write(&daemon, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(super::executable_daemon_in(&root).is_none());
+            std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(super::executable_daemon_in(&root), Some(daemon));
+            assert!(super::executable_daemon_in(&root.join("unrelated")).is_none());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn receiver_lock_excludes_other_sessions_and_rejects_unsafe_paths() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let root = fixture_root("receiver-lock");
+            let directory = root.join("airdropd");
+            let guard = super::lock_idle_receiver_at(&directory).unwrap();
+            assert!(super::lock_idle_receiver_at(&directory).is_err());
+            drop(guard);
+            drop(super::lock_idle_receiver_at(&directory).unwrap());
+
+            let alias = root.join("alias");
+            symlink(&directory, &alias).unwrap();
+            assert!(super::lock_idle_receiver_at(&alias).is_err());
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(super::lock_idle_receiver_at(&directory).is_err());
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_file(directory.join("lock")).unwrap();
+            let outside = root.join("outside");
+            std::fs::write(&outside, b"unchanged").unwrap();
+            symlink(&outside, directory.join("lock")).unwrap();
+            assert!(super::lock_idle_receiver_at(&directory).is_err());
+            assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn unrelated_listener_is_not_a_receiver_and_does_not_prevent_stopped_state() {
+            let root = fixture_root("listener-owner");
+            let worker = root.join("12345");
+            std::fs::create_dir(&worker).unwrap();
+            let executable = std::path::Path::new("/custom/data/mochi/owl/.venv-opendrop/bin/opendrop");
+            let sockets = "LISTEN 0 5 [::]:8771 [::]:* users:((\"python3\",pid=12345,fd=3))";
+            std::fs::write(worker.join("cmdline"), b"python3\0-m\0http.server\08771\0").unwrap();
+            assert!(!super::receiver_socket_owned(sockets, &root, executable));
+            std::fs::write(worker.join("cmdline"), format!("python3\0{}\0receive\0", executable.display())).unwrap();
+            assert!(super::receiver_socket_owned(sockets, &root, executable));
+            std::fs::write(worker.join("cmdline"), format!("python3\0{}\0find\0", executable.display())).unwrap();
+            assert!(!super::receiver_socket_owned(sockets, &root, executable));
+            assert!(!super::receiver_socket_owned("LISTEN 0 5 [::]:8771 [::]:*", &root, executable));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
         #[test]
         fn private_upload_progress_rejects_outside_and_symlink_paths() {
             use super::workspace_archive_received;

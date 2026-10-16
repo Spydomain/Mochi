@@ -14,6 +14,136 @@ const report = (weatherCode, isDay, precipitationMm = 0) => ({
   weatherCode, isDay, precipitationMm, temperatureC: 12, highC: 17, lowC: 8, observedAt: "2026-10-12T10:45",
 });
 
+for (const outcome of ["report", "empty", "rejected"]) {
+  test(`forecast changes drain promptly after an obsolete ${outcome} request and never publish it`, async () => {
+    const oldForecast = Bridge.weatherForecast;
+    const saved = { settings: State.settings, paused: State.paused,
+      weatherReport: State.weatherReport, weatherFetchedAt: State.weatherFetchedAt,
+      weatherAttemptedAt: State.weatherAttemptedAt };
+    const requests = [];
+    const published = [];
+    const unsubscribe = State.subscribe(() => {
+      if (State.weatherReport) published.push(State.weatherReport);
+    });
+    Bridge.weatherForecast = () => new Promise((resolve, reject) => {
+      requests.push({ location: State.settings.weatherLocation.name, resolve, reject });
+    });
+    const location = (name, latitude) => ({ name, latitude, longitude: 85.3 });
+    try {
+      State.paused = false;
+      State.weatherReport = null;
+      State.settings = { ...saved.settings, weatherEnabled: true, weatherAutoLocation: false,
+        weatherLocation: location("A", 27) };
+      const backdrop = new WeatherBackdrop();
+      const first = backdrop.refresh();
+      State.settings.weatherLocation = location("B", 28);
+      backdrop.settingsChanged();
+      assert.equal(requests.length, 1, "keep one native request in flight");
+      if (outcome === "rejected") requests[0].reject(new Error("offline"));
+      else requests[0].resolve(outcome === "report" ? report(61, true) : null);
+      await first.catch(() => {});
+      assert.deepEqual(requests.map((r) => r.location), ["A", "B"], "B starts without a polling tick");
+      assert.equal(State.weatherReport, null);
+
+      State.settings.weatherLocation = location("C", 29);
+      backdrop.settingsChanged();
+      State.settings.weatherLocation = location("D", 30);
+      backdrop.settingsChanged();
+      assert.equal(requests.length, 2);
+      requests[1].resolve(report(73, true));
+      await new Promise(setImmediate);
+      assert.deepEqual(requests.map((r) => r.location), ["A", "B", "D"], "coalesce to the latest settings");
+      assert.equal(State.weatherReport, null);
+      const latest = report(0, true);
+      requests[2].resolve(latest);
+      await new Promise(setImmediate);
+      assert.equal(State.weatherReport, latest);
+      assert.ok(published.length > 0);
+      assert.ok(published.every((r) => r === latest), "obsolete results never reach subscribers");
+      await backdrop.refresh();
+      assert.equal(requests.length, 3, "retain normal forecast throttling");
+    } finally {
+      for (const request of requests) request.resolve(null);
+      await new Promise(setImmediate);
+      unsubscribe();
+      Bridge.weatherForecast = oldForecast;
+      Object.assign(State, saved);
+    }
+  });
+}
+
+for (const stop of ["disabled", "paused"]) {
+  test(`an invalidated forecast stays discarded while weather is ${stop}`, async () => {
+    const oldForecast = Bridge.weatherForecast;
+    const saved = { settings: State.settings, paused: State.paused,
+      weatherReport: State.weatherReport, weatherFetchedAt: State.weatherFetchedAt,
+      weatherAttemptedAt: State.weatherAttemptedAt };
+    let finish;
+    let calls = 0;
+    Bridge.weatherForecast = () => { calls++; return new Promise((resolve) => { finish = resolve; }); };
+    try {
+      State.paused = false;
+      State.settings = { ...saved.settings, weatherEnabled: true, weatherAutoLocation: false,
+        weatherLocation: { name: "A", latitude: 27, longitude: 85 } };
+      const backdrop = new WeatherBackdrop();
+      const pending = backdrop.refresh();
+      State.settings.weatherLocation = { name: "B", latitude: 28, longitude: 85 };
+      if (stop === "disabled") State.settings.weatherEnabled = false;
+      else State.paused = true;
+      backdrop.settingsChanged();
+      finish(report(61, true));
+      await pending;
+      assert.equal(State.weatherReport, null);
+      assert.equal(calls, 1);
+    } finally {
+      Bridge.weatherForecast = oldForecast;
+      Object.assign(State, saved);
+    }
+  });
+}
+
+test("repeated settings updates for the same city retain its stale report until a replacement arrives", async () => {
+  const oldForecast = Bridge.weatherForecast;
+  const oldNow = Date.now;
+  const saved = { settings: State.settings, paused: State.paused,
+    weatherReport: State.weatherReport, weatherFetchedAt: State.weatherFetchedAt,
+    weatherAttemptedAt: State.weatherAttemptedAt };
+  let now = 1_800_000_000_000;
+  Date.now = () => now;
+  const requests = [];
+  try {
+    State.paused = false;
+    State.settings = { ...saved.settings, weatherEnabled: true, weatherAutoLocation: false,
+      weatherLocation: { name: "Kathmandu", latitude: 27.7, longitude: 85.3 } };
+    const sample = report(0, true);
+    Bridge.weatherForecast = async () => sample;
+    const backdrop = new WeatherBackdrop();
+    await backdrop.refresh();
+    const fetchedAt = State.weatherFetchedAt;
+    now += 46 * 60_000;
+    Bridge.weatherForecast = () => new Promise((resolve) => requests.push(resolve));
+    const pending = backdrop.refresh();
+    backdrop.settingsChanged();
+    backdrop.settingsChanged();
+    assert.equal(State.weatherReport, sample);
+    assert.equal(State.weatherFetchedAt, fetchedAt);
+    requests[0](report(61, true));
+    await pending;
+    assert.equal(requests.length, 2);
+    assert.equal(State.weatherReport, sample, "invalidated refresh cannot replace the retained reading");
+    requests[1](null);
+    await new Promise(setImmediate);
+    assert.equal(State.weatherReport, sample);
+    assert.equal(State.weatherFetchedAt, fetchedAt);
+  } finally {
+    for (const resolve of requests) resolve(null);
+    await new Promise(setImmediate);
+    Bridge.weatherForecast = oldForecast;
+    Date.now = oldNow;
+    Object.assign(State, saved);
+  }
+});
+
 test("night sky works offline and daytime remains quiet", () => {
   assert.equal(weatherScene(null, 23), "night");
   assert.equal(weatherScene(null, 2), "night");

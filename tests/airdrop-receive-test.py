@@ -5,9 +5,12 @@ import errno
 import gzip
 import importlib.util
 import io
+import json
 import logging
 import os
 import platform
+import plistlib
+from email.message import Message
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import socket
@@ -19,6 +22,7 @@ import tracemalloc
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+from concurrent.futures import ThreadPoolExecutor
 import zlib
 
 REPO = Path(__file__).resolve().parents[1]
@@ -36,9 +40,18 @@ if len(sys.argv) > 1 and sys.argv[1].endswith(".py"):
                and node.value.value is True and any(isinstance(target, ast.Attribute)
                and target.attr == "allow_reuse_address" for target in node.targets)
                for node in ast.walk(tree)), "receiver must permit safe socket reuse after restart"
-    upload = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "handle_upload")
-    scope.update(__package__="opendrop", os=os, socket=socket, platform=platform, time=time, logger=logging.getLogger("test"))
-    exec(compile(ast.fix_missing_locations(ast.Module(body=[upload], type_ignores=[])), "receiver", "exec"), scope)
+    methods = {"handle_upload", "handle_ask", "handle_discover", "_read_request_body", "_reject_request",
+               "_ask_user", "_set_response", "handle_expect_100", "do_POST"}
+    selected = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in methods]
+    handler = ast.ClassDef(name="PatchedHandler", bases=[ast.Name(id="BaseHTTPRequestHandler", ctx=ast.Load())],
+                           keywords=[], body=selected, decorator_list=[])
+    url_helpers = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("safe_url", "ask_items", "open_url")]
+    scope.update(__package__="opendrop", os=os, socket=socket, platform=platform, time=time, plistlib=plistlib, json=json,
+                 logger=logging.getLogger("test"), BaseHTTPRequestHandler=BaseHTTPRequestHandler,
+                 URL_SCHEMES=("http://", "https://"), open_url=lambda url: None,
+                 AirDropUtil=SimpleNamespace(write_debug=lambda *args: None))
+    exec(compile(ast.fix_missing_locations(ast.Module(body=url_helpers + [handler], type_ignores=[])), "receiver", "exec"), scope)
+    scope["handle_upload"] = scope["PatchedHandler"].handle_upload
     init_server = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_init_server")
     exec(compile(ast.fix_missing_locations(ast.Module(body=[init_server], type_ignores=[])), "receiver", "exec"), scope)
 
@@ -64,13 +77,21 @@ def dvzip(data):
     return bytes(output)
 
 
-class FakeHandler:
+class FakeHandler(scope.get("PatchedHandler", object)):
     UPLOAD_CONTENT_TYPES = ("application/x-cpio", "application/x-dvzip")
-    def __init__(self, data, kind="dvzip", terminate=True):
-        self.headers = {"content-type": f"application/x-{kind}", "transfer-encoding": "chunked"}
+    def __init__(self, data, kind="dvzip", terminate=True, server=None, address=("fe80::1", 50000, 0, 2)):
+        self.headers = Message()
+        self.headers["content-type"] = f"application/x-{kind}"
+        self.headers["transfer-encoding"] = "chunked"
         self.rfile = io.BytesIO(f"{len(data):x};extension=yes\r\n".encode() + data + (b"\r\n0\r\n\r\n" if terminate else b""))
         self.responses = []
         self.connection = self
+        self.server = server or SimpleNamespace(mochi_upload_permissions=receive.UploadPermissions())
+        self.client_address = address
+        self.path = "/Upload"
+        self.close_connection = False
+        self.wfile = io.BytesIO()
+        self.config = SimpleNamespace(computer_model="test", computer_name="Mochi", record_data=None)
     def settimeout(self, timeout):
         self.timeout = timeout
     def send_response(self, code):
@@ -79,6 +100,23 @@ class FakeHandler:
         pass
     def end_headers(self):
         pass
+
+
+class FakeControl(FakeHandler):
+    def __init__(self, path="/Ask", body=None, accept=True, **kwargs):
+        super().__init__(b"", **kwargs)
+        self.path = path
+        if body is None:
+            body = plistlib.dumps({"SenderComputerName": "Phone", "Files": [{"FileName": "photo.jpg"}]})
+        self.rfile = io.BytesIO(body)
+        self.headers = Message()
+        self.headers["Content-Length"] = str(len(body))
+        self.accept = accept
+        self.prompt_count = 0
+
+    def _ask_user(self, body):
+        self.prompt_count += 1
+        return self.accept
 
 
 class WorkspaceTestCase(unittest.TestCase):
@@ -245,6 +283,28 @@ class WorkspaceTests(WorkspaceTestCase):
         self.assertEqual((self.gallery / "photo.jpg").read_bytes(), b"photo")
         self.assertTrue((self.gallery / "Notes/Empty").is_dir())
 
+    def test_publication_rejects_replaced_or_modified_verified_source(self):
+        for replace in (False, True):
+            with self.subTest(replace=replace):
+                workspace = self.workspace("cpio")
+                workspace.raw_path.write_bytes(member("photo.jpg", b"GOOD") + TRAILER)
+                workspace.extract_file(workspace.raw_path)
+                source = workspace.root / "photo.jpg"
+                if replace:
+                    source.unlink()
+                source.write_bytes(b"EVIL")  # same length cannot establish integrity
+                with self.assertRaisesRegex(ValueError, "changed before publication"):
+                    workspace.finish(True, ["photo.jpg"])
+                self.assertEqual(list(self.gallery.iterdir()), [])
+                self.assertTrue(workspace.raw_path.exists())
+
+    def test_publication_rejects_unverified_whole_length_file(self):
+        workspace = self.workspace("cpio")
+        (workspace.root / "photo.jpg").write_bytes(b"photo")
+        with self.assertRaisesRegex(ValueError, "changed before publication"):
+            workspace.finish(True, ["photo.jpg"])
+        self.assertEqual(list(self.gallery.iterdir()), [])
+
     def test_chunk_reader_does_not_buffer_entire_chunk(self):
         class Bounded(io.BytesIO):
             def read1(self, n):
@@ -287,6 +347,9 @@ class WorkspaceTests(WorkspaceTestCase):
 class ReceiveTests(WorkspaceTestCase):
     def send(self, data, kind="dvzip", terminate=True):
         handler = FakeHandler(data, kind, terminate)
+        ask = FakeControl(server=handler.server)
+        ask.handle_ask()
+        self.assertEqual(ask.responses, [200])
         scope["handle_upload"](handler)
         self.assertEqual(handler.timeout, 300)
         return handler.responses[-1]
@@ -301,7 +364,7 @@ class ReceiveTests(WorkspaceTestCase):
         self.assertEqual([p.name for p in self.gallery.iterdir()], ["photo.jpg"])
         recovery = list((self.root / "state/mochi/airdrop/recovery").glob("receive-*"))
         self.assertEqual(len(recovery), 1)
-        self.assertEqual((recovery[0] / "files/PHMediaFormatConversionRequest-abc/video.mov.partial").stat().st_size, 4000)
+        self.assertEqual((recovery[0] / "partials/PHMediaFormatConversionRequest-abc/video.mov").stat().st_size, 4000)
         self.assertTrue(list(recovery[0].glob("*.dvzip")))
     def test_missing_archive_trailer_fails(self):
         self.assertEqual(self.send(dvzip(member("photo.jpg", b"whole"))), 500)
@@ -325,6 +388,23 @@ class ReceiveTests(WorkspaceTestCase):
             self.assertEqual(self.send(dvzip(member("photo.jpg", b"photo") + TRAILER)), 500)
         self.assertEqual(list(self.gallery.iterdir()), [])
         self.assertTrue(list((self.root / "state/mochi/airdrop/recovery").glob("receive-*/*.dvzip")))
+
+    def test_complete_partial_named_member_survives_truncated_sibling(self):
+        # Exact exploit: the legacy verifier replaced the complete member with
+        # unfinished bytes and then published it using its stale `good` list.
+        archive = member("video.mov.partial", b"COMPLETE ORIGINAL") + member("video.mov", b"BAD" + b"X" * 97)
+        self.assertEqual(self.send(dvzip(archive[:-97])), 500)
+        self.assertEqual((self.gallery / "video.mov.partial").read_bytes(), b"COMPLETE ORIGINAL")
+        self.assertFalse((self.gallery / "video.mov").exists())
+        recovery = next((self.root / "state/mochi/airdrop/recovery").glob("receive-*"))
+        self.assertEqual((recovery / "partials/video.mov").read_bytes(), b"BAD")
+        self.assertEqual((recovery / "files/video.mov.partial").read_bytes(), b"COMPLETE ORIGINAL")
+
+    def test_duplicate_name_does_not_quarantine_an_earlier_verified_file(self):
+        for duplicate in (b"other", b"a longer duplicate"):
+            archive = member("photo.jpg", b"whole") + member("photo.jpg", duplicate) + TRAILER
+            self.assertEqual(self.send(dvzip(archive)), 500)
+            self.assertEqual((self.gallery / "photo.jpg").read_bytes(), b"whole")
     def test_directory_only_transfer_succeeds(self):
         archive = member("NSIRD_AirDrop_abc/Notes/Empty", mode=0o40755) + TRAILER
         self.assertEqual(self.send(dvzip(archive)), 200)
@@ -386,6 +466,281 @@ class ReceiveTests(WorkspaceTestCase):
         with self.assertRaises(OSError):
             scope["_init_server"](fake)
         self.assertEqual(fake.config.port, 8771)
+
+
+class PermissionTests(unittest.TestCase):
+    def test_expiry_new_ask_and_single_use(self):
+        now = [100.0]
+        permissions = receive.UploadPermissions(clock=lambda: now[0])
+        peer = ("fe80::1", 12345, 0, 2)
+        newer = ("fe80::1", 54321, 0, 2)
+        ticket = permissions.begin(peer)
+        self.assertFalse(permissions.consume(peer), "an unanswered Ask is not consent")
+        self.assertTrue(permissions.accept(peer, ticket))
+        self.assertFalse(permissions.consume(("fe80::1", 54321, 0, 3)), "IPv6 scopes differ")
+        self.assertTrue(permissions.consume(newer), "TCP port changes are normal")
+        self.assertFalse(permissions.consume(peer), "grant is single-use")
+        ticket = permissions.begin(peer)
+        permissions.accept(peer, ticket)
+        now[0] += permissions.TTL
+        self.assertFalse(permissions.consume(peer), "grant expires at the boundary")
+        pending = permissions.begin(peer)
+        now[0] += permissions.TTL
+        self.assertFalse(permissions.accept(peer, pending), "expired prompts cannot create a new grant")
+        old = permissions.begin(peer)
+        self.assertIsNone(permissions.begin(peer), "overlapping pending Ask must preserve the first ticket")
+        self.assertTrue(permissions.accept(peer, old))
+        current = permissions.begin(peer)
+        self.assertFalse(permissions.accept(peer, old), "a genuinely new Ask supersedes an accepted grant")
+        permissions.cancel(peer, old)
+        self.assertTrue(permissions.accept(peer, current))
+
+    def test_parallel_uploads_cannot_replay_a_grant(self):
+        permissions = receive.UploadPermissions()
+        peer = ("fe80::1", 12345, 0, 2)
+        permissions.accept(peer, permissions.begin(peer))
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: permissions.consume(peer), range(16)))
+        self.assertEqual(sum(results), 1)
+
+    def test_pending_peer_table_is_bounded_and_expired_entries_are_reaped(self):
+        now = [0]
+        permissions = receive.UploadPermissions(clock=lambda: now[0])
+        for n in range(permissions.MAX_PEERS):
+            self.assertIsNotNone(permissions.begin((f"2001:db8::{n}", 1000, 0, 0)))
+        self.assertIsNone(permissions.begin(("2001:db8::extra", 1000, 0, 0)))
+        now[0] += permissions.TTL
+        self.assertIsNotNone(permissions.begin(("2001:db8::extra", 1000, 0, 0)))
+        self.assertEqual(len(permissions.entries), 1)
+
+
+class ControlBodyTests(unittest.TestCase):
+    def test_fixed_body_limits_and_short_reads(self):
+        class Short(io.BytesIO):
+            def read(self, n):
+                self.max_read = max(getattr(self, "max_read", 0), n)
+                return super().read(min(n, 7))
+        source = Short(b"A" * 80)
+        self.assertEqual(receive.read_control_body(source, {"Content-Length": "80"}, limit=80), b"A" * 80)
+        self.assertLessEqual(source.max_read, 65536)
+        for length in ("81", str(1 << 40), "9" * 8192):
+            source = io.BytesIO(b"unread")
+            with self.assertRaises(receive.RequestBodyTooLarge):
+                receive.read_control_body(source, {"Content-Length": length}, limit=80)
+            self.assertEqual(source.tell(), 0)
+        for length in ("-1", "+1", "no", "١"):
+            with self.assertRaises(ValueError):
+                receive.read_control_body(io.BytesIO(), {"Content-Length": length})
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            receive.read_control_body(io.BytesIO(b"a"), {"Content-Length": "2"})
+
+    def test_chunked_cumulative_limit_extensions_trailers_and_early_reject(self):
+        headers = {"Transfer-Encoding": "chunked"}
+        wire = b"3;ext=yes\r\nabc\r\n2\r\nde\r\n0\r\nX-Test: yes\r\n\r\n"
+        self.assertEqual(receive.read_control_body(io.BytesIO(wire), headers, limit=5), b"abcde")
+        stream = io.BytesIO(wire)
+        with self.assertRaises(receive.RequestBodyTooLarge):
+            receive.read_control_body(stream, headers, limit=4)
+        self.assertEqual(stream.read(2), b"de", "over-limit chunk body is not read")
+        stream = io.BytesIO(b"10000000000\r\nUNREAD")
+        with self.assertRaises(receive.RequestBodyTooLarge):
+            receive.read_control_body(stream, headers)
+        self.assertEqual(stream.read(), b"UNREAD")
+        for wire in (b"1\r\naBAD\r\n0\r\n\r\n", b"1\r\n", b"-1\r\n", b"0\n"):
+            with self.assertRaises(ValueError):
+                receive.read_control_body(io.BytesIO(wire), headers)
+        with self.assertRaises(ValueError):
+            receive.read_control_body(io.BytesIO(), {**headers, "Content-Length": "1"})
+
+
+@unittest.skipUnless(scope, "supply a security-patched server.py to run handler tests")
+class SecurityHandlerTests(WorkspaceTestCase):
+    def assert_denied_before_io(self, handler):
+        class Unreadable:
+            def read(self, *args):
+                raise AssertionError("unauthorized body read")
+            def read1(self, *args):
+                raise AssertionError("unauthorized body read")
+            def readline(self, *args):
+                raise AssertionError("unauthorized body read")
+        handler.rfile = Unreadable()
+        handler.headers["Expect"] = "100-continue"
+        with patch.object(receive, "ReceiveWorkspace", side_effect=AssertionError("unauthorized workspace")):
+            handler.handle_upload()
+        self.assertEqual(handler.responses, [403])
+        self.assertTrue(handler.close_connection)
+        self.assertFalse((self.root / "cache/mochi/airdrop/incoming").exists())
+
+    def test_unasked_and_unanswered_uploads_are_rejected_before_io(self):
+        handler = FakeHandler(b"")
+        self.assert_denied_before_io(handler)
+        handler = FakeHandler(b"")
+        handler.server.mochi_upload_permissions.begin(handler.client_address)
+        self.assert_denied_before_io(handler)
+
+    def test_declined_and_wrong_peer_uploads_are_rejected_before_io(self):
+        ask = FakeControl(accept=False)
+        ask.handle_ask()
+        self.assertEqual(ask.responses, [403])
+        self.assert_denied_before_io(FakeHandler(b"", server=ask.server))
+        ask = FakeControl()
+        ask.handle_ask()
+        self.assertEqual(ask.responses, [200])
+        self.assert_denied_before_io(FakeHandler(b"", server=ask.server, address=("fe80::2", 50000, 0, 2)))
+        original = FakeHandler(dvzip(member("photo.jpg", b"photo") + TRAILER), server=ask.server)
+        original.handle_upload()
+        self.assertEqual(original.responses, [200], "wrong peer must not consume another peer's grant")
+
+    def test_accepted_receive_and_replay(self):
+        ask = FakeControl()
+        ask.handle_ask()
+        handler = FakeHandler(dvzip(member("photo.jpg", b"photo") + TRAILER), server=ask.server,
+                              address=("fe80::1", 50001, 0, 2))
+        handler.headers["Expect"] = "100-continue"
+        handler.handle_upload()
+        self.assertEqual(handler.responses, [100, 200])
+        self.assertEqual((self.gallery / "photo.jpg").read_bytes(), b"photo")
+        replay = FakeHandler(b"", server=ask.server)
+        class Unreadable(io.BytesIO):
+            def readinto(self, *args):
+                raise AssertionError("replay read")
+        replay.rfile = Unreadable()
+        with patch.object(receive, "ReceiveWorkspace", side_effect=AssertionError("replayed workspace")):
+            replay.handle_upload()
+        self.assertEqual(replay.responses, [403])
+
+    def test_expired_accepted_upload_is_rejected_before_io(self):
+        now = [0]
+        server = SimpleNamespace(mochi_upload_permissions=receive.UploadPermissions(clock=lambda: now[0]))
+        ask = FakeControl(server=server)
+        ask.handle_ask()
+        now[0] = receive.UploadPermissions.TTL
+        self.assert_denied_before_io(FakeHandler(b"", server=server))
+
+    def test_declined_new_ask_revokes_previous_acceptance(self):
+        first = FakeControl()
+        first.handle_ask()
+        second = FakeControl(server=first.server, accept=False)
+        second.handle_ask()
+        self.assert_denied_before_io(FakeHandler(b"", server=first.server))
+
+    def test_malformed_new_ask_revokes_previous_acceptance(self):
+        first = FakeControl()
+        first.handle_ask()
+        second = FakeControl(server=first.server, body=b"malformed")
+        second.handle_ask()
+        self.assertEqual(second.responses, [400])
+        self.assert_denied_before_io(FakeHandler(b"", server=first.server))
+
+    def test_overlapping_same_peer_prompt_preserves_first_explicit_acceptance(self):
+        first = FakeControl()
+        second = FakeControl(server=first.server, accept=False)
+        def newer_request(body):
+            second.handle_ask()
+            return True
+        first._ask_user = newer_request
+        first.handle_ask()
+        self.assertEqual(second.responses, [503])
+        self.assertEqual(second.prompt_count, 0)
+        self.assertEqual(first.responses, [200])
+        handler = FakeHandler(dvzip(member("photo.jpg", b"photo") + TRAILER), server=first.server)
+        handler.handle_upload()
+        self.assertEqual(handler.responses, [200])
+        self.assertEqual((self.gallery / "photo.jpg").read_bytes(), b"photo")
+
+    def test_link_acceptance_does_not_authorize_files(self):
+        ask = FakeControl(body=plistlib.dumps({"Items": ["https://example.invalid/"]}))
+        with patch.dict(scope, open_url=lambda url: None):
+            ask.handle_ask()
+        self.assertEqual(ask.responses, [200])
+        self.assert_denied_before_io(FakeHandler(b"", server=ask.server))
+
+    def test_link_helpers_only_pass_safe_http_s_urls_to_the_opener(self):
+        unsafe = ["file:///etc/passwd", "javascript:alert(1)", "data:text/html,hi", "custom:run",
+                  "--help", "https://", "http:///missing-host", "https://example.invalid/\nfile:///etc/passwd",
+                  "https://example.invalid/\0bad", " https://example.invalid/", "https://[invalid/"]
+        safe = ["https://example.invalid/path?q=yes", "http://example.invalid/", "HTTPS://example.invalid/"]
+        items = scope["ask_items"]({"Items": unsafe + safe})
+        self.assertEqual(items, safe)
+        import subprocess
+        with patch.object(subprocess, "Popen") as popen, patch.dict(os.environ, AIRDROP_URL_HOOK="/test/url-opener"):
+            for url in unsafe:
+                scope["open_url"](url)
+            popen.assert_not_called()
+            for url in safe:
+                scope["open_url"](url)
+            self.assertEqual([call.args[0] for call in popen.call_args_list], [["/test/url-opener", url] for url in safe])
+        for url in unsafe:
+            ask = FakeControl(body=plistlib.dumps({"Items": [url]}, fmt=plistlib.FMT_BINARY))
+            ask.handle_ask()
+            self.assertEqual(ask.responses, [400])
+            self.assertEqual(ask.prompt_count, 0)
+
+    def test_missing_hook_and_malformed_ask_do_not_autoaccept(self):
+        ask = FakeControl()
+        ask._ask_user = scope["PatchedHandler"]._ask_user.__get__(ask)
+        with patch.dict(os.environ, {}, clear=True):
+            ask.handle_ask()
+        self.assertEqual(ask.responses, [403])
+        self.assert_denied_before_io(FakeHandler(b"", server=ask.server))
+        for body in (b"not a plist", plistlib.dumps([]), plistlib.dumps({"Files": "bad"}), plistlib.dumps({})):
+            ask = FakeControl(body=body)
+            ask.handle_ask()
+            self.assertEqual(ask.responses, [400])
+            self.assertEqual(ask.prompt_count, 0)
+            self.assert_denied_before_io(FakeHandler(b"", server=ask.server))
+
+    def test_ask_and_discover_return_413_for_fixed_and_chunked_oversize(self):
+        for path in ("/Ask", "/Discover"):
+            for chunked in (False, True):
+                with self.subTest(path=path, chunked=chunked):
+                    handler = FakeControl(path=path, body=b"UNREAD")
+                    handler.headers = Message()
+                    if chunked:
+                        handler.headers["Transfer-Encoding"] = "chunked"
+                        handler.rfile = io.BytesIO(f"{receive.CONTROL_BODY_LIMIT+1:x}\r\n".encode() + b"UNREAD")
+                    else:
+                        handler.headers["Content-Length"] = str(receive.CONTROL_BODY_LIMIT+1)
+                    handler.do_POST()
+                    self.assertEqual(handler.responses, [413])
+                    self.assertTrue(handler.close_connection)
+                    self.assertEqual(handler.prompt_count, 0)
+                    self.assertEqual(handler.rfile.read(), b"UNREAD")
+
+    def test_small_control_requests_and_duplicate_framing(self):
+        handler = FakeControl(path="/Discover")
+        handler.handle_discover()
+        self.assertEqual(handler.responses, [200])
+        for name in ("Content-Length", "Transfer-Encoding"):
+            handler = FakeControl()
+            handler.headers[name] = "1"
+            if name == "Transfer-Encoding":
+                handler.headers[name] = "chunked"
+            handler.handle_ask()
+            self.assertEqual(handler.responses, [400])
+            self.assertEqual(handler.rfile.tell(), 0)
+
+    def test_chunked_ask_acceptance_and_cumulative_413(self):
+        ask = FakeControl()
+        body = ask.rfile.read()
+        ask.headers = Message()
+        ask.headers["Transfer-Encoding"] = "chunked"
+        ask.rfile = io.BytesIO(f"{len(body):x};ext=yes\r\n".encode() + body + b"\r\n0\r\nX-Test: yes\r\n\r\n")
+        ask.handle_ask()
+        self.assertEqual(ask.responses, [200])
+        handler = FakeHandler(dvzip(member("photo.jpg", b"photo") + TRAILER), server=ask.server)
+        handler.handle_upload()
+        self.assertEqual(handler.responses, [200])
+        for path in ("/Ask", "/Discover"):
+            handler = FakeControl(path=path)
+            handler.headers = Message()
+            handler.headers["Transfer-Encoding"] = "chunked"
+            first = b"A" * receive.CONTROL_BODY_LIMIT
+            handler.rfile = io.BytesIO(f"{len(first):x}\r\n".encode() + first + b"\r\n1\r\nZ\r\n0\r\n\r\n")
+            handler.do_POST()
+            self.assertEqual(handler.responses, [413])
+            self.assertEqual(handler.rfile.read(1), b"Z")
+            self.assertEqual(handler.prompt_count, 0)
 
 
 if __name__ == "__main__":

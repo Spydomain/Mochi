@@ -67,6 +67,46 @@ test("the compact island retracts 2 s after the mouse leaves, uncovering tabs", 
   assert.equal(fsm.state, "hidden");
 });
 
+test("an active compact status cancels an already scheduled hide without pinning expanded", () => {
+  fsm.reveal();
+  seconds(1);
+  fsm.keepCompact = true;
+  seconds(600);
+  assert.equal(fsm.state, "petit");
+  fsm.openOnHover = true;
+  fsm.mouseEntered();
+  assert.equal(fsm.state, "home", "a transfer must not block hover opening");
+  fsm.mouseLeft();
+  seconds(fsm.hoverCloseDelay);
+  assert.equal(fsm.state, "petit", "expanded may fold normally during a transfer");
+  seconds(600);
+  assert.equal(fsm.state, "petit");
+});
+
+test("ending a compact status restarts normal hiding without repeated polling delaying it", () => {
+  fsm.keepCompact = true;
+  fsm.reveal();
+  seconds(600);
+  assert.equal(fsm.state, "petit");
+  fsm.keepCompact = false;
+  seconds(1);
+  fsm.keepCompact = false;
+  seconds(1);
+  assert.equal(fsm.state, "hidden");
+});
+
+test("ending a compact status under the pointer waits for a real leave", () => {
+  fsm.keepCompact = true;
+  fsm.reveal();
+  fsm.mouseEntered();
+  fsm.keepCompact = false;
+  seconds(600);
+  assert.equal(fsm.state, "petit");
+  fsm.mouseLeft();
+  seconds(2);
+  assert.equal(fsm.state, "hidden");
+});
+
 test("coming back before the compact hide cancels it", () => {
   fsm.mouseEntered();
   fsm.mouseLeft();

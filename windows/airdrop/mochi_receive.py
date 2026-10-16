@@ -9,13 +9,117 @@ from pathlib import Path, PurePosixPath
 import shutil
 import struct
 import tempfile
+import threading
 import time
 import zlib
 
+
+class RequestBodyTooLarge(ValueError):
+    pass
+
+
+CONTROL_BODY_LIMIT = 1024 * 1024
+
+
+class UploadPermissions:
+    """One expiring, single-use file upload grant per accepted peer address.
+
+    TCP source ports change between Ask and Upload. Include the IPv6 scope,
+    but not the source port. This binds consent to the network peer, not to a
+    claimed sender name (and does not authenticate devices sharing an address).
+    State belongs to one HTTP server and never survives a receiver restart.
+    """
+    TTL = 120
+    MAX_PEERS = 64
+
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.Lock()
+        self.entries = {}
+
+    @staticmethod
+    def peer(address):
+        return (address[0], address[3] if len(address) > 3 else 0)
+
+    def begin(self, address):
+        peer = self.peer(address)
+        with self.lock:
+            now = self.clock()
+            self.entries = {p: entry for p, entry in self.entries.items() if entry[2] > now}
+            # The shell hook rejects overlapping prompts with flock. Preserve
+            # the first pending ticket so that refusal cannot invalidate the
+            # explicit decision the user is still making for that request.
+            if peer in self.entries and not self.entries[peer][1]:
+                return None
+            if peer not in self.entries and len(self.entries) >= self.MAX_PEERS:
+                return None
+            ticket = object()
+            self.entries[peer] = (ticket, False, now + self.TTL)
+            return ticket
+
+    def accept(self, address, ticket):
+        peer = self.peer(address)
+        with self.lock:
+            entry = self.entries.get(peer)
+            now = self.clock()
+            if entry is None or entry[0] is not ticket or entry[2] <= now:
+                return False
+            self.entries[peer] = (ticket, True, now + self.TTL)
+            return True
+
+    def cancel(self, address, ticket):
+        peer = self.peer(address)
+        with self.lock:
+            entry = self.entries.get(peer)
+            if entry is not None and entry[0] is ticket:
+                del self.entries[peer]
+
+    def consume(self, address):
+        with self.lock:
+            entry = self.entries.get(self.peer(address))
+            if entry is None or not entry[1] or entry[2] <= self.clock():
+                return False
+            del self.entries[self.peer(address)]
+            return True
+
+
+def read_control_body(rfile, headers, limit=CONTROL_BODY_LIMIT):
+    """Bound both announced and cumulative bytes before parsing a plist."""
+    encoding = headers.get("Transfer-Encoding", headers.get("transfer-encoding", "")).lower()
+    length = headers.get("Content-Length", headers.get("content-length"))
+    if encoding:
+        if encoding != "chunked" or length is not None:
+            raise ValueError("ambiguous or unsupported request framing")
+        stream = HTTPChunkedReader(rfile, max_bytes=limit)
+        remaining = None
+    else:
+        word = "0" if length is None else length
+        if not word or not word.isascii() or not word.isdecimal():
+            raise ValueError("invalid Content-Length")
+        # Avoid converting an attacker-sized integer before the bound check.
+        word = word.lstrip("0") or "0"
+        if len(word) > len(str(limit)) or int(word) > limit:
+            raise RequestBodyTooLarge("request body exceeds limit")
+        remaining = int(word)
+        stream = rfile
+    body = bytearray()
+    while remaining is None or remaining:
+        block = stream.read(min(65536, remaining) if remaining is not None else 65536)
+        if not block:
+            if remaining:
+                raise ValueError("truncated request body")
+            break
+        body.extend(block)
+        if remaining is not None:
+            remaining -= len(block)
+    return bytes(body)
+
+
 class HTTPChunkedReader(io.RawIOBase):
     """Read chunk bodies incrementally, including chunk extensions/trailers."""
-    def __init__(self, rfile):
+    def __init__(self, rfile, max_bytes=None):
         self.rfile = rfile
+        self.max_bytes = max_bytes
         self.remaining = 0
         self.separator = False
         self.finished = False
@@ -37,6 +141,8 @@ class HTTPChunkedReader(io.RawIOBase):
             if not word or any(c not in b"0123456789abcdefABCDEF" for c in word):
                 raise ValueError("invalid HTTP chunk length")
             self.remaining = int(word, 16)
+            if self.max_bytes is not None and self.total + self.remaining > self.max_bytes:
+                raise RequestBodyTooLarge("request body exceeds limit")
             if not self.remaining:
                 for _ in range(128):
                     if self._line() == b"\r\n":
@@ -235,6 +341,7 @@ class ReceiveWorkspace:
         self.detector = DVZipEnd() if extension == "dvzip" else None
         self.directories = set()
         self.published = []
+        self.verified_files = {}
         self._progress()
 
     def _progress(self):
@@ -358,8 +465,35 @@ class ReceiveWorkspace:
                                 raise ValueError("truncated ODC file")
                             out.write(block)
                             remaining -= len(block)
+                    self.verified_files[str(target.relative_to(self.root))] = self._file_identity(target)
                 else:
                     raise ValueError("unsupported archive member type")
+
+    @staticmethod
+    def _file_identity(path):
+        info = path.lstat()
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def verified_file(self, name):
+        source = safe_member(self.root, name)
+        identity = self.verified_files.get(str(source.relative_to(self.root)))
+        return (identity is not None and not source.is_symlink() and source.is_file()
+                and self._file_identity(source) == identity)
+
+    def quarantine_partial(self, name):
+        """Keep partials outside the archive namespace; never replace a member."""
+        if self.verified_file(name):
+            return
+        source = safe_member(self.root, name)
+        if not source.is_file() or source.is_symlink():
+            return
+        partial = safe_member(self.directory / "partials", name)
+        partial.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        # The private recovery tree can contain conflicting normalized names.
+        # Use the same no-overwrite publication primitive as completed files.
+        publish_file(source, partial.parent)
+        # The enclosing `partials` namespace marks it as unfinished.
+        source.unlink()
 
     @property
     def has_user_directories(self):
@@ -383,8 +517,14 @@ class ReceiveWorkspace:
 
     def finish(self, complete, good):
         sidecars = []
+        seen = set()
         for name in good:
             source = safe_member(self.root, name)
+            if source in seen:
+                continue
+            seen.add(source)
+            if not self.verified_file(name):
+                raise ValueError("verified archive member changed before publication")
             if metadata(name):
                 if (source.suffix.lower() == ".aae" and source.is_file()
                         and not source.is_symlink()):

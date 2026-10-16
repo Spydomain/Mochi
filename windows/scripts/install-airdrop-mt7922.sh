@@ -4,6 +4,7 @@
 set -euo pipefail
 
 here="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$here/airdrop-install-common.sh"
 patches="$here/../airdrop/patches"
 data="${XDG_DATA_HOME:-$HOME/.local/share}/mochi"
 backend="$data/airdrop-mt7921"
@@ -37,10 +38,12 @@ for nic in "$net_root"/*; do
 done
 if (( !found )); then log 'No supported MT7922 (14c3:0616, mt7921e); radio installation skipped.'; exit 0; fi
 if ((check)); then log 'Supported MT7922 detected; one-shot receiver installation is available.'; exit 0; fi
+config="${AIRDROP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config}"
+confirm_hook="$data/bin/mochi-airdrop-confirm"
 if ((verify)); then
   bash "$here/install-airdrop-receiver.sh" "$owl/.venv-opendrop" --verify || die 'Streaming receiver verification failed.'
-  grep -Eq '^[[:space:]]*export[[:space:]]+MOCHI_AIRDROP_SERVICE_ID="[0-9a-f]{12}"[[:space:]]*$' \
-    "${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config" || die 'Persistent AirDrop identity is missing.'
+  airdrop_verify_consent "$config" "$confirm_hook" "$here/mochi-airdrop-confirm.sh" ||
+    die 'Receiver identity or matching executable consent hook verification failed.'
   [[ -x "$backend/daemon/airdropd" && -x "$owl/.venv-opendrop/bin/opendrop" &&
      -x /usr/local/bin/airdrop-helper && -x /usr/local/bin/airdrop-owl &&
      -x /usr/local/bin/airdrop-go-hostapd ]] || die 'MT7922 backend is incomplete.'
@@ -65,22 +68,12 @@ if ((verify)); then
     die 'A root-owned radio component is missing or stale.'
   grep -q 'application/x-dvzip' "$owl/.venv-opendrop/lib"/python*/site-packages/opendrop/server.py ||
     die 'OpenDrop is missing iPhone upload support.'
-  # The receiver silently declines every transfer when its confirm hook cannot
-  # ask anyone. Prove the hook is what the receiver will use. Its freshness is
-  # the setup script's job: it installs the hook AFTER this backend step.
-  confirm_hook="$data/bin/mochi-airdrop-confirm"
-  config="${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config"
-  effective="$( { printf 'AIRDROP_CONFIRM=%s\n' "$confirm_hook"; cat "$config"; } 2>/dev/null |
-    sed -n 's/^[[:space:]]*AIRDROP_CONFIRM="\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' | tail -1 )"
-  [[ "$effective" == "$confirm_hook" ]] ||
-    die "The AirDrop receiver would prompt with '$effective', not Mochi's island hook."
   exit 0
 fi
 [[ "$(id -u)" != 0 ]] || die 'Run as the desktop user, not root.'
 command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/null 2>&1 ||
   die 'The MT7922 receiver requires a running systemd user manager.'
-if systemctl --user is-active --quiet mochi-airdrop.service ||
-   ss -ltnH '( sport = :8771 )' | grep -q .; then
+if ! airdrop_install_lock || ! airdrop_require_idle; then
   die 'A receiver is active. Turn AirDrop off and wait for transfers before updating radio components.'
 fi
 for installed in /usr/local/bin/airdrop-helper /usr/local/bin/airdrop-ble-watch \
@@ -157,7 +150,6 @@ for name in opendrop-incomplete-response opendrop-verified-archive owl-ios26-act
 done
 
 # Never let the upstream installer's default 'exclusive' disconnect Wi-Fi.
-config="${XDG_CONFIG_HOME:-$HOME/.config}/airdrop/config"
 if [[ ! -e "$config" ]]; then
   install -d -m 700 "$(dirname "$config")"
   (umask 077; printf '%s\n' '# Mochi: keep the existing Wi-Fi station connected.' 'AIRDROP_MODE="${AIRDROP_MODE:-shared}"' > "$config")
@@ -167,22 +159,11 @@ fi
 # second with nothing shown anywhere, so every transfer was silently refused
 # while Mochi's island prompt sat unused. Point the receiver at Mochi's hook.
 # An AIRDROP_CONFIRM the user set themselves is left alone.
-confirm_hook="$data/bin/mochi-airdrop-confirm"
 [[ -x "$confirm_hook" ]] || die "Mochi's AirDrop consent hook is missing: $confirm_hook"
-if ! grep -q '^[[:space:]]*AIRDROP_CONFIRM=' "$config" 2>/dev/null; then
-  ( umask 077; printf '\n# Mochi: prompt the island, not a notification daemon.\nAIRDROP_CONFIRM="%s"\n' \
-    "$confirm_hook" >> "$config" )
-  log 'Configured the island consent hook in the receiver config.'
-fi
 # OpenDrop otherwise changes its advertised service ID on every restart. iOS
 # can retain the old entry as a second Mochi tile. Keep one 6-byte ID in the
 # existing per-user AirDrop config across both app and backend updates.
-if ! grep -Eq '^[[:space:]]*(export[[:space:]]+)?MOCHI_AIRDROP_SERVICE_ID=' "$config"; then
-  service_id="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
-  ( umask 077; printf '\nexport MOCHI_AIRDROP_SERVICE_ID="%s"\n' "$service_id" >> "$config" )
-elif ! grep -Eq '^[[:space:]]*export[[:space:]]+MOCHI_AIRDROP_SERVICE_ID=' "$config"; then
-  ( umask 077; printf '\nexport MOCHI_AIRDROP_SERVICE_ID\n' >> "$config" )
-fi
+airdrop_config normalize "$config" "$confirm_hook" || die 'Receiver config was preserved; review its consent hook and identity.'
 
 # Build the P2P-GO hostapd extension from a checksum-verified upstream source.
 # This never loads modules, brings up an interface or changes Wi-Fi settings.
@@ -200,10 +181,10 @@ if [[ ! -d "$hostapd" ]]; then
   rmdir -- "$staging"
   trap - EXIT
 fi
-if patch --batch -d "$hostapd" -p1 --dry-run --reverse < "$patches/hostapd-p2p-go-iftype.patch" >/dev/null 2>&1; then
+if patch --batch --forward --fuzz=0 -d "$hostapd" -p1 --dry-run --reverse < "$patches/hostapd-p2p-go-iftype.patch" >/dev/null 2>&1; then
   :
-elif patch --batch -d "$hostapd" -p1 --dry-run < "$patches/hostapd-p2p-go-iftype.patch" >/dev/null 2>&1; then
-  patch --batch -d "$hostapd" -p1 < "$patches/hostapd-p2p-go-iftype.patch"
+elif patch --batch --forward --fuzz=0 -d "$hostapd" -p1 --dry-run < "$patches/hostapd-p2p-go-iftype.patch" >/dev/null 2>&1; then
+  patch --batch --forward --fuzz=0 -d "$hostapd" -p1 < "$patches/hostapd-p2p-go-iftype.patch"
 else
   die "Unknown hostapd source changes in $hostapd; preserved."
 fi

@@ -549,12 +549,6 @@ function mediaCard(): HTMLElement {
   const active = players.find((p) => String(p.bus ?? "") === activeBus) ?? players[0];
   let selectedBus = String(active.bus ?? "");
   const selected = () => players.find((p) => String(p.bus ?? "") === selectedBus) ?? active;
-  const title = String(active.title ?? "");
-  const artist = String(active.artist ?? "");
-  const album = String(active.album ?? "");
-  const playing = active.playing === true;
-  const playLabel = playing ? "Pause playback" : "Play playback";
-  const canToggle = playing ? active.canPause !== false : active.canPlay !== false;
 
   // Custom picker: native selects can grow to the height of their popup on
   // Linux/WebKit, which used to push the transport row out of the card.
@@ -587,42 +581,54 @@ function mediaCard(): HTMLElement {
         e.stopPropagation();
         pickerOpen = false;
         pickerMenu.classList.remove("open");
-        pickerLabel.textContent = String(p.name ?? "Media");
         selectedBus = bus;
+        syncSelected();
         void Bridge.mediaSetPlayer(bus);
       },
     });
     pickerMenu.append(option);
   }
 
+  const title = h("span", { class: "np-title" });
+  const subtitle = h("span", { class: "np-sub" });
   const text = h(
     "div",
     { class: "media-track" },
-    h("span", { class: "np-title", text: title || "—" }),
-    h("span", { class: "np-sub", text: [artist, album, active.name].filter(Boolean).join(" · ") }),
+    title, subtitle,
   );
+
+  const playPause = h("button", {
+    class: "np-play", type: "button",
+    onclick: () => {
+      const p = selected();
+      const isPlaying = p.playing === true;
+      if ((isPlaying ? p.canPause : p.canPlay) !== false) {
+        void Bridge.mediaControl(isPlaying ? "pause" : "play", selectedBus);
+      }
+    },
+  });
+  function syncSelected() {
+    const p = selected();
+    const playing = p.playing === true;
+    const label = playing ? "Pause playback" : "Play playback";
+    pickerLabel.textContent = String(p.name ?? "Media");
+    title.textContent = String(p.title ?? "") || "—";
+    subtitle.textContent = [p.artist, p.album, p.name].filter(Boolean).join(" · ");
+    playPause.setAttribute("title", label);
+    playPause.setAttribute("aria-label", label);
+    if ((playing ? p.canPause : p.canPlay) === false) playPause.setAttribute("disabled", "");
+    else playPause.removeAttribute("disabled");
+    clear(playPause);
+    playPause.append(svg(playing ? ICONS.pause : ICONS.play, 11));
+  }
+  syncSelected();
 
   const controls = h(
     "div",
     { class: "np-buttons media-controls" },
     mediaButton(ICONS.backward, "Previous track",
       () => void Bridge.mediaControl("previous", selectedBus)),
-    h(
-      "button",
-      {
-        class: "np-play", type: "button", title: playLabel,
-        "aria-label": playLabel,
-        disabled: !canToggle,
-        onclick: () => {
-          const p = selected();
-          const isPlaying = p.playing === true;
-          if ((isPlaying ? p.canPause : p.canPlay) !== false) {
-            void Bridge.mediaControl(isPlaying ? "pause" : "play", selectedBus);
-          }
-        },
-      },
-      svg(playing ? ICONS.pause : ICONS.play, 11),
-    ),
+    playPause,
     mediaButton(ICONS.forward, "Next track",
       () => void Bridge.mediaControl("next", selectedBus)),
   );

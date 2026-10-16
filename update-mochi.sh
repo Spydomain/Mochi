@@ -65,7 +65,14 @@ fi
 git -C "$MOCHI_DIR" fetch --no-tags "$REPO_URL" "$branch" || die 'Could not fetch the update; the current app was left unchanged.'
 fetched_sha="$(git -C "$MOCHI_DIR" rev-parse FETCH_HEAD)"
 if git -C "$MOCHI_DIR" merge-base --is-ancestor "$fetched_sha" HEAD; then
-  log 'No updates available. Current Mochi installation unchanged.'
+  if [[ "$installed_sha" == "$local_sha" ]] && installation_complete; then
+    log 'No updates available. Current Mochi installation unchanged.'
+    exit 0
+  fi
+  log 'Local source is ahead of upstream, but its installation is incomplete. Reinstalling the local revision.'
+  "$MOCHI_DIR/mochi-full-setup.sh" || die 'Setup failed; the existing app was left as-is where possible.'
+  verify_install "$local_sha"
+  log 'Mochi installation repaired.'
   exit 0
 fi
 git -C "$MOCHI_DIR" merge-base --is-ancestor HEAD "$fetched_sha" ||

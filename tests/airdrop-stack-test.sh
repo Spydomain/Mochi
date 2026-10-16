@@ -65,24 +65,33 @@ opendrop_source="$(find "$installed_opendrop" -path '*/site-packages/opendrop/se
 if [[ -n "$opendrop_source" ]]; then
   mkdir -p "$tmp/opendrop/opendrop"
   cp "$opendrop_source" "$tmp/opendrop/opendrop/server.py"
+  security_patch="$patches/opendrop-receive-security.patch"
+  # Security overlaps workspace hunks, so unwind newest-first on this copy.
+  if patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
+      < "$security_patch" >/dev/null 2>&1; then
+    patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --reverse \
+      < "$security_patch" >/dev/null
+  fi
   # Restore the pre-workspace baseline to prove both overlay directions.
-  if patch --batch "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
+  if patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
       < "$patches/opendrop-receive-workspace.patch" >/dev/null 2>&1; then
-    patch --batch "$tmp/opendrop/opendrop/server.py" --reverse \
+    patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --reverse \
       < "$patches/opendrop-receive-workspace.patch" >/dev/null
   fi
   # An already-installed receiver carries this patch. Applying it twice would
   # reverse it, so accept whichever state the copy is actually in.
-  if ! patch --batch -d "$tmp/opendrop" -p1 --dry-run --reverse \
+  if ! patch --batch --forward --fuzz=0 -d "$tmp/opendrop" -p1 --dry-run --reverse \
       < "$patches/opendrop-verified-archive.patch" >/dev/null 2>&1; then
-    patch --batch -d "$tmp/opendrop" -p1 < "$patches/opendrop-verified-archive.patch" >/dev/null
+    patch --batch --forward --fuzz=0 -d "$tmp/opendrop" -p1 < "$patches/opendrop-verified-archive.patch" >/dev/null
   fi
   python3 "$repo/tests/opendrop-archive-test.py" "$tmp/opendrop/opendrop/server.py"
-  patch --batch "$tmp/opendrop/opendrop/server.py" < "$patches/opendrop-receive-workspace.patch" >/dev/null
-  patch --batch "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" < "$patches/opendrop-receive-workspace.patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
       < "$patches/opendrop-receive-workspace.patch" >/dev/null
   python3 "$repo/tests/opendrop-archive-test.py" "$tmp/opendrop/opendrop/server.py"
-  "$installed_opendrop/bin/python" "$repo/tests/airdrop-receive-test.py" "$tmp/opendrop/opendrop/server.py"
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" < "$security_patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$security_patch" >/dev/null
+  "$installed_opendrop/bin/python" "$repo/tests/airdrop-receive-test.py" "$tmp/opendrop/opendrop/server.py" --no-network
   cp "$(dirname "$opendrop_source")/config.py" "$tmp/opendrop/opendrop/config.py"
   identity_patch="$patches/opendrop-stable-service-id.patch"
   if patch --batch --forward -d "$tmp/opendrop/opendrop" -p1 --fuzz=0 --dry-run --reverse \
@@ -97,8 +106,8 @@ if [[ -n "${MOCHI_TEST_HOSTAPD_TARBALL:-}" ]]; then
   printf '%s  %s\n' '2b3facb632fd4f65e32f4bf82a76b4b72c501f995a4f62e330219fe7aed1747a' \
     "$MOCHI_TEST_HOSTAPD_TARBALL" | sha256sum -c --status
   tar -xzf "$MOCHI_TEST_HOSTAPD_TARBALL" -C "$tmp"
-  patch --batch -d "$tmp/hostapd-2.11" -p1 < "$patches/hostapd-p2p-go-iftype.patch"
-  patch --batch -d "$tmp/hostapd-2.11" -p1 --dry-run --reverse \
+  patch --batch --forward --fuzz=0 -d "$tmp/hostapd-2.11" -p1 < "$patches/hostapd-p2p-go-iftype.patch"
+  patch --batch --forward --fuzz=0 -d "$tmp/hostapd-2.11" -p1 --dry-run --reverse \
     < "$patches/hostapd-p2p-go-iftype.patch" >/dev/null
 fi
 printf 'MT7922 hardware gates and clean-source patch reproduction passed.\n'

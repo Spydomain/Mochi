@@ -2,9 +2,18 @@
 
 Mochi is a Linux-first, Dynamic Island-style desktop companion built with Tauri, Rust, and TypeScript. Its compact top-edge capsule brings OpenCode and coding-agent activity, MPRIS media controls, battery status, time, and weather together without taking over your desktop. On supported MediaTek MT7922 hardware, an experimental AirDrop/AWDL receiver can accept iPhone transfers with explicit consent. The repository also contains Windows and Apple-platform source.
 
-![Mochi opening from its compact capsule on Linux](docs/media/mochi-demo.gif)
+![Mochi opening its clock and weather card, then receiving an iPhone AirDrop](docs/media/mochi-demo.gif)
 
-*Live capture from the Linux app. [Watch the short MP4 demo](docs/media/mochi-demo.mp4). The main setup path below builds Mochi locally; this repository also contains Windows and Apple-platform source.*
+*Recorded from the running Linux build on October 16, 2026: hover opening, Clock with weather, an actual iPhone consent prompt, the compact transfer indicator, and completion. Pauses between excerpts are removed; no audio or file contents are included. [Watch the short MP4 demo](docs/media/mochi-demo.mp4).*
+
+## Documentation
+
+| Guide | Purpose |
+| --- | --- |
+| [Linux installation](#install-on-linux) | Automated setup, autostart, updates, and everyday use. |
+| [Desktop development and Windows](windows/README.md) | Shared client architecture, source builds, testing, and packaging. |
+| [Linux AirDrop](windows/airdrop/README.md) | Hardware requirements, consent, recovery, diagnostics, and pinned source bundles. |
+| [Optional iPhone relay](relay/README.md) | Self-hosted Apple Live Activity integration; unrelated to AirDrop. |
 
 ## What Mochi does
 
@@ -19,15 +28,17 @@ The four small companion pills are configurable in Settings. The capsule retract
 
 ### Screenshots and video
 
-| Overview | Wardrobe |
+| Clock and weather | Incoming AirDrop |
 | --- | --- |
-| ![Mochi overview with companion pills](docs/media/mochi-overview.png) | ![Mochi wardrobe with optional outfits](docs/media/mochi-wardrobe.png) |
+| ![Mochi's Clock card with Kathmandu weather, four companion pills, battery status, AirDrop, and Awake](docs/media/mochi-overview.png) | ![An actual incoming iPhone photo request with explicit Decline and Accept buttons](docs/media/mochi-airdrop-request.png) |
 
-*These are captures from a running Linux session. Other platforms and desktop themes may look different.*
+*Actual desktop captures, cropped to Mochi. Weather stays behind the Clock card. Other platforms and desktop themes may look different.*
 
-![Mochi expanding from the Linux desktop edge](docs/media/mochi-demo.gif)
+![Mochi's compact AirDrop indicator showing successful receipt](docs/media/mochi-airdrop-received.png)
 
-[Watch the Linux demo video (MP4)](docs/media/mochi-demo.mp4) · [View the overview screenshot](docs/media/mochi-overview.png) · [View the wardrobe screenshot](docs/media/mochi-wardrobe.png). These captures show the general interface, **not** a verified AirDrop transfer or its progress ring.
+[Watch the Linux demo video (MP4)](docs/media/mochi-demo.mp4) · [View the overview](docs/media/mochi-overview.png) · [View the consent prompt](docs/media/mochi-airdrop-request.png).
+
+The recorded iPhone → Mochi test received a 2.17 MB photo. The receiver verified the archive trailer, extracted the photo, and returned HTTP 200 before reporting success. This demonstrates receiving on the development machine, not universal hardware compatibility or verified sending to an iPhone. Requests need an explicit **Accept**; unanswered prompts expire after 15 seconds.
 
 ## Install on Linux
 
@@ -42,6 +53,12 @@ cd Mochi
 
 Setup installs the required distro packages, Node.js 24 LTS locally if the existing Node is unsuitable, Rust, OpenCode v2 if needed, the app, and its hook. It runs the frontend tests before installing the release build. The first run downloads dependencies and can take several minutes. Review the script and its upstream installers before running it.
 
+| Setup option | Effect |
+| --- | --- |
+| `--check` | Inspect the environment without installing or launching. A nonzero exit can indicate missing prerequisites. |
+| `--no-launch` | Install and configure autostart without immediately launching Mochi. |
+| `--no-airdrop` | Skip optional MT7922 radio provisioning; the desktop app still installs. |
+
 On Niri, setup enables a user `systemd` service for graphical login. On other desktops it writes an XDG autostart entry. It also configures a daily timer—or a login-time fallback without user `systemd`—to remove **Mochi chat sessions** older than 30 days without deleting other OpenCode work. Setup keeps your local Git checkout and existing preferences, while setting autostart, hover opening, English, and OpenCode as its defaults. It does not reset or pull the repository. Use `./mochi-full-setup.sh --no-launch` if you want to install without starting the app immediately.
 
 ### Update
@@ -50,7 +67,7 @@ On Niri, setup enables a user `systemd` service for graphical login. On other de
 ./update-mochi.sh
 ```
 
-The updater checks this repository's default branch. It leaves an up-to-date, complete installation unchanged, fast-forwards a clean checkout when a new commit exists, and rebuilds through the same setup script. If a previous installation stopped partway through or its relay, cleanup script, AirDrop consent hook, or supported MT7922 backend is missing or outdated, it retries setup. It refuses to overwrite local edits or merge divergent histories; commit or stash your changes first.
+The updater checks this repository's default branch. It leaves an up-to-date, complete installation unchanged, fast-forwards a clean checkout when a new commit exists, and rebuilds through the same setup script. If a previous installation stopped partway through or its relay, cleanup script, AirDrop consent hook, or supported MT7922 backend is missing or outdated, it retries setup. A verified, running AirDrop receiver stays up while the app updates; if its backend needs replacing, finish the transfer and turn AirDrop off before retrying instead of updating a live radio. It refuses to overwrite local edits or merge divergent histories; commit or stash your changes first.
 
 ### Check the running app
 
@@ -84,7 +101,9 @@ The backend lives under `~/.local/share/mochi/airdrop-mt7921`. To send **to** Mo
 
 On the MT7922 route, an incoming transfer opens a full-island **Accept / Decline** prompt showing the sender and item. Mochi accepts only an explicit click; if the app is unavailable or nobody answers within 15 seconds, the backend declines. After acceptance, the compact island shows a transfer ring for as long as the upload is running; it shows a check only for a fully extracted file and an exclamation mark for an incomplete one. The receiver runs as a separate systemd user service, so closing or restarting the Mochi UI does not stop an opted-in radio session; use **Turn off** to stop it. Logout still ends the user service. Open **Settings → AirDrop (Linux)** to set the advertised device name and an existing, user-owned absolute folder for received files. Leave the folder field empty for `~/Downloads`. Turn AirDrop off and on to apply changes. The optional Omdrop/USB route uses its own receiver and consent flow; the custom name and folder controls currently apply only to MT7922.
 
-The compact ring fills from **measured upload bytes** against the sender's declared size, and is capped at 99% until the receiver verifies extraction — it never claims completion on a byte count alone. Success is decided by the parsed archive trailer and intact extracted files, not by comparing sizes: for iOS 26's compressed dvzip, `TotalBytes` describes the decoded archive while the bytes on disk are compressed, so a size comparison alone once reported a complete transfer as failed. A transfer that really is truncated stays a failure, and whatever was recovered is kept with a `.partial` suffix. The shared MT7922 radio link can stall mid-transfer; send smaller files until you have measured a reliable large one.
+The compact ring uses **measured upload bytes** against the sender's declared size and is capped at 99% until extraction is verified. A byte count alone never means success: compressed iOS dvzip payloads and the declared decoded archive size can differ. Uploads are staged privately; only complete user files are published into the selected save folder. If a transfer is truncated, complete members may be recovered, but the transfer still reports failure and remaining work data stays in private recovery storage. The timeout measures five minutes of inactivity, not total transfer duration. The shared MT7922 radio link can still stall; start with a small file before relying on larger transfers.
+
+For storage paths, safe recovery of older `.dvzip` / `.partial` artifacts, verification commands, and maintainer notes, see the [Linux AirDrop guide](windows/airdrop/README.md).
 
 ### Other Linux Wi-Fi adapters (Omdrop)
 
@@ -135,6 +154,8 @@ playerctl metadata
 | Media controls do nothing | Start eligible media and confirm the browser or app appears in `playerctl -l`. |
 | Locate me names no new city | Check desktop location permission and GeoClue accuracy; use Find city if the only fix is coarse. |
 | Chat reports a local connection error | Check `opencode service status`, then try `opencode service start`. |
+| An AirDrop request is declined automatically | Answer the island's consent prompt within 15 seconds. If no prompt appears, check the app and receiver logs; never enable blanket acceptance as a workaround. |
+| An AirDrop upload is incomplete | Leave the originals on the iPhone, retry a small file, and inspect the [recovery and diagnostics guide](windows/airdrop/README.md#storage-and-recovery). |
 | Awake is off but the laptop has not suspended | Awake off releases Mochi's idle inhibitor; your desktop's screen-off and suspend timeouts still apply. Check those timeouts and other apps' inhibitors before reporting a regression. |
 
 ## Report a bug
@@ -156,6 +177,8 @@ npm test
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
+
+For prerequisites, development servers, checkout-move recovery, and platform packaging, use the [desktop development guide](windows/README.md). Documentation and screenshots describe the checked source and observed Linux behavior, not a certification that every distribution, browser, or adapter has been tested.
 
 ## License
 

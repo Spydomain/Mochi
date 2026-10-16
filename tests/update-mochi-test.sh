@@ -19,7 +19,7 @@ chmod 755 "$test_dir/work/mochi-full-setup.sh"
 git -C "$test_dir/work" add .
 git -C "$test_dir/work" commit --quiet -m initial
 git -C "$test_dir/work" remote add origin "$test_dir/remote.git"
-git -C "$test_dir/work" push --quiet origin main
+git -C "$test_dir/remote.git" fetch --quiet "$test_dir/work" main:main
 
 export MOCHI_UPDATE_REMOTE="$test_dir/remote.git"
 export MOCHI_TEST_MARKER="$test_dir/installed.log"
@@ -42,7 +42,7 @@ git -C "$test_dir/publisher" config user.email 'test@example.invalid'
 printf 'new upstream commit\n' > "$test_dir/publisher/CHANGELOG-test"
 git -C "$test_dir/publisher" add .
 git -C "$test_dir/publisher" commit --quiet -m update
-git -C "$test_dir/publisher" push --quiet origin main
+git -C "$test_dir/remote.git" fetch --quiet "$test_dir/publisher" main:main
 
 # Local edits must survive an available upstream update unchanged.
 printf 'keep me\n' > "$test_dir/work/local-note"
@@ -90,7 +90,7 @@ test -x "$XDG_DATA_HOME/mochi/bin/mochi-hook"
 printf 'second upstream commit\n' > "$test_dir/publisher/CHANGELOG-test"
 git -C "$test_dir/publisher" add .
 git -C "$test_dir/publisher" commit --quiet -m second-update
-git -C "$test_dir/publisher" push --quiet origin main
+git -C "$test_dir/remote.git" fetch --quiet "$test_dir/publisher" main:main
 before_install="$(< "$XDG_DATA_HOME/mochi/installed-revision")"
 if MOCHI_TEST_FAIL_SETUP=1 "$test_dir/work/update-mochi.sh" > "$test_dir/failed-setup.log" 2>&1; then
   printf 'Updater accepted a failed setup.\n' >&2
@@ -100,4 +100,26 @@ fi
 "$test_dir/work/update-mochi.sh" > "$test_dir/recovered.log"
 [[ "$(wc -l < "$MOCHI_TEST_MARKER")" -eq 5 ]]
 [[ "$(< "$XDG_DATA_HOME/mochi/installed-revision")" == "$(git -C "$test_dir/work" rev-parse HEAD)" ]]
-printf 'Updater no-change, dirty-checkout, repair, failed-setup recovery and repeat checks passed.\n'
+# Local commits ahead of upstream must not prevent repair or alter history.
+printf 'local commit\n' > "$test_dir/work/local-committed"
+git -C "$test_dir/work" add local-committed
+git -C "$test_dir/work" commit --quiet -m local
+ahead="$(git -C "$test_dir/work" rev-parse HEAD)"
+rm -- "$XDG_DATA_HOME/mochi/installed-revision"
+"$test_dir/work/update-mochi.sh" > "$test_dir/ahead-repair.log"
+[[ "$(wc -l < "$MOCHI_TEST_MARKER")" -eq 6 ]]
+[[ "$(git -C "$test_dir/work" rev-parse HEAD)" == "$ahead" ]]
+[[ "$(< "$XDG_DATA_HOME/mochi/installed-revision")" == "$ahead" ]]
+"$test_dir/work/update-mochi.sh" > "$test_dir/ahead-repeat.log"
+[[ "$(wc -l < "$MOCHI_TEST_MARKER")" -eq 6 ]]
+rm -- "$XDG_DATA_HOME/mochi/bin/mochi-hook"
+"$test_dir/work/update-mochi.sh" > "$test_dir/ahead-relay.log"
+[[ "$(wc -l < "$MOCHI_TEST_MARKER")" -eq 7 ]]
+printf 'dirty ahead checkout\n' > "$test_dir/work/local-note"
+if "$test_dir/work/update-mochi.sh" > "$test_dir/ahead-dirty.log" 2>&1; then
+  printf 'Updater accepted dirty local-ahead source.\n' >&2
+  exit 1
+fi
+[[ "$(wc -l < "$MOCHI_TEST_MARKER")" -eq 7 ]]
+[[ "$(< "$test_dir/work/local-note")" == 'dirty ahead checkout' ]]
+printf 'Updater no-change, dirty-checkout, repair, failed-setup recovery, local-ahead and repeat checks passed.\n'
