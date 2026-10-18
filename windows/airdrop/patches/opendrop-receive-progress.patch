@@ -1,0 +1,28 @@
+--- a/server.py
++++ b/server.py
+@@ -555,7 +555,8 @@
+ 
+         logger.info("Receiving file(s) ...")
+         start = time.time()
+-        storage = ReceiveWorkspace(os.getcwd(), "dvzip" if "dvzip" in content_type else "cpio")
++        storage = ReceiveWorkspace(os.getcwd(), "dvzip" if "dvzip" in content_type else "cpio",
++                                   total_bytes=self.headers.get("TotalBytes"))
+         raw_path = str(storage.raw_path)
+         reader = HTTPChunkedReader(self.rfile)
+         # Upload inactivity is independent of the short request-header timeout.
+@@ -585,6 +586,7 @@
+             finally:
+                 raw.flush()
+                 os.fsync(raw.fileno())
++        storage.set_phase("verifying")
+ 
+         def odc_members(cpio):
+             """(name, data_is_complete, is_regular) for each ODC cpio member.
+@@ -731,6 +733,7 @@
+             f"File(s) {'received' if complete else 'incomplete'} "
+             f"(size {transferred:.02f} MB, speed {speed:.02f} MB/s)"
+         )
++        storage.set_phase("complete" if complete else "failed")
+         self.send_response(200 if complete else 500)
+         self.send_header("Content-Length", 0)
+         self.send_header("Connection", "close")

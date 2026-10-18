@@ -1,0 +1,127 @@
+--- a/client.py
++++ b/client.py
+@@ -305,9 +305,9 @@
+                 file_name = os.path.basename(file)
+                 file_entry = {
+                     "FileName": file_name,
+-                    "FileType": AirDropUtil.get_uti_type(entry_flp),
++                    "FileType": AirDropUtil.get_uti_type(entry_flp, file),
+                     "FileBomPath": os.path.join(".", file_name),
+-                    "FileIsDirectory": os.path.isdir(file_name),
++                    "FileIsDirectory": os.path.isdir(file),
+                     "ConvertMediaFormats": 0,
+                 }
+                 yield file_entry
+@@ -323,7 +323,13 @@
+             with open(file_path[0], "rb") as f:
+                 first_flp = fleep.get(f.read(128))
+                 if not icon and len(first_flp.mime) > 0 and "image" in first_flp.mime[0]:
+-                    icon = AirDropUtil.generate_file_icon(f.name)
++                    try:
++                        icon = AirDropUtil.generate_file_icon(f.name)
++                    except Exception:
++                        # A preview is optional. HEIC/RAW/WebP or unusual PNG
++                        # modes may lack a local decoder/encoder. Still send
++                        # the original file unchanged, without a thumbnail.
++                        logger.warning("Image preview unavailable; sending the original file without a thumbnail")
+             ask_body["Files"] = [e for e in file_entries(file_path)]
+         if icon:
+             ask_body["FileIcon"] = icon
+--- a/util.py
++++ b/util.py
+@@ -19,6 +19,7 @@
+ 
+ import io
+ import ipaddress
++import mimetypes
+ import os
+ 
+ import ifaddr
+@@ -45,20 +46,64 @@
+     """
+ 
+     @staticmethod
+-    def get_uti_type(flp) -> str:
++    def get_uti_type(flp, file_path=None) -> str:
+         """
+         Get the Apple conform UTI Type from a flp instance which has been used on the data which should be sent
+ 
+         :param flp: fleep object
+         """
+ 
+-        # Default UTI Type
+-        uti_type = "public.content"
+-        if len(flp.mime) == 0 or len(flp.type) == 0:
+-            return uti_type
+-
+-        mime = flp.mime[0]
+-        f_type = flp.type[0]
++        # Sniffed content wins; extensions help with formats without a magic
++        # signature (text, Office). Unknown and extensionless files are data,
++        # not errors. These types guide the phone's destination, not filtering.
++        mime = flp.mime[0] if flp.mime else (mimetypes.guess_type(file_path)[0] if file_path else None)
++        mime = mime or "application/octet-stream"
++        # fleep can list PostScript before PDF, or Excel for shared OLE and
++        # OOXML signatures. Resolve Office containers by extension without
++        # reading beyond the bounded sniff or changing uploaded contents.
++        if "application/pdf" in flp.mime:
++            mime = "application/pdf"
++        if file_path:
++            office = {
++                ".doc": "application/msword",
++                ".xls": "application/vnd.ms-excel",
++                ".ppt": "application/vnd.ms-powerpoint",
++                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
++                ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++                ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
++            }
++            if mime in ("application/zip", "application/x-zip-compressed") or mime in office.values():
++                mime = office.get(os.path.splitext(file_path)[1].lower(), mime)
++        f_type = flp.type[0] if flp.type else mime.split("/", 1)[0]
++        known = {
++            "application/pdf": "com.adobe.pdf",
++            "text/plain": "public.plain-text",
++            "text/csv": "public.comma-separated-values-text",
++            "text/html": "public.html",
++            "application/json": "public.json",
++            "application/rtf": "public.rtf",
++            "text/rtf": "public.rtf",
++            "application/msword": "com.microsoft.word.doc",
++            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "org.openxmlformats.wordprocessingml.document",
++            "application/vnd.ms-excel": "com.microsoft.excel.xls",
++            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "org.openxmlformats.spreadsheetml.sheet",
++            "application/vnd.ms-powerpoint": "com.microsoft.powerpoint.ppt",
++            "application/vnd.openxmlformats-officedocument.presentationml.presentation": "org.openxmlformats.presentationml.presentation",
++            "image/jpeg": "public.jpeg",
++            "image/heic": "public.heic",
++            "image/heif": "public.heif",
++            "image/tiff": "public.tiff",
++            "image/webp": "org.webmproject.webp",
++            "video/mp4": "public.mpeg-4",
++            "video/quicktime": "com.apple.quicktime-movie",
++            "audio/mpeg": "public.mp3",
++            "audio/mp4": "public.mpeg-4-audio",
++            "application/gzip": "org.gnu.gnu-zip-archive",
++            "application/x-gzip": "org.gnu.gnu-zip-archive",
++        }
++        if mime in known:
++            return known[mime]
++        uti_type = "public.data"
+         if "image" in mime:
+             uti_type = "public.image"
+ 
+@@ -76,12 +121,12 @@
+             uti_type = "public.audio"
+         elif "video" in f_type:
+             uti_type = "public.video"
+-        elif "archive" in f_type:
++        elif "archive" in f_type or mime in ("application/zip", "application/x-zip-compressed"):
+             uti_type = "public.data"
+ 
+             if "gzip" in mime:
+                 uti_type = "org.gnu.gnu-zip-archive"
+-            if "zip" in mime:
++            elif "zip" in mime:
+                 uti_type = "public.zip-archive"
+ 
+         return uti_type

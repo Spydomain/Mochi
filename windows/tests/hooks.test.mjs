@@ -29,6 +29,7 @@ beforeEach(() => {
   asked = [];
   calls.length = 0;
   State.tasks = [];
+  State.agentSessions.clear();
   State.focusId = null;
   State.mode = "hidden";
   State.view = "overview";
@@ -87,6 +88,20 @@ test("a work event leaves an island that is already showing where it is", () => 
   State.mode = "compact";
   hook({ hook_event_name: "SessionStart", cwd: "/p" });
   assert.deepEqual(asked, []);
+});
+
+test("agent completion and errors do not replace an open AirDrop workflow", () => {
+  for (const event of ["Stop", "StopFailure"]) {
+    hook({ hook_event_name: "SessionStart", cwd: "/p" });
+    State.focusId = CLAUDE;
+    State.mode = "expanded";
+    State.view = "airdrop";
+    asked = [];
+    hook({ hook_event_name: event, cwd: "/p" });
+    assert.deepEqual(asked, []);
+    assert.equal(State.view, "airdrop");
+    assert.equal(task().state, event === "Stop" ? "finished" : "error");
+  }
 });
 
 test("a submitted prompt shows as thinking, with the prompt as the step", () => {
@@ -205,6 +220,45 @@ test("a new turn within 5.2 s of a stop is not put back to idle", () => {
 });
 
 // ── Other agents ──────────────────────────────────────────────────────────────
+
+test("late Codex and OpenCode tool events never revive a stopped turn, even after its pill disappears", () => {
+  for (const agent of ["codex", "opencode"]) {
+    const id = `agent_${agent}`;
+    const send = event => hook({ hook_event_name: event, mochi_agent: agent, session_id: `${agent}-ended` });
+    send("UserPromptSubmit"); send("PreToolUse"); send("Stop");
+    for (const event of ["PostToolUse", "PostToolUseFailure", "PreToolUse"]) send(event);
+    assert.equal(task(id).state, "finished");
+    seconds(5.2);
+    assert.equal(task(id), undefined);
+    send("PostToolUse"); send("PreToolUse");
+    assert.equal(task(id), undefined);
+    send("UserPromptSubmit"); send("PreToolUse");
+    assert.equal(task(id).state, "working", "a real next turn still starts normally");
+    send("Interrupt"); send("PostToolUse");
+    assert.equal(task(id).state, "idle");
+  }
+});
+
+test("one agent session finishing never idles or removes another active session", () => {
+  for (const agent of ["codex", "opencode"]) {
+    const id = `agent_${agent}`;
+    const send = (event, session) => hook({ hook_event_name: event, mochi_agent: agent, session_id: session, cwd: `/${session}` });
+    send("UserPromptSubmit", "first"); send("PreToolUse", "first");
+    send("UserPromptSubmit", "second");
+    send("Stop", "first");
+    assert.equal(task(id).state, "thinking");
+    assert.equal(task(id).sessionId, "second");
+    assert.equal(task(id).sessionCwd, "/second");
+    seconds(6);
+    assert.equal(task(id).state, "thinking");
+    send("PostToolUse", "first");
+    assert.equal(task(id).state, "thinking");
+    send("Stop", "second");
+    assert.equal(task(id).state, "finished");
+    seconds(5.2);
+    assert.equal(task(id), undefined);
+  }
+});
 
 test("a tagged agent gets its own pill next to Claude Code's", () => {
   hook({ hook_event_name: "PreToolUse", cwd: "/p/proj", mochi_agent: "gemini", tool_name: "Bash", tool_input: { command: "ls" } });

@@ -518,10 +518,22 @@ async fn airdrop_send(mac: String) -> Result<String, String> {
     airdrop::send(mac).await
 }
 
+#[tauri::command]
+fn airdrop_discovery() -> airdrop::Discovery { airdrop::discovery() }
+
+#[tauri::command]
+async fn airdrop_discovery_set(enabled: bool) -> Result<airdrop::Discovery, String> {
+    airdrop::discovery_set(enabled).await
+}
+
+#[tauri::command]
+fn airdrop_outbound() -> Option<airdrop::Outbound> { airdrop::outbound() }
+
 /// Tray → Pause. Paused means paused: the pollers stop talking to the network,
 /// not just the island stopping showing things.
 #[tauri::command]
 fn set_paused(paused: bool) {
+    if paused { tauri::async_runtime::spawn(async { let _ = airdrop::discovery_set(false).await; }); }
     integrations::set_paused(paused);
 }
 
@@ -973,6 +985,9 @@ pub fn run() {
             airdrop_save_preferences,
             airdrop_peers,
             airdrop_send,
+            airdrop_discovery,
+            airdrop_discovery_set,
+            airdrop_outbound,
             hooks_status,
             agent_hooks_status,
             hooks_preview,

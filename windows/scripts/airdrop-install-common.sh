@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 # Shared installer helpers. Sourcing this file does not inspect or change a radio.
 
+airdrop_require_app_idle() {
+  # The independent receiver survives UI updates, but a sender/chooser belongs
+  # to the app. Do not restart that app while one of its workflows is active.
+  # An explicit proc root is used only by isolated fixture tests.
+  local data="$1" proc="${2:-/proc}" entry arg sender picker sending
+  local -a args
+  for entry in "$proc"/[0-9]*/cmdline; do
+    [[ -r "$entry" && -O "${entry%/cmdline}" ]] || continue
+    args=()
+    mapfile -d '' -t args < "$entry" 2>/dev/null || continue
+    sender=0 picker=0 sending=0
+    for arg in "${args[@]}"; do
+      case "$arg" in
+        "$data/bin/mochi-airdrop-pick"|"$data/bin/mochi-airdrop-send"|"$data/omdrop-plugin/bin/pick.py") picker=1 ;;
+        "$data/owl/.venv-opendrop/bin/opendrop"|"$data/omdrop-plugin/bin/omdrop"|"$HOME/.local/bin/omdrop") sender=1 ;;
+        send) sending=1 ;;
+      esac
+    done
+    if ((picker || (sender && sending))); then
+      printf 'Finish AirDrop sending or file selection before updating Mochi; the running app was left alone.\n' >&2
+      return 1
+    fi
+  done
+}
+
 airdrop_install_lock() {
   local rundir="${XDG_RUNTIME_DIR:-/tmp}/airdropd" lock inherited fd previous_umask
   lock="$rundir/lock"

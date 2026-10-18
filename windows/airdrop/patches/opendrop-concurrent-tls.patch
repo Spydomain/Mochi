@@ -1,0 +1,54 @@
+--- a/server.py
++++ b/server.py
+@@ -239,7 +239,7 @@
+         except OSError as exc:
+             logger.warning(f"Could not enlarge the receive buffer ({exc})")
+         httpd.socket = self.config.get_ssl_context().wrap_socket(
+-            sock=httpd.socket, server_side=True
++            sock=httpd.socket, server_side=True, do_handshake_on_connect=False
+         )
+ 
+         return httpd
+@@ -278,6 +278,42 @@
+ 
+     address_family = socket.AF_INET6
+     daemon_threads = True
++    MAX_TLS_HANDSHAKES = 8
++    TLS_HANDSHAKE_TIMEOUT = 30
++
++    def __init__(self, *args, **kwargs):
++        self._tls_slots = threading.BoundedSemaphore(self.MAX_TLS_HANDSHAKES)
++        super().__init__(*args, **kwargs)
++
++    def process_request(self, request, client_address):
++        # TLS must run AFTER accept returns, in its own worker. An idle
++        # preconnection otherwise blocks every subsequent Discover/Ask even
++        # with ThreadingHTTPServer: SSLSocket.accept handshakes synchronously.
++        # Bound unfinished handshakes, not uploads or the user's consent wait.
++        if not self._tls_slots.acquire(blocking=False):
++            self.shutdown_request(request)
++            return
++        try:
++            super().process_request(request, client_address)
++        except BaseException:
++            self._tls_slots.release()
++            raise
++
++    def process_request_thread(self, request, client_address):
++        try:
++            previous_timeout = request.gettimeout()
++            request.settimeout(self.TLS_HANDSHAKE_TIMEOUT)
++            request.do_handshake()
++            request.settimeout(previous_timeout)
++        except OSError as exc:
++            logger.debug("AirDrop TLS handshake did not complete (%s)", type(exc).__name__)
++            self.shutdown_request(request)
++            return
++        finally:
++            self._tls_slots.release()
++        # Normal handler timeouts and explicit consent still apply. The
++        # handshake limit is released before any prompt or upload begins.
++        super().process_request_thread(request, client_address)
+ 
+ 
+ class AirDropServerHandler(BaseHTTPRequestHandler):

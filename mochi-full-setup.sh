@@ -29,6 +29,7 @@ PLUGIN_FILE="$CONFIG_HOME/opencode/plugins/mochi.js"
 HOOK_FILE="$DATA_HOME/mochi/bin/mochi-hook"
 CLEANUP_FILE="$DATA_HOME/mochi/bin/cleanup-opencode-sessions"
 AIRDROP_CONFIRM_FILE="$DATA_HOME/mochi/bin/mochi-airdrop-confirm"
+AIRDROP_PICKER_FILE="$DATA_HOME/mochi/bin/mochi-airdrop-pick"
 SYSTEMD_DIR="$CONFIG_HOME/systemd/user"
 AUTOSTART_BACKUP_DIR="$CONFIG_HOME/mochi/autostart-backups"
 # One-time upgrade from the earlier local install. These old paths are used
@@ -168,24 +169,24 @@ install_system_dependencies() {
   local -a packages missing
   case "$PACKAGE_MANAGER" in
   pacman)
-    packages=(base-devel git curl file pkgconf gtk3 webkit2gtk-4.1 geoclue
+    packages=(base-devel git curl file tar xz python pkgconf gtk3 webkit2gtk-4.1 geoclue
       gtk-layer-shell libayatana-appindicator librsvg openssl dbus xdg-desktop-portal xdotool playerctl iproute2
       gst-plugins-base gst-plugins-good gst-plugins-bad)
     ;;
   apt-get)
-    packages=(build-essential git curl file pkg-config libgtk-3-dev
+    packages=(build-essential git curl file tar xz-utils python3 pkg-config libgtk-3-dev
       libwebkit2gtk-4.1-dev geoclue-2.0 libgtk-layer-shell-dev libayatana-appindicator3-dev
       librsvg2-dev libssl-dev libdbus-1-dev xdg-desktop-portal libxdo-dev patchelf playerctl iproute2
       gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad)
     ;;
   dnf)
-    packages=(gcc gcc-c++ make git curl file pkgconf-pkg-config gtk3-devel
+    packages=(gcc gcc-c++ make git curl file tar xz python3 pkgconf-pkg-config gtk3-devel
       webkit2gtk4.1-devel geoclue2 gtk-layer-shell-devel libayatana-appindicator-gtk3-devel
       librsvg2-devel openssl-devel dbus-devel xdg-desktop-portal libxdo-devel patchelf playerctl iproute
       gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free)
     ;;
   zypper)
-    packages=(gcc gcc-c++ make git curl file pkg-config gtk3-devel
+    packages=(gcc gcc-c++ make git curl file tar xz python3 pkg-config gtk3-devel
       webkit2gtk3-devel geoclue2 gtk-layer-shell-devel libappindicator3-devel
       librsvg-devel libopenssl-devel dbus-1-devel xdg-desktop-portal xdotool-devel patchelf playerctl iproute2
       gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugins-bad)
@@ -195,10 +196,10 @@ install_system_dependencies() {
   # provision the experimental receiver on an unrelated network adapter.
   if (( !NO_AIRDROP )) && has_mt7922; then
     case "$PACKAGE_MANAGER" in
-      pacman) packages+=(cmake python python-pip python-dbus python-gobject iw tcpdump libnl libarchive patch sudo) ;;
-      apt-get) packages+=(cmake python3 python3-venv python3-pip python3-dbus python3-gi iw tcpdump libpcap-dev libnl-3-dev libnl-genl-3-dev libarchive-dev patch sudo) ;;
-      dnf) packages+=(cmake python3 python3-pip python3-dbus python3-gobject iw tcpdump libpcap-devel libnl3-devel libarchive-devel patch sudo) ;;
-      zypper) packages+=(cmake python3 python3-pip python3-dbus-python python3-gobject iw tcpdump libpcap-devel libnl3-devel libarchive-devel patch sudo) ;;
+      pacman) packages+=(cmake python-pip python-dbus python-gobject iw tcpdump libpcap libnl libarchive networkmanager bluez patch sudo) ;;
+      apt-get) packages+=(cmake python3-venv python3-pip python3-dbus python3-gi gir1.2-gtk-3.0 iw tcpdump libpcap-dev libnl-3-dev libnl-genl-3-dev libarchive-dev network-manager bluez patch sudo) ;;
+      dnf) packages+=(cmake python3-pip python3-dbus python3-gobject iw tcpdump libpcap-devel libnl3-devel libarchive-devel NetworkManager bluez patch sudo) ;;
+      zypper) packages+=(cmake python3-pip python3-dbus-python python3-gobject typelib-1_0-Gtk-3_0 iw tcpdump libpcap-devel libnl3-devel libarchive-devel NetworkManager bluez patch sudo) ;;
     esac
   fi
   mapfile -t missing < <(missing_packages "${packages[@]}")
@@ -270,6 +271,9 @@ build_app() {
   (cd "$WINDOWS_DIR" && npm ci && npm test && ./node_modules/.bin/tauri build --no-bundle)
   [[ -x "$BUILT_BINARY" && -x "$WINDOWS_DIR/target/release/mochi-hook" ]] || die 'Release app or relay is missing.'
   bash -n "$WINDOWS_DIR/scripts/mochi-airdrop-confirm.sh" || die 'AirDrop consent hook failed syntax check.'
+  if (( !NO_AIRDROP )) && has_mt7922; then
+    python3 "$WINDOWS_DIR/scripts/mochi-airdrop-pick.py" --check || die 'AirDrop file chooser dependencies are missing.'
+  fi
 }
 
 install_airdrop() {
@@ -365,6 +369,11 @@ install_files() {
   # Replace by rename: a running receiver can finish using its old consent
   # hook, while the next /Ask gets a complete, executable progress-aware hook.
   install_consent_hook
+  install_executable "$WINDOWS_DIR/scripts/mochi-airdrop-pick.py" "$AIRDROP_PICKER_FILE"
+  install_executable "$WINDOWS_DIR/airdrop/mochi_discover.py" "$DATA_HOME/mochi/bin/mochi-airdrop-browse"
+  install_executable "$WINDOWS_DIR/airdrop/mochi_send.py" "$DATA_HOME/mochi/bin/mochi-airdrop-send"
+  install_executable "$MOCHI_DIR/uninstall-mochi.sh" "$DATA_HOME/mochi/bin/uninstall-mochi"
+  install_executable "$WINDOWS_DIR/scripts/uninstall-mochi.py" "$DATA_HOME/mochi/bin/uninstall-mochi.py"
   # Now that the hook exists, re-check that the receiver really uses it. A
   # receiver pointed at any other hook refuses every transfer in silence.
   if (( ! NO_AIRDROP )); then
@@ -483,6 +492,7 @@ JS
 }
 
 start_app() {
+  airdrop_require_app_idle "$DATA_HOME/mochi" || die 'App restart deferred to preserve the outgoing AirDrop workflow.'
   local pid path service_pid=''
   if systemctl --user is-enabled --quiet mochi-app.service 2>/dev/null; then
     service_pid="$(systemctl --user show -p MainPID --value mochi-app.service 2>/dev/null || true)"
@@ -525,6 +535,14 @@ record_install_revision() {
     revision="$revision dirty"
   fi
   marker_file="$(mktemp "$DATA_HOME/mochi/.installed-revision.XXXXXX")"
+  # Preserve an explicit radio opt-out across ordinary application updates.
+  if ((NO_AIRDROP)); then
+    printf '1\n' > "$marker_file"
+    mv -f -- "$marker_file" "$DATA_HOME/mochi/installed-no-airdrop"
+    marker_file="$(mktemp "$DATA_HOME/mochi/.installed-revision.XXXXXX")"
+  else
+    rm -f -- "$DATA_HOME/mochi/installed-no-airdrop"
+  fi
   printf '%s\n' "$revision" > "$marker_file"
   mv -f -- "$marker_file" "$INSTALLED_REVISION"
 }
@@ -545,7 +563,10 @@ ensure_node
 ensure_rust
 ensure_opencode
 build_app
+source "$WINDOWS_DIR/scripts/airdrop-install-common.sh"
+airdrop_require_app_idle "$DATA_HOME/mochi" || die 'Setup deferred to preserve the outgoing AirDrop workflow.'
 install_airdrop
+airdrop_require_app_idle "$DATA_HOME/mochi" || die 'App installation deferred to preserve the outgoing AirDrop workflow.'
 install_files
 opencode service start >/dev/null || die 'Could not start the OpenCode background service.'
 if ((NO_LAUNCH)); then

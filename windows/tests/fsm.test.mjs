@@ -18,6 +18,29 @@ afterEach(() => mock.timers.reset());
 
 const seconds = (n) => mock.timers.tick(n * 1000);
 
+test("a workflow's expanded hold cancels normal collapse without pinning alerts", () => {
+  fsm.forceHome();
+  fsm.mouseLeft();
+  seconds(1);
+  fsm.holdExpanded = true;
+  seconds(600);
+  assert.equal(fsm.state, "home");
+  assert.equal(fsm.pinned, false);
+  assert.equal(fsm.homeCollapseDueAt, null);
+  fsm.holdExpanded = false;
+  seconds(fsm.homeToPetitDelay - 1);
+  assert.equal(fsm.state, "home");
+  seconds(1);
+  assert.equal(fsm.state, "petit");
+});
+
+test("an expanded workflow still permits an explicit close", () => {
+  fsm.forceHome();
+  fsm.holdExpanded = true;
+  fsm.forcePetit();
+  assert.equal(fsm.state, "petit");
+});
+
 test("starts hidden and opens on the greeting at launch", () => {
   assert.equal(fsm.state, "hidden");
   fsm.launch();

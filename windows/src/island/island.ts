@@ -21,7 +21,7 @@ import { UploadCanvas } from "../upload/canvas";
 import { USC, UploadSeq } from "../upload/sequence";
 import { closePlanCard, openPlanColor, planCardOpen } from "../views/usage";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
-import { buildAirDropCompactStatus } from "../views/airdrop";
+import { airDropActivity, buildAirDropCompactStatus } from "../views/airdrop";
 import { h } from "../views/dom";
 import { IslandStateMachine } from "./fsm";
 import { companionMoodState } from "./wellbeing";
@@ -390,7 +390,8 @@ export class Island {
           if (!this.wasInIsland) this.fsm.mouseLeft();
           break;
         case "home":
-          this.expand(State.defaultView());
+          this.expand(!State.pendingApproval && airDropActivity().state !== null
+            ? "airdrop" : State.defaultView());
           if (!this.wasInIsland) this.fsm.mouseLeft();
           // Hooks may have been installed in a terminal since: the idle cards
           // say so on the next open, without polling while the island is shut.
@@ -524,10 +525,18 @@ export class Island {
 
   /** A live transfer owns compact visibility, not the expanded panel's pin. */
   private syncAirDropTransfer() {
-    const active = !State.paused && State.airdropTransfer !== null;
+    // AirDrop owns its 600 ms hover dismissal, including while busy. Feed it
+    // native pointer edges too: a chooser can swallow DOM mouseleave events.
+    this.fsm.holdExpanded = State.view === "airdrop";
+    const active = !State.paused && airDropActivity().state !== null;
+    const resized = active !== this.airDropCompactActive;
+    this.airDropCompactActive = active;
     this.fsm.keepCompact = active;
     if (active && this.fsm.state === "hidden") this.revealSilently();
+    else if (resized && State.mode === "compact") this.animateGeometry(active);
   }
+
+  private airDropCompactActive = false;
 
   /** Music started playing: the compact island, without the peek sound (musicReveal). */
   revealSilently() {
@@ -764,7 +773,9 @@ export class Island {
   // ── Geometry ────────────────────────────────────────────────────────────────
 
   private targetSize(): { w: number; h: number; r: number } {
-    let { w, h } = islandSize(State.mode, State.view, State.chatHistory.length);
+    let { w, h } = islandSize(State.mode, State.view, State.chatHistory.length,
+      !State.paused && airDropActivity().state !== null);
+    if (State.mode === "expanded" && State.view === "airdrop") h = State.airdropPanelHeight;
     if (State.mode === "expanded" && State.view === "question" && State.pendingApproval?.questions) {
       h = QUESTION_PICKER_H;
     }
@@ -1008,6 +1019,9 @@ export class Island {
       this.fsm.mouseEntered();
     }
     this.pointerInside = inside;
+    if (State.view === "airdrop" && State.mode === "expanded") {
+      this.views?.get("airdrop")?.pointerInside?.(inside);
+    }
   }
 
   /** Cursor in window-logical coordinates. */
@@ -1043,6 +1057,9 @@ export class Island {
     // the pointer as still outside.
     const wasIn = this.wasInIsland;
     this.wasInIsland = inIsland;
+    if (State.view === "airdrop" && State.mode === "expanded" && inIsland !== wasIn) {
+      this.views?.get("airdrop")?.pointerInside?.(inIsland);
+    }
     if (inIsland && !wasIn) {
       if (this.fsm.state === "mochi") this.greeting.hover();
       this.fsm.mouseEntered();
@@ -1544,7 +1561,10 @@ export class Island {
     for (const [name, view] of this.views) {
       const on = name === State.view;
       view.el.classList.toggle("on", on);
-      if (on) view.sync();
+      if (on) {
+        view.pointerInside?.(this.pointerInside ?? this.wasInIsland);
+        view.sync();
+      }
     }
 
     // The chat is the only view with a text field, so it is the only time the
@@ -1562,7 +1582,9 @@ export class Island {
 
     // Compact mini grid
     const showGrid = State.mode === "compact";
-    this.airDropIndicator.sync(State.mode, State.airdropTransfer, State.airdropProgress);
+    const airDrop = airDropActivity();
+    this.islandEl.classList.toggle("airdrop-session", showGrid && airDrop.state !== null);
+    this.airDropIndicator.sync(State.mode, airDrop.state, airDrop.progress, airDrop.label);
     this.miniGrid.style.opacity = showGrid ? "1" : "0";
     if (showGrid) {
       const others = compactMiniTasks(State.otherTasks);

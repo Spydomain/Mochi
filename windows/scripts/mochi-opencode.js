@@ -8,60 +8,137 @@ const EVENT_MAP = {
   'session.idle': 'Stop',
   'session.error': 'StopFailure',
   'session.deleted': 'SessionEnd',
+  'session.execution.started': 'UserPromptSubmit',
+  'session.execution.succeeded': 'Stop',
+  'session.execution.failed': 'StopFailure',
+  'session.execution.interrupted': 'Interrupt',
 };
 
+let delivery = Promise.resolve();
 function forward(hook_event_name, payload = {}) {
-  try {
+  // Keep relay deliveries in event order. Detached concurrent children could
+  // deliver a late PostToolUse after Stop and resurrect a finished agent.
+  delivery = delivery.then(() => new Promise((resolve) => {
+    let timer;
+    const done = () => { clearTimeout(timer); resolve(); };
+    try {
     const child = spawn(HOOK, ['--agent', 'opencode'], {
       stdio: ['pipe', 'ignore', 'ignore'],
       detached: process.platform !== 'win32',
       windowsHide: true,
     });
-    child.on('error', () => {});
+    child.on('error', done);
+    child.on('close', done);
     child.stdin.on('error', () => {});
     child.stdin.end(JSON.stringify({ hook_event_name, ...payload }) + '\n');
     child.unref();
-  } catch {}
+    timer = setTimeout(() => { child.kill(); done(); }, 2000);
+    timer.unref?.();
+    } catch { done(); }
+  })).catch(() => {});
 }
 
 export default {
   id: 'mochi',
   async setup(ctx) {
     const controller = new AbortController();
+    const active = new Map();
+    const known = new Set();
+    let revision = 0;
+    let pollingActivity = false;
+    const cwd = ctx.location?.directory || '';
+    function begin(sessionID, event = 'UserPromptSubmit', fields = {}) {
+      if (controller.signal.aborted || !sessionID) return;
+      known.add(sessionID);
+      if (known.size > 256) for (const id of known) {
+        if (!active.has(id)) { known.delete(id); break; }
+      }
+      active.set(sessionID, ++revision);
+      forward(event, { session_id: sessionID, cwd, ...fields });
+    }
+    function finish(sessionID, event, observedTerminal = false) {
+      if (!known.has(sessionID) && !observedTerminal) return;
+      const wasActive = active.delete(sessionID);
+      if (!wasActive && event !== 'SessionEnd' && !observedTerminal) return;
+      // Report every session's actual terminal event. The island aggregates
+      // concurrent sessions; substituting another start would leave this one
+      // permanently active in its lifecycle registry.
+      forward(event, { session_id: sessionID, cwd });
+      if (event === 'SessionEnd') known.delete(sessionID);
+    }
+    const context = await ctx.session.hook('context', event => begin(event.sessionID));
     const before = await ctx.tool.hook('execute.before', (event) => {
-      forward('PreToolUse', {
-        session_id: event.sessionID || '',
+      begin(event.sessionID, 'PreToolUse', {
         cwd: event.cwd || ctx.location?.directory || '',
         tool_name: event.tool || '',
         tool_input: event.input ?? null,
       });
     });
     const after = await ctx.tool.hook('execute.after', (event) => {
+      if (controller.signal.aborted || !active.has(event.sessionID)) return;
       forward('PostToolUse', {
         session_id: event.sessionID || '',
         cwd: event.cwd || ctx.location?.directory || '',
         tool_name: event.tool || '',
       });
     });
-    void (async () => {
+    const reconcile = async () => {
+      if (pollingActivity || !active.size || typeof ctx.session.active !== 'function') return;
+      pollingActivity = true;
+      const observed = new Map(active);
       try {
+        // Authoritative process activity, not an arbitrary inactivity timeout:
+        // a silent but genuinely running tool must never be declared finished.
+        const response = await ctx.session.active();
+        const running = response?.data || response;
+        if (controller.signal.aborted || !running || typeof running !== 'object' || Array.isArray(running)
+            || Object.entries(running).some(([id, status]) => !id.startsWith('ses') || status?.type !== 'running')) return;
+        for (const [id, version] of observed) {
+          if (!running[id] && active.get(id) === version) finish(id, 'Interrupt');
+        }
+      } catch {} // A disconnected service is not proof that a session stopped.
+      finally { pollingActivity = false; }
+    };
+    const activityTimer = setInterval(() => void reconcile(), 5000);
+    activityTimer.unref?.();
+    void (async () => {
+      while (!controller.signal.aborted) {
+        try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+          if (controller.signal.aborted) break;
           const hook_event_name = EVENT_MAP[event.type];
           if (!hook_event_name) continue;
-          const props = event.properties || {};
-          forward(hook_event_name, {
-            session_id: props.sessionID || props.info?.id || '',
-            cwd: ctx.location?.directory || '',
-          });
+          // Native V2 events use data and execution lifecycle events. Retain
+          // properties only for legacy-compatible stream implementations.
+          const props = event.data || event.properties || {};
+          const id = props.sessionID || props.info?.id || '';
+          if (!id) continue;
+          if (!known.has(id) && event.location?.directory !== cwd) continue;
+          if (hook_event_name === 'UserPromptSubmit') begin(id);
+          else if (hook_event_name === 'SessionStart') { known.add(id); forward('SessionStart', { session_id: id, cwd }); }
+          else finish(id, hook_event_name, true);
         }
-      } catch (error) {
-        if (!controller.signal.aborted) console.error('[mochi] event subscription failed', error);
+        } catch (error) {
+          if (!controller.signal.aborted) console.error('[mochi] event subscription failed; reconnecting', error);
+        }
+        if (controller.signal.aborted) break;
+        await reconcile();
+        await new Promise(resolve => {
+          const done = () => { clearTimeout(timer); controller.signal.removeEventListener('abort', done); resolve(); };
+          const timer = setTimeout(done, 1000);
+          controller.signal.addEventListener('abort', done, { once: true });
+        });
       }
     })();
     return async () => {
+      // Reloading/unloading a plugin must withdraw the activity it owns.
+      // New setup receives fresh lifecycle events; old callbacks cannot revive it.
+      for (const id of [...active.keys()]) finish(id, 'Interrupt');
       controller.abort();
+      clearInterval(activityTimer);
       await before.dispose();
       await after.dispose();
+      await context.dispose();
     };
   },
 };

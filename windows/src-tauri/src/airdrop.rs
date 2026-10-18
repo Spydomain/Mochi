@@ -1,6 +1,7 @@
-//! Native AirDrop on Linux, via an *installed* Omdrop receiver and AWDL radio
-//! backend. Mochi does not implement AWDL, install privileged code, or fake a
-//! Bluetooth device. The Omdrop CLI owns the receiver, timer and radio.
+//! Native AirDrop on Linux, via installed MT7922 or Omdrop/AWDL backends.
+//! Setup provisions the optional root-owned radio helpers; the desktop app
+//! controls their lifecycle without implementing AWDL or silently installing
+//! privileged components during a transfer.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,10 +21,16 @@ pub struct Status {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Peer {
     pub mac: String,
     pub name: Option<String>,
     pub rssi: Option<i32>,
+    pub last_seen: Option<u64>,
+    #[serde(default)]
+    pub fresh: bool,
+    #[serde(default)]
+    pub connection: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -32,11 +39,36 @@ pub struct Transfer {
     pub state: String,
     pub received_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
+    pub wire_bytes: Option<u64>,
+    pub bytes_per_second: Option<f64>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Discovery {
+    pub supported: bool,
+    pub running: bool,
+    pub peers: Vec<Peer>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Outbound {
+    pub phase: String,
+    pub sent_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub measurement: Option<String>,
+    #[serde(default)]
+    pub bytes_per_second: Option<f64>,
 }
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{Peer, Status, Transfer};
+    use super::{Discovery, Outbound, Peer, Status, Transfer};
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::path::PathBuf;
@@ -45,17 +77,246 @@ mod linux {
     use std::sync::OnceLock;
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, SystemTime};
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     use tokio::process::Command;
-    use tokio::sync::Mutex;
+    use tokio::sync::{watch, Mutex};
 
     static SWITCH: OnceLock<Mutex<()>> = OnceLock::new();
     static STARTED_BY_MOCHI: AtomicBool = AtomicBool::new(false);
     static TRANSFER_CACHE: OnceLock<StdMutex<TransferCache>> = OnceLock::new();
+    static OPERATIONS: OnceLock<StdMutex<OperationControl>> = OnceLock::new();
+    const CANCELLED: &str = "AirDrop operation cancelled because Turn off was requested.";
+    const SEND_TIMEOUT: Duration = Duration::from_secs(900);
+    const SEND_TIMED_OUT: &str = "The iPhone did not confirm completion before the send timed out. Check the phone before retrying.";
+    const REAP_GRACE: Duration = Duration::from_secs(1);
+    const PIPE_GRACE: Duration = Duration::from_millis(250);
+    static DISCOVERY_SESSION: OnceLock<Mutex<Option<DiscoverySession>>> = OnceLock::new();
+    static DISCOVERY_STATE: OnceLock<StdMutex<(Discovery, std::time::Instant)>> = OnceLock::new();
+    static OUTBOUND: OnceLock<StdMutex<Option<OutboundRecord>>> = OnceLock::new();
+    static SENDING: AtomicBool = AtomicBool::new(false);
+    static DISCOVERY_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static DISCOVERY_REQUESTED_UNTIL: OnceLock<StdMutex<Option<tokio::time::Instant>>> = OnceLock::new();
+
+    struct DiscoverySession {
+        cancel: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    struct OutboundRecord {
+        value: Outbound,
+        started: std::time::Instant,
+        phase_started: std::time::Instant,
+        ended: Option<std::time::Instant>,
+    }
+
+    fn discovery_state() -> &'static StdMutex<(Discovery, std::time::Instant)> {
+        DISCOVERY_STATE.get_or_init(|| StdMutex::new((Discovery::default(), std::time::Instant::now())))
+    }
+
+    pub fn discovery() -> Discovery {
+        let state = discovery_state().lock().unwrap();
+        let mut value = state.0.clone();
+        value.supported = mt7922_daemon().is_some();
+        if !value.running { value.peers.retain(|peer| peer.name.is_some()); }
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        expire_cached_peers(&mut value.peers, now);
+        value
+    }
+
+    fn expire_cached_peers(peers: &mut Vec<Peer>, now: u64) {
+        peers.retain(|peer| peer.last_seen.is_some_and(|seen| seen <= now.saturating_add(5000)
+            && now.saturating_sub(seen) <= if peer.connection.is_some() { 30_000 } else { 180_000 }));
+        for peer in peers { peer.fresh = peer.name.is_some() && peer.connection.is_none()
+            && peer.last_seen.is_some_and(|seen| now.saturating_sub(seen) <= 20_000); }
+    }
+
+    pub fn outbound() -> Option<Outbound> {
+        if operations().lock().unwrap().stopped { return None; }
+        let state = OUTBOUND.get_or_init(|| StdMutex::new(None)).lock().unwrap();
+        state.as_ref().filter(|record| record.ended.is_none_or(|ended| ended.elapsed() < Duration::from_secs(5)))
+            .map(|record| record.value.clone())
+    }
+
+    fn send_phase(phase: &str, sent: Option<u64>, total: Option<u64>) {
+        let mut state = OUTBOUND.get_or_init(|| StdMutex::new(None)).lock().unwrap();
+        if let Some(record) = state.as_mut() {
+            if phase != record.value.phase {
+                #[cfg(not(test))]
+                crate::log::line(format!("AirDrop send timing: {} took {} ms", record.value.phase, record.phase_started.elapsed().as_millis()));
+                record.phase_started = std::time::Instant::now();
+            }
+            record.value.phase = phase.into();
+            record.value.elapsed_ms = record.started.elapsed().as_millis() as u64;
+            if sent.is_some() { record.value.sent_bytes = sent; }
+            if total.is_some() { record.value.total_bytes = total; }
+            if matches!(phase, "complete" | "failed" | "cancelled") {
+                record.ended = Some(std::time::Instant::now());
+                #[cfg(not(test))]
+                crate::log::line(format!("AirDrop send summary: result={phase} metric={} bytes={}/{} elapsed_ms={}",
+                    record.value.measurement.as_deref().unwrap_or("unavailable"),
+                    record.value.sent_bytes.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
+                    record.value.total_bytes.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
+                    record.value.elapsed_ms));
+            }
+        }
+    }
+
+    struct SendingSession;
+    impl SendingSession {
+        fn begin() -> Result<Self, String> {
+            SENDING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .map_err(|_| "An AirDrop send is already in progress.".to_string())?;
+            let now = std::time::Instant::now();
+            *OUTBOUND.get_or_init(|| StdMutex::new(None)).lock().unwrap() = Some(OutboundRecord {
+                value: Outbound { phase: "choosing".into(), ..Default::default() }, started: now, phase_started: now, ended: None,
+            });
+            Ok(Self)
+        }
+    }
+    impl Drop for SendingSession {
+        fn drop(&mut self) {
+            let active = OUTBOUND.get_or_init(|| StdMutex::new(None)).lock().unwrap()
+                .as_ref().is_some_and(|record| record.ended.is_none());
+            if active { send_phase("cancelled", None, None); }
+            SENDING.store(false, Ordering::SeqCst);
+        }
+    }
+
+    // Registration and off share this short synchronous lock. A new operation
+    // cannot subscribe just after a stop signal and mistake it for permission
+    // to start. Only a successfully completed explicit enable reopens the gate.
+    struct OperationControl {
+        stopped: bool,
+        epoch: u64,
+        changes: watch::Sender<u64>,
+    }
+
+    impl OperationControl {
+        fn new() -> Self {
+            Self { stopped: false, epoch: 0, changes: watch::channel(0).0 }
+        }
+
+        fn register(&self) -> Result<Operation, String> {
+            if self.stopped { return Err(CANCELLED.into()); }
+            Ok(Operation { changes: self.changes.subscribe() })
+        }
+
+        fn stop(&mut self) -> u64 {
+            self.stopped = true;
+            self.epoch += 1;
+            self.changes.send_replace(self.epoch);
+            self.epoch
+        }
+
+        fn enabled(&mut self, epoch: u64) -> bool {
+            if self.epoch != epoch { return false; }
+            self.stopped = false;
+            true
+        }
+    }
+
+    fn operations() -> &'static StdMutex<OperationControl> {
+        OPERATIONS.get_or_init(|| StdMutex::new(OperationControl::new()))
+    }
+
+    struct Operation { changes: watch::Receiver<u64> }
+
+    impl Operation {
+        fn check(&self) -> Result<(), String> {
+            if self.changes.has_changed().unwrap_or(true) { Err(CANCELLED.into()) } else { Ok(()) }
+        }
+
+        async fn run<F: std::future::Future>(&self, future: F) -> Result<F::Output, String> {
+            let mut changes = self.changes.clone();
+            tokio::select! {
+                biased;
+                _ = changes.changed() => Err(CANCELLED.into()),
+                result = future => Ok(result),
+            }
+        }
+    }
+
+    // Own only a child we spawned, never a receiver PID or a process selected
+    // by name. Drop also covers cancellation of the enclosing Tauri future.
+    // SIGKILL closes a wake helper's D-Bus connection, removing its advert.
+    struct OwnedChild(Option<tokio::process::Child>);
+
+    impl OwnedChild {
+        fn spawn(command: &mut Command) -> Result<Self, String> {
+            command.kill_on_drop(true).spawn().map(|child| Self(Some(child)))
+                .map_err(|err| format!("Could not start AirDrop helper: {err}"))
+        }
+
+        fn child(&mut self) -> &mut tokio::process::Child { self.0.as_mut().unwrap() }
+
+        async fn kill_and_reap(&mut self) {
+            let child = self.child();
+            let _ = child.start_kill();
+            // A pathological kernel wait must not prevent off. Drop transfers
+            // any remaining reap to the runtime, without waiting on pipe EOF.
+            let _ = tokio::time::timeout(REAP_GRACE, child.wait()).await;
+        }
+
+        async fn output(&mut self) -> std::io::Result<std::process::Output> {
+            let child = self.child();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut stderr = child.stderr.take().unwrap();
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let status = {
+                let drain = async {
+                    tokio::try_join!(stdout.read_to_end(&mut out), stderr.read_to_end(&mut err))
+                };
+                tokio::pin!(drain);
+                tokio::select! {
+                    status = child.wait() => {
+                        let status = status?;
+                        // Descendants may inherit the pipes. Their EOF is not
+                        // evidence that our actual child is still running.
+                        let _ = tokio::time::timeout(PIPE_GRACE, &mut drain).await;
+                        status
+                    }
+                    drained = &mut drain => {
+                        drained?;
+                        child.wait().await?
+                    }
+                }
+            };
+            Ok(std::process::Output { status, stdout: out, stderr: err })
+        }
+    }
+
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                if child.id().is_none() { return; }
+                let _ = child.start_kill();
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move { let _ = child.wait().await; });
+                }
+            }
+        }
+    }
+
+    async fn operation_output(command: &mut Command, operation: &Operation,
+        deadline: Option<Duration>) -> Result<std::process::Output, String> {
+        operation.check()?;
+        let mut child = OwnedChild::spawn(command.stdin(Stdio::null())
+            .stdout(Stdio::piped()).stderr(Stdio::piped()))?;
+        let result = operation.run(async {
+            match deadline {
+                Some(limit) => tokio::time::timeout(limit, child.output()).await
+                    .map_err(|_| SEND_TIMED_OUT.to_string())?,
+                None => child.output().await,
+            }.map_err(|err| format!("Could not run AirDrop helper: {err}"))
+        }).await.and_then(|result| result);
+        if result.is_err() { child.kill_and_reap().await; }
+        result
+    }
 
     #[derive(Default)]
     struct TransferCache {
-        key: Option<(u64, usize, u64, SystemTime)>,
+        key: Option<(u64, usize, u64, SystemTime, u8)>,
         state: Option<String>,
         total_bytes: Option<u64>,
     }
@@ -194,11 +455,12 @@ mod linux {
         let metadata = log.metadata().ok()?;
         let len = metadata.len();
         if (offset as u64) > len {
-            return transfer_state("", now - start).map(|state| Transfer {
-                state: state.into(), received_bytes: None, total_bytes: None,
-            });
+            return Some(upload_start_status(now - start));
         }
-        let key = (start, offset, len, metadata.modified().ok()?);
+        // A quiet log must not freeze age-dependent status in the cache.
+        let age = now - start;
+        let wait_bucket = if age <= 15 { 0 } else if age <= 90 { 1 } else { 2 };
+        let key = (start, offset, len, metadata.modified().ok()?, wait_bucket);
         let cache = TRANSFER_CACHE.get_or_init(|| StdMutex::new(TransferCache::default()));
         let cached = cache.lock().ok()?;
         let (state, total_bytes) = if cached.key == Some(key) {
@@ -220,28 +482,68 @@ mod linux {
             (state, total_bytes)
         };
         let state = state?;
-        if state == "waiting" && now - start > 10 * 60 { return None; }
+        if matches!(state.as_str(), "waiting" | "notStarted") {
+            return Some(upload_start_status(age));
+        }
         // The log changes only at state transitions. Stat the raw file even
         // when the log is cached, so the ring tracks bytes while data arrives.
         let received_bytes = if state == "receiving" || state == "failed" {
             raw["rawPath"].as_str().and_then(|path| private_archive_received(std::path::Path::new(path), start, now))
                 .or_else(|| directory.and_then(|dir| archive_received(dir, start, now)))
         } else { None };
+        let measured = received_bytes.and_then(|actual| measured_receive_progress(&raw["progress"], actual, total_bytes, now * 1000));
+        if let Some(mut progress) = measured {
+            // A counter/phase can never promote an archive to success. Only
+            // the existing extraction + final result logs authorize completion.
+            progress.state = if state == "receiving" && raw["progress"]["phase"] == "verifying" {
+                "verifying".into()
+            } else { state };
+            return Some(progress);
+        }
         Some(Transfer {
             state,
-            received_bytes: received_bytes.zip(total_bytes).map(|(got, total)| got.min(total)),
-            total_bytes: if received_bytes.is_some() { total_bytes } else { None },
+            received_bytes,
+            // Legacy raw DVZip sizes and declared decoded totals are not
+            // comparable. Keep real byte activity without inventing a percent.
+            total_bytes: None,
+            wire_bytes: received_bytes,
+            bytes_per_second: None,
+            message: None,
         })
     }
 
+    fn upload_start_status(age_seconds: u64) -> Transfer {
+        Transfer {
+            state: if age_seconds > 90 { "failed" } else { "waiting" }.into(),
+            received_bytes: None, total_bytes: None, wire_bytes: None, bytes_per_second: None,
+            message: Some(if age_seconds > 90 {
+                "The upload has not reached Mochi after 90 seconds. No file bytes were received for this request. Check the iPhone before retrying; the receiver is still available."
+            } else if age_seconds > 15 {
+                "Connection delayed · accepted, but no upload has reached Mochi yet."
+            } else {
+                "Accepted · waiting for the iPhone to start uploading…"
+            }.into()),
+        }
+    }
+
+    fn measured_receive_progress(value: &serde_json::Value, actual_wire: u64, log_total: Option<u64>, now_ms: u64) -> Option<Transfer> {
+        let wire = value["wireBytes"].as_u64()?;
+        let updated = value["updatedMs"].as_u64()?;
+        // Buffered writes may leave at most one receive slice off disk. Do not
+        // trust telemetry for another file or a future/oversized forged sample.
+        if wire > actual_wire.saturating_add(65536) || wire > (1u64 << 53) || updated > now_ms.saturating_add(2000) { return None; }
+        let decoded = value["decodedBytes"].as_u64().filter(|n| *n <= (1u64 << 53));
+        let total = value["totalBytes"].as_u64().or(log_total).filter(|n| (1..=1_000_000_000_000).contains(n));
+        let rate = value["bytesPerSecond"].as_f64().filter(|n| n.is_finite() && *n >= 0.0 && *n <= 1e12)
+            .map(|rate| if now_ms.saturating_sub(updated) > 2000 { 0.0 } else { rate });
+        Some(Transfer { state: "receiving".into(), received_bytes: decoded.or(Some(wire)),
+            total_bytes: if decoded.is_some() { total } else { None }, wire_bytes: Some(wire), bytes_per_second: rate, message: None })
+    }
+
     fn upload_total_bytes(log: &str) -> Option<u64> {
-        // PROGRESS ONLY. The receiver decides success from the parsed archive
-        // trailer, never from this number - that comparison was what reported
-        // a complete transfer as failed, because iOS 26's TotalBytes measures
-        // the decoded archive while the raw file on disk is the compressed
-        // dvzip. For the ring it is still sound: both are byte counts of the
-        // same transfer, the ratio only ever climbs, and the UI caps it below
-        // 100% until extraction is verified, so it cannot claim completion.
+        // Declared decoded/archive total, NOT a compressed wire length. It can
+        // be compared only with validated decoded counters, never raw disk
+        // sizes. Archive validation, not this header, determines completion.
         let upload = log.rsplit("POST request at /Upload").next()?;
         upload.lines()
             .filter_map(|line| line.strip_prefix("TotalBytes: ")?.trim().parse::<u64>().ok())
@@ -314,13 +616,13 @@ mod linux {
             } else {
                 Some("complete")
             }
-        } else if log.contains("Receiving file(s)") {
+        } else if log.contains("Receiving file(s)") || log.contains("POST request at /Upload") {
             // A large file can take much longer than the old 90-second cap.
             Some("receiving")
-        } else if age_seconds <= 10 * 60 {
+        } else if age_seconds <= 90 {
             Some("waiting")
         } else {
-            None
+            Some("notStarted")
         }
     }
 
@@ -591,7 +893,19 @@ mod linux {
             .output().await.is_ok_and(|out| out.status.success() && !out.stdout.is_empty())
     }
 
-    fn lock_idle_receiver_at(directory: &std::path::Path) -> Result<std::fs::File, String> {
+    struct IdleReceiverGuard(std::fs::File);
+
+    impl Drop for IdleReceiverGuard {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd;
+            // O_CLOEXEC closes the descriptor at exec, not at fork. A command
+            // launched concurrently may briefly inherit this open description;
+            // explicitly unlock so it cannot delay our handoff to airdropd.
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); }
+        }
+    }
+
+    fn lock_idle_receiver_at(directory: &std::path::Path) -> Result<IdleReceiverGuard, String> {
         use std::os::{fd::AsRawFd, unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt}};
         if !directory.exists() {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)
@@ -611,10 +925,10 @@ mod linux {
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err("An AirDrop session is starting, running, or being updated. Mochi will not interrupt it.".into());
         }
-        Ok(file)
+        Ok(IdleReceiverGuard(file))
     }
 
-    fn lock_idle_receiver() -> Result<std::fs::File, String> {
+    fn lock_idle_receiver() -> Result<IdleReceiverGuard, String> {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or("No private runtime directory is available.")?;
         lock_idle_receiver_at(&PathBuf::from(runtime).join("airdropd"))
     }
@@ -748,7 +1062,6 @@ mod linux {
     }
 
     async fn mt7922_set(enabled: bool, name: &str, directory: &str) -> Result<Status, String> {
-        let _guard = SWITCH.get_or_init(|| Mutex::new(())).lock().await;
         if enabled {
             let daemon = mt7922_ready()?;
             let (name, directory) = preferences(name, directory)?;
@@ -901,19 +1214,36 @@ mod linux {
         id: String,
         name: Option<String>,
         address: Option<String>,
+        #[serde(default, rename = "lastSeen")]
+        last_seen: Option<f64>,
+        connection: Option<String>,
     }
 
     fn parse_mt_peers(raw: Vec<RawMtPeer>, own_name: &str, own_addresses: &str) -> Vec<Peer> {
+        parse_mt_peers_with_age(raw, own_name, own_addresses, 25.0)
+    }
+
+    fn parse_mt_peers_with_age(raw: Vec<RawMtPeer>, own_name: &str, own_addresses: &str, max_age: f64) -> Vec<Peer> {
         raw.into_iter()
             .take(50)
             .filter_map(|item| {
-                let name = item.name?.trim().to_string();
-                if name.is_empty()
+                let name = item.name.as_deref().unwrap_or("").trim().to_string();
+                let connecting = max_age >= 180.0 && name.is_empty()
+                    && matches!(item.connection.as_deref(), Some("connecting" | "retrying"))
+                    && item.last_seen.is_some()
+                    && item.address.as_deref().and_then(|address| address.split('%').next())
+                        .and_then(|address| address.parse::<std::net::Ipv6Addr>().ok())
+                        .is_some_and(|address| address.is_unicast_link_local());
+                if (!connecting && name.is_empty())
                     || name.len() > 80
                     || name.chars().any(char::is_control)
-                    || name == own_name.trim()
+                    || (!name.is_empty() && name == own_name.trim())
                     || item.id.len() != 12
                     || !item.id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || item.last_seen.is_some_and(|seen| {
+                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                        !seen.is_finite() || seen > now + 5.0 || now - seen > if connecting { 30.0 } else { max_age }
+                    })
                     || item
                         .address
                         .as_deref()
@@ -923,8 +1253,14 @@ mod linux {
                 }
                 Some(Peer {
                     mac: item.id,
-                    name: Some(name),
+                    name: if connecting { None } else { Some(name) },
                     rssi: None,
+                    last_seen: item.last_seen.map(|seen| (seen * 1000.0) as u64),
+                    fresh: !connecting && item.last_seen.is_none_or(|seen| {
+                        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs_f64();
+                        now - seen <= 20.0
+                    }),
+                    connection: if connecting { item.connection } else { None },
                 })
             })
             .collect()
@@ -960,53 +1296,124 @@ mod linux {
         Ok(parse_mt_peers(raw, &own_name, &own_addresses))
     }
 
-    async fn start_ble_wake() -> Result<tokio::process::Child, String> {
+    async fn start_ble_wake(operation: &Operation) -> Result<OwnedChild, String> {
         let script = crate::platform::local_dir().join("airdrop-mt7921/tools/blewake-dbus.py");
         if !script.is_file() {
             return Err("The AirDrop Bluetooth wake helper is missing. Reinstall the optional MT7922 backend.".into());
         }
         // BlueZ owns this advertisement. Dropping the child closes its D-Bus
         // connection and unregisters it, including if a scan is cancelled.
-        let mut child = Command::new("python3")
+        operation.check()?;
+        let mut child = OwnedChild::spawn(Command::new("python3")
             .arg(script)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("Could not start the AirDrop Bluetooth wake: {e}"))?;
+            .kill_on_drop(true))?;
         let stdout = child
+            .child()
             .stdout
             .take()
             .ok_or("Could not read Bluetooth wake status.")?;
         let mut output = BufReader::new(stdout);
         let mut line = String::new();
-        let ready = tokio::time::timeout(Duration::from_secs(6), output.read_line(&mut line)).await;
-        if !matches!(ready, Ok(Ok(n)) if n > 0 && line.trim() == "advert up") {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        let ready = operation.run(tokio::time::timeout(Duration::from_secs(6), output.read_line(&mut line))).await;
+        if !matches!(ready, Ok(Ok(Ok(n))) if n > 0 && line.trim() == "advert up") {
+            child.kill_and_reap().await;
+            if let Err(err) = ready { return Err(err); }
             return Err("Bluetooth could not advertise AirDrop discovery. Check that Bluetooth is enabled and BlueZ is running.".into());
         }
-        child.stdout = Some(output.into_inner());
+        child.child().stdout = Some(output.into_inner());
         Ok(child)
     }
 
-    async fn stop_ble_wake(mut child: tokio::process::Child) {
-        if let Some(pid) = child.id() {
-            unsafe { libc::kill(pid as i32, libc::SIGINT) };
-        }
-        if tokio::time::timeout(Duration::from_secs(2), child.wait())
-            .await
-            .is_err()
-        {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+    async fn stop_ble_wake(mut child: OwnedChild) {
+        child.kill_and_reap().await;
     }
 
-    async fn scan_mt7922_peers() -> Result<Vec<Peer>, String> {
-        let _guard = SWITCH.get_or_init(|| Mutex::new(())).lock().await;
-        if !mt7922_status().await?.visible {
+    pub async fn discovery_set(enabled: bool) -> Result<Discovery, String> {
+        let revision = DISCOVERY_REVISION.fetch_add(1, Ordering::SeqCst) + 1;
+        let until = enabled.then(|| tokio::time::Instant::now() + Duration::from_secs(600));
+        *DISCOVERY_REQUESTED_UNTIL.get_or_init(|| StdMutex::new(None)).lock().unwrap() = until;
+        discovery_set_until(enabled, until, Some(revision)).await
+    }
+
+    async fn discovery_set_until(enabled: bool, until: Option<tokio::time::Instant>, revision: Option<u64>) -> Result<Discovery, String> {
+        let mut session = DISCOVERY_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+        if revision.is_some_and(|revision| revision != DISCOVERY_REVISION.load(Ordering::SeqCst)) {
+            return Ok(discovery());
+        }
+        if let Some(previous) = session.as_ref() {
+            if enabled && !previous.task.is_finished() { return Ok(discovery()); }
+        }
+        if let Some(mut previous) = session.take() {
+            previous.cancel.send_replace(true);
+            if tokio::time::timeout(Duration::from_secs(3), &mut previous.task).await.is_err() {
+                previous.task.abort();
+                let _ = previous.task.await;
+            }
+        }
+        let cached = discovery().peers;
+        *discovery_state().lock().unwrap() = (Discovery { peers: cached, ..Default::default() }, std::time::Instant::now());
+        if !enabled { return Ok(discovery()); }
+        if SENDING.load(Ordering::SeqCst) { return Err("Finish the current send before finding devices again.".into()); }
+        let operation = operations().lock().unwrap().register()?;
+        if mt7922_daemon().is_none() {
+            return Ok(discovery());
+        }
+        if !operation.run(mt7922_status()).await??.visible { return Err("Turn on AirDrop before finding devices.".into()); }
+        operation.check()?;
+        if revision.is_some_and(|revision| revision != DISCOVERY_REVISION.load(Ordering::SeqCst)) { return Ok(discovery()); }
+        if SENDING.load(Ordering::SeqCst) { return Err("Finish the current send before finding devices again.".into()); }
+        let python = crate::platform::local_dir().join("owl/.venv-opendrop/bin/python");
+        let script = crate::platform::local_dir().join("bin/mochi-airdrop-browse");
+        if !python.is_file() || !script.is_file() { return Err("The continuous AirDrop browser is missing. Rerun Mochi setup.".into()); }
+        let (cancel, mut changes) = watch::channel(false);
+        let deadline = until.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(600));
+        let cached = discovery().peers;
+        *discovery_state().lock().unwrap() = (Discovery { running: true, peers: cached, ..Default::default() }, std::time::Instant::now());
+        let task = tokio::spawn(async move {
+            let work = async {
+                let mut wake = start_ble_wake(&operation).await?;
+                // Browse immediately while the phone wakes. One browser and
+                // advertisement stay alive; no repeated cold-start delays.
+                let mut child = OwnedChild::spawn(Command::new(python).arg("-u").arg(script).arg("--cache")
+                    .env("OPENDROP_QUERY_INTERVAL", "1.0")
+                    .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()))?;
+                let mut reader = BufReader::new(child.child().stdout.take().unwrap());
+                let result: Result<(), String> = async {
+                    loop {
+                        let mut line = String::new();
+                        let length = tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => return Ok(()),
+                            read = operation.run(reader.read_line(&mut line)) => read?.map_err(|_| "AirDrop browser stopped unexpectedly.".to_string())?,
+                        };
+                        if length == 0 { return Err("AirDrop browser ended. Use Find iPhone to restart it.".into()); }
+                        if line.len() > 32768 { return Err("AirDrop browser returned an oversized device list.".into()); }
+                        let raw: Vec<RawMtPeer> = serde_json::from_str(&line).map_err(|_| "AirDrop browser returned an invalid device list.")?;
+                        let peers = parse_mt_peers_with_age(raw, "", "", 180.0); // Display-only cache, never upload authorization.
+                        *discovery_state().lock().unwrap() = (Discovery { supported: true, running: true, peers, error: None }, std::time::Instant::now());
+                    }
+                }.await;
+                child.kill_and_reap().await;
+                wake.kill_and_reap().await;
+                result
+            };
+            let result = tokio::select! {
+                _ = changes.changed() => Ok(()),
+                result = operation.run(work) => result.and_then(|result| result),
+            };
+            let mut state = discovery_state().lock().unwrap();
+            state.0.running = false;
+            state.0.error = result.err().filter(|message| message != CANCELLED);
+        });
+        *session = Some(DiscoverySession { cancel, task });
+        Ok(discovery())
+    }
+
+    async fn scan_mt7922_peers(operation: &Operation) -> Result<Vec<Peer>, String> {
+        let _guard = operation.run(SWITCH.get_or_init(|| Mutex::new(())).lock()).await?;
+        if !operation.run(mt7922_status()).await??.visible {
             return Err(
                 "Turn on AirDrop and wait until its radio is visible before scanning.".into(),
             );
@@ -1015,49 +1422,330 @@ mod linux {
         if !opendrop.is_file() {
             return Err("The MT7922 AirDrop discovery tool is missing.".into());
         }
-        let wake = start_ble_wake().await?;
-        // Give the iPhone a moment to wake AWDL before sending mDNS queries.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let result = scan_mt7922_peers_awdl(opendrop).await;
+        let wake = start_ble_wake(operation).await?;
+        let result = async {
+            // Give the iPhone a moment to wake AWDL before mDNS queries.
+            operation.run(tokio::time::sleep(Duration::from_secs(3))).await?;
+            scan_mt7922_peers_awdl(opendrop, None, operation).await
+        }.await;
         stop_ble_wake(wake).await;
         result
     }
 
-    async fn scan_mt7922_peers_awdl(opendrop: PathBuf) -> Result<Vec<Peer>, String> {
+    async fn scan_mt7922_peers_awdl(opendrop: PathBuf, receiver: Option<&str>, operation: &Operation) -> Result<Vec<Peer>, String> {
         let started = SystemTime::now();
-        let mut child = Command::new(opendrop)
-            .args(["-i", "awdl0", "find"])
+        operation.check()?;
+        let browser = crate::platform::local_dir().join("bin/mochi-airdrop-browse");
+        if !browser.is_file() { return Err("Mochi's live AirDrop browser is missing. Rerun setup.".into()); }
+        let mut child = OwnedChild::spawn(Command::new(opendrop.with_file_name("python"))
+            .arg("-u").arg(browser).env("OPENDROP_QUERY_INTERVAL", "1.0")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("Could not scan for AirDrop devices: {e}"))?;
-        // OpenDrop writes the peer report when interrupted. Wait for the
-        // discovery window without repeatedly spawning `ip` and rereading
-        // the report, which may still contain only the previous scan.
-        let timed_out = match tokio::time::timeout(Duration::from_secs(25), child.wait()).await {
-            Ok(Ok(_)) => false,
-            Ok(Err(e)) => return Err(format!("AirDrop discovery failed: {e}")),
-            Err(_) => true,
-        };
-        if timed_out {
-            if let Some(pid) = child.id() {
-                // OpenDrop writes its discovery report on KeyboardInterrupt.
-                unsafe { libc::kill(pid as i32, libc::SIGINT) };
+            .kill_on_drop(true))?;
+        // OpenDrop persists each resolved service. Return a named peer as soon
+        // as it arrives instead of spending 25s aging a result already found.
+        // Only a changed report may trigger address lookup/parsing; never use
+        // an old scan, and keep browsing when the only result is Mochi itself.
+        let mut report_version = None;
+        let result = wait_for_mt_peers(&mut child, receiver, operation, Duration::from_secs(25),
+            Duration::from_millis(500), || {
+            let version = mt7922_report().and_then(|path| std::fs::metadata(path).ok()?.modified().ok());
+            if version.is_some_and(|modified| modified >= started) && version != report_version {
+                report_version = version;
+                return recent_mt7922_peers(Some(started)).ok();
             }
-            if tokio::time::timeout(Duration::from_secs(8), child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
+            None
+        }).await;
+        if result.is_err() {
+            child.kill_and_reap().await;
+            return result;
         }
+        // The browser persists every resolved service atomically, and the
+        // wait above reads that fresh report before returning a match. Nothing
+        // needs to be flushed on SIGINT. zeroconf.close() can otherwise hang
+        // for eight seconds after the phone was already found. Stop only our
+        // browser child immediately; never signal the independent receiver.
+        child.kill_and_reap().await;
+        operation.check()?;
         let peers = recent_mt7922_peers(Some(started))?;
+        if receiver.is_some_and(|id| !selected_mt_peer_present(&peers, id)) {
+            return Err("The selected iPhone did not answer the connection check. Everyone mode alone does not confirm an AWDL connection. Keep it unlocked and retry; if its identity rotated, select its new entry. No files were sent.".into());
+        }
         if peers.is_empty() {
             return Err("No iPhone AirDrop service answered. To send from Mochi, unlock the iPhone, select Everyone for 10 Minutes, CLOSE its Share sheet, and scan again. To receive on Mochi, OPEN the iPhone Share sheet and look for Mochi there.".into());
         }
         Ok(peers)
+    }
+
+    async fn wait_for_mt_peers(child: &mut OwnedChild, receiver: Option<&str>, operation: &Operation,
+        limit: Duration, poll: Duration, mut read: impl FnMut() -> Option<Vec<Peer>>) -> Result<Vec<Peer>, String> {
+        let deadline = tokio::time::Instant::now() + limit;
+        let mut peers = Vec::new();
+        loop {
+            operation.check()?;
+            if let Some(latest) = read() { peers = latest; }
+            let found = receiver.map_or(!peers.is_empty(), |id| selected_mt_peer_present(&peers, id));
+            if found || child.child().try_wait().map_err(|err| err.to_string())?.is_some()
+                || tokio::time::Instant::now() >= deadline { return Ok(peers); }
+            operation.run(tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + poll))).await?;
+        }
+    }
+
+    fn mt7922_send_command(opendrop: &std::path::Path, receiver: &str, name: &str, files: &[String]) -> Command {
+        let mut command = Command::new(opendrop.with_file_name("python"));
+        command.arg("-u").arg(crate::platform::local_dir().join("bin/mochi-airdrop-send"));
+        command.args(["-n", name, "-i", "awdl0", "-r", receiver]);
+        for file in files { command.arg("-f").arg(file); }
+        command.kill_on_drop(true);
+        command
+    }
+
+    fn fresh_selected_report(raw: &str, receiver: &str, now: f64, max_age: f64) -> Option<serde_json::Value> {
+        if raw.len() > 65536 { return None; }
+        let rows: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+        let peer = rows.into_iter().take(50).find(|peer| {
+            let seen = peer["lastSeen"].as_f64().unwrap_or(f64::NAN);
+            let name = peer["name"].as_str().unwrap_or("");
+            peer["id"].as_str().is_some_and(|id| id.eq_ignore_ascii_case(receiver))
+                && peer["discoverable"].as_bool() == Some(true)
+                && seen.is_finite() && seen <= now && now - seen <= max_age
+                && !name.is_empty() && name.len() <= 320 && !name.chars().any(char::is_control)
+                && peer["port"].as_u64().is_some_and(|port| port > 0 && port <= 65535)
+                && peer["address"].as_str().is_some_and(|address| address.split('%').next()
+                    .and_then(|address| address.parse::<std::net::Ipv6Addr>().ok())
+                    .is_some_and(|address| address.is_unicast_link_local()))
+        })?;
+        Some(serde_json::json!([peer]))
+    }
+
+    fn current_selected_report(receiver: &str, max_age: f64) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(mt7922_report()?).ok()?;
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs_f64();
+        fresh_selected_report(&raw, receiver, now, max_age)
+    }
+
+    fn live_selected_report(raw: &str, receiver: &str, now: f64) -> Option<serde_json::Value> {
+        let selected = fresh_selected_report(raw, receiver, now, 180.0)?;
+        let peer = selected.as_array()?.first()?;
+        let announced = peer["lastAnnounced"].as_f64()?;
+        if peer["sessionVerified"].as_bool() != Some(true)
+            || !announced.is_finite() || announced > now || now - announced > 30.0 {
+            return None;
+        }
+        Some(selected)
+    }
+
+    fn current_live_selected_report(receiver: &str) -> Option<serde_json::Value> {
+        // Internal supported flips only after this browser has emitted its
+        // first list (and initialized its report). The public discovery()
+        // accessor instead computes hardware support, even during startup.
+        if { let state = discovery_state().lock().unwrap(); !state.0.running || !state.0.supported } { return None; }
+        let raw = std::fs::read_to_string(mt7922_report()?).ok()?;
+        let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs_f64();
+        live_selected_report(&raw, receiver, now)
+    }
+
+    struct SendReport(PathBuf);
+    impl SendReport {
+        fn focus(receiver: &str) -> Result<Self, String> {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+            let staged = Self::new(&serde_json::json!({"id":receiver,
+                "nonce":now.as_nanos().to_string(), "expires":now.as_secs_f64() + 15.0}))?;
+            let parent = staged.0.parent().unwrap().join("mochi-airdrop");
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&parent).map_err(|err| err.to_string())?;
+            let meta = parent.symlink_metadata().map_err(|err| err.to_string())?;
+            if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.permissions().mode() & 0o077 != 0 {
+                return Err("The AirDrop discovery runtime directory is not private.".into());
+            }
+            let path = parent.join("find-focus.json");
+            std::fs::rename(&staged.0, &path).map_err(|err| err.to_string())?;
+            Ok(Self(path))
+        }
+
+        fn new(report: &serde_json::Value) -> Result<Self, String> {
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+            use std::io::Write;
+            let parent = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).ok_or("No private runtime directory is available.")?;
+            let meta = parent.symlink_metadata().map_err(|err| err.to_string())?;
+            if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.permissions().mode() & 0o077 != 0 {
+                return Err("The AirDrop runtime directory is not private.".into());
+            }
+            let nonce = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_nanos();
+            let path = parent.join(format!("mochi-send-{}-{nonce}.json", std::process::id()));
+            let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).map_err(|err| err.to_string())?;
+            let owned = Self(path);
+            file.write_all(report.to_string().as_bytes()).map_err(|err| err.to_string())?;
+            Ok(owned)
+        }
+    }
+    impl Drop for SendReport {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+
+    fn read_send_progress(line: &str) -> bool {
+        let Some(json) = line.strip_prefix("MOCHI_SEND ") else { return false; };
+        if json.len() > 2048 { return true; }
+        if let Ok(progress) = serde_json::from_str::<Outbound>(json) {
+            if matches!(progress.phase.as_str(), "connecting" | "asking" | "accepted" | "preparing" | "sending" | "stalled" | "confirming")
+                && progress.sent_bytes.zip(progress.total_bytes).is_none_or(|(sent, total)| total > 0 && sent <= total && total <= (1u64 << 53)) {
+                send_phase(&progress.phase, progress.sent_bytes, progress.total_bytes);
+                if matches!(progress.measurement.as_deref(), Some("tcpAck" | "tlsWritten")) {
+                    let mut state = OUTBOUND.get_or_init(|| StdMutex::new(None)).lock().unwrap();
+                    if let Some(record) = state.as_mut() {
+                        if record.value.measurement != progress.measurement {
+                            #[cfg(not(test))]
+                            crate::log::line(format!("AirDrop send metric: {}", progress.measurement.as_deref().unwrap()));
+                        }
+                        record.value.measurement = progress.measurement;
+                    }
+                }
+                if let Some(rate) = progress.bytes_per_second.filter(|rate| rate.is_finite() && *rate >= 0.0 && *rate <= 1e12) {
+                    if let Some(record) = OUTBOUND.get_or_init(|| StdMutex::new(None)).lock().unwrap().as_mut() {
+                        record.value.bytes_per_second = Some(rate);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn sender_line(line: &str, diagnostic: &mut String) {
+        if !read_send_progress(line.trim_end()) && diagnostic.len() < 16384 {
+            let mut end = (16384 - diagnostic.len()).min(line.len());
+            while !line.is_char_boundary(end) { end -= 1; }
+            diagnostic.push_str(&line[..end]);
+        }
+    }
+
+    async fn sender_output(command: &mut Command, operation: &Operation) -> Result<std::process::Output, String> {
+        operation.check()?;
+        let mut child = OwnedChild::spawn(command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()))?;
+        let mut reader = BufReader::new(child.child().stderr.take().unwrap());
+        let mut diagnostic = String::new();
+        let result = operation.run(tokio::time::timeout(SEND_TIMEOUT, async {
+            let mut eof = false;
+            loop {
+                let mut line = String::new();
+                tokio::select! {
+                    status = child.child().wait() => {
+                        let status = status.map_err(|err| err.to_string())?;
+                        let mut tail = String::new();
+                        let mut limited = (&mut reader).take(32768);
+                        let _ = tokio::time::timeout(PIPE_GRACE, limited.read_to_string(&mut tail)).await;
+                        for line in tail.lines() { sender_line(line, &mut diagnostic); }
+                        // Completion is the process result, not a child-supplied
+                        // phase or a byte counter that merely reached its total.
+                        return Ok(std::process::Output { status, stdout: vec![], stderr: diagnostic.into_bytes() });
+                    }
+                    read = reader.read_line(&mut line), if !eof => {
+                        let count = read.map_err(|err| err.to_string())?;
+                        if count == 0 { eof = true; continue; }
+                        if line.len() > 32768 { return Err("AirDrop sender returned an oversized status line.".into()); }
+                        sender_line(&line, &mut diagnostic);
+                    }
+                }
+            }
+        })).await.and_then(|result| result.map_err(|_| SEND_TIMED_OUT.to_string())).and_then(|result| result);
+        if result.is_err() { child.kill_and_reap().await; }
+        result
+    }
+
+    fn mt7922_send_error(code: Option<i32>, diagnostic: &str) -> String {
+        if code == Some(124) || code == Some(137) {
+            return SEND_TIMED_OUT.into();
+        }
+        if diagnostic.contains("ConnectionRefusedError") || diagnostic.contains("RemoteDisconnected")
+            || diagnostic.contains("Selected AirDrop service no longer exists") {
+            return "The iPhone's receiving connection changed or closed. Keep it unlocked with Everyone enabled and its Share sheet closed, then use Find iPhone again.".into();
+        }
+        if diagnostic.contains("Receiver declined") {
+            return "The iPhone declined the request or its acceptance window expired. Retry and accept the prompt on the iPhone.".into();
+        }
+        if diagnostic.contains("TimeoutError") || diagnostic.contains("timed out") {
+            return "The iPhone connection stalled before delivery was confirmed. Keep it nearby and unlocked; check the phone before retrying to avoid duplicates.".into();
+        }
+        "AirDrop did not confirm delivery. Keep the iPhone nearby in receiving mode, use Find iPhone again, then retry.".into()
+    }
+
+    fn selected_mt_peer_present(peers: &[Peer], receiver: &str) -> bool {
+        peers.iter().any(|peer| peer.mac.eq_ignore_ascii_case(receiver) && peer.name.is_some())
+    }
+
+    fn selected_service_retired(snapshot: &Discovery, receiver: &str) -> bool {
+        // Named devices stay in the display cache for three minutes. If a
+        // populated live list has already removed this ID, don't spend another
+        // 25 seconds waiting on that retired selection. An unresolved entry
+        // with the SAME ID still deserves its connection check. Never replace
+        // the selected ID by matching another row's name.
+        snapshot.running && !snapshot.peers.is_empty()
+            && !snapshot.peers.iter().any(|peer| peer.mac.eq_ignore_ascii_case(receiver))
+    }
+
+    fn check_selected_service(snapshot: &Discovery, receiver: &str) -> Result<(), String> {
+        if selected_service_retired(snapshot, receiver) {
+            crate::log::line("AirDrop send: selected exact service left the live device list; no upload attempted");
+            return Err("The selected iPhone connection is no longer listed. Select its current entry in Mochi before choosing files again. No files were sent.".into());
+        }
+        Ok(())
+    }
+
+    async fn send_mt7922_files(opendrop: PathBuf, receiver: &str, name: &str, files: &[String], operation: &Operation) -> Result<String, String> {
+        // The chooser may stay open for minutes. A wake that ended with the
+        // initial scan is no longer proof that the phone still accepts TCP.
+        // Re-wake after selection, resolve the SAME service, and retain the
+        // advert until the upload finishes. Never substitute a matching name.
+        send_phase("waking", None, None);
+        let wake = start_ble_wake(operation).await?;
+        let result = async {
+            send_phase("discovering", None, None);
+            // Keep the exact selected recipient through the chooser. Reuse a
+            // recent name probe, or an exact current announcement whose name
+            // was verified in this browser session. A slow redundant Discover
+            // must not block the real TLS/Ask acceptance connection. Display-
+            // only cache entries and name-based substitutions remain forbidden.
+            // Freeze it privately before stopping background probes so neither
+            // report rewrites nor /Discover contention can disrupt the upload.
+            let mut report = current_selected_report(receiver, 5.0)
+                .or_else(|| current_live_selected_report(receiver));
+            if report.is_none() && discovery().running {
+                check_selected_service(&discovery(), receiver)?;
+                let _focus = SendReport::focus(receiver).ok();
+                // Keep the already-established browser/wake alive rather than
+                // throwing away its mDNS state when one probe was lost.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+                while report.is_none() && discovery().running && tokio::time::Instant::now() < deadline {
+                    operation.run(tokio::time::sleep(Duration::from_millis(250))).await?;
+                    report = current_selected_report(receiver, 5.0)
+                        .or_else(|| current_live_selected_report(receiver));
+                    if report.is_none() { check_selected_service(&discovery(), receiver)?; }
+                }
+                if report.is_none() && discovery().running {
+                    return Err("The selected iPhone stopped answering connection checks. The background search is still running; keep it unlocked or select its new entry if its identity rotated. No files were sent.".into());
+                }
+            }
+            discovery_set_until(false, None, None).await?;
+            if report.is_none() {
+                scan_mt7922_peers_awdl(opendrop.clone(), Some(receiver), operation).await?;
+                report = current_selected_report(receiver, 25.0);
+            } else {
+                crate::log::line("AirDrop send: reused the verified exact live service; redundant discovery skipped");
+            }
+            let report = SendReport::new(&report.ok_or("The selected iPhone connection expired before sending; no files were sent.")?)?;
+            crate::log::line(format!("AirDrop send: starting {} file(s) to the selected recipient", files.len()));
+            let mut command = mt7922_send_command(&opendrop, receiver, name, files);
+            command.arg("--report").arg(&report.0);
+            let output = sender_output(&mut command, operation).await?;
+            if !output.status.success() {
+                let message = mt7922_send_error(output.status.code(), &String::from_utf8_lossy(&output.stderr));
+                crate::log::line(format!("AirDrop send: {message}"));
+                return Err(message);
+            }
+            crate::log::line("AirDrop send: receiver confirmed upload");
+            Ok("AirDrop transfer complete.".into())
+        }.await;
+        stop_ble_wake(wake).await;
+        result
     }
 
     #[derive(serde::Deserialize)]
@@ -1111,6 +1799,24 @@ mod linux {
     }
 
     pub async fn set(enabled: bool, name: &str, directory: &str) -> Result<Status, String> {
+        // This must precede EVERY await, including backend/service detection
+        // and waiting for SWITCH. New sends/scans are barred until enabled.
+        let epoch = {
+            let mut control = operations().lock().unwrap();
+            if enabled { control.epoch } else { control.stop() }
+        };
+        if !enabled { discovery_set(false).await?; }
+        let _guard = SWITCH.get_or_init(|| Mutex::new(())).lock().await;
+        if enabled && operations().lock().unwrap().epoch != epoch { return Err(CANCELLED.into()); }
+        let result = set_locked(enabled, name, directory).await;
+        if enabled && result.as_ref().is_ok_and(|status| status.receiving)
+            && !operations().lock().unwrap().enabled(epoch) {
+            return Err(CANCELLED.into());
+        }
+        result
+    }
+
+    async fn set_locked(enabled: bool, name: &str, directory: &str) -> Result<Status, String> {
         if mt7922_daemon().is_some() || (!enabled && mt7922_service_running().await) {
             return mt7922_set(enabled, name, directory).await;
         }
@@ -1119,8 +1825,6 @@ mod linux {
                 "Custom AirDrop name and save folder currently require the MT7922 backend.".into(),
             );
         }
-        // Do not let two quick clicks race Omdrop's own service/timer lifecycle.
-        let _guard = SWITCH.get_or_init(|| Mutex::new(())).lock().await;
         if executable().is_none() {
             return Err(SETUP.into());
         }
@@ -1167,9 +1871,10 @@ mod linux {
     }
 
     pub async fn stop_if_owned() {
+        let _ = discovery_set(false).await;
         // The MT7922 receiver is now its own user service. Only the explicit
         // AirDrop toggle may stop it; closing or restarting Mochi does not.
-        if mt7922_daemon().is_some() {
+        if mt7922_daemon().is_some() || mt7922_service_running().await {
             return;
         }
         if STARTED_BY_MOCHI.load(Ordering::Relaxed) {
@@ -1178,9 +1883,10 @@ mod linux {
     }
 
     pub async fn peers(named: bool) -> Result<Vec<Peer>, String> {
+        let operation = operations().lock().unwrap().register()?;
         if mt7922_daemon().is_some() {
             if named {
-                return scan_mt7922_peers().await;
+                return scan_mt7922_peers(&operation).await;
             }
             return Ok(recent_mt7922_peers(None).unwrap_or_default());
         }
@@ -1191,7 +1897,8 @@ mod linux {
         } else {
             &["peers", "--json"]
         };
-        let (ok, output) = run(args, if named { 35 } else { 12 }).await?;
+        let _guard = operation.run(SWITCH.get_or_init(|| Mutex::new(())).lock()).await?;
+        let (ok, output) = run_operation(args, if named { 35 } else { 12 }, &operation).await?;
         // Omdrop exits 1 with [] when there are no devices in range.
         if !ok && output != "[]" {
             return Err(output);
@@ -1200,35 +1907,68 @@ mod linux {
     }
 
     pub async fn send(mac: String) -> Result<String, String> {
+        if transfer().is_some_and(|transfer| matches!(transfer.state.as_str(), "receiving" | "verifying")) {
+            return Err("Wait for the incoming AirDrop transfer to finish before sending on the shared radio.".into());
+        }
+        let session = SendingSession::begin()?;
+        let revision = DISCOVERY_REVISION.load(Ordering::SeqCst);
+        let epoch = operations().lock().unwrap().epoch;
+        // Keep the user's intent through temporary pauses and a second send
+        // begun before asynchronous search restart has completed.
+        let resume = *DISCOVERY_REQUESTED_UNTIL.get_or_init(|| StdMutex::new(None)).lock().unwrap();
+        let result = send_inner(mac).await;
+        let phase = match &result {
+            Ok(_) => "complete",
+            Err(error) if error == CANCELLED || error == "No files selected." => "cancelled",
+            Err(_) => "failed",
+        };
+        send_phase(phase, None, None);
+        drop(session);
+        if resume.is_some_and(|deadline| deadline > tokio::time::Instant::now())
+            && { let control = operations().lock().unwrap(); !control.stopped && control.epoch == epoch }
+            && !crate::integrations::PAUSED.load(Ordering::Relaxed) {
+            // Delivery already has a conclusive result. Radio health checks
+            // for optional background search must not hold the Send promise
+            // (and its disabled buttons/progress) open afterward.
+            tokio::spawn(async move {
+                if { let control = operations().lock().unwrap(); !control.stopped && control.epoch == epoch }
+                    && !crate::integrations::PAUSED.load(Ordering::Relaxed) {
+                    let _ = discovery_set_until(true, resume, Some(revision)).await;
+                }
+            });
+        }
+        result
+    }
+
+    async fn send_inner(mac: String) -> Result<String, String> {
+        let operation = operations().lock().unwrap().register()?;
         if mt7922_daemon().is_some() {
             if mac.len() != 12 || !mac.bytes().all(|byte| byte.is_ascii_hexdigit()) {
                 return Err("Select a named AirDrop device from a fresh scan.".into());
             }
-            let _guard = SWITCH.get_or_init(|| Mutex::new(())).lock().await;
-            if !mt7922_status().await?.visible {
+            let _guard = operation.run(SWITCH.get_or_init(|| Mutex::new(())).lock()).await?;
+            if !operation.run(mt7922_status()).await??.visible {
                 return Err("The AirDrop radio is not visible. Turn it on and try again.".into());
             }
-            if !recent_mt7922_peers(None)?
-                .iter()
-                .any(|peer| peer.mac == mac && peer.name.is_some())
-            {
+            let known = selected_mt_peer_present(&discovery().peers, &mac)
+                || recent_mt7922_peers(None).is_ok_and(|peers| selected_mt_peer_present(&peers, &mac));
+            if !known {
                 return Err(
                     "That AirDrop recipient is no longer in the fresh device list. Scan again."
                         .into(),
                 );
             }
-            let daemon = mt7922_ready()?;
-            let picker = crate::platform::local_dir().join("omdrop-plugin/bin/pick.py");
+            mt7922_ready()?;
+            let opendrop = crate::platform::local_dir().join("owl/.venv-opendrop/bin/opendrop");
+            if !opendrop.is_file() { return Err("The AirDrop sender is missing. Reinstall the MT7922 backend.".into()); }
+            if !crate::platform::local_dir().join("bin/mochi-airdrop-send").is_file() {
+                return Err("Mochi's measured AirDrop sender is missing. Rerun setup.".into());
+            }
+            let picker = crate::platform::local_dir().join("bin/mochi-airdrop-pick");
             if !picker.is_file() {
                 return Err("The desktop file picker is not installed.".into());
             }
-            let output = Command::new("python3")
-                .arg(picker)
-                .args(["files", "", "Send via AirDrop"])
-                .kill_on_drop(true)
-                .output()
-                .await
-                .map_err(|e| format!("Could not open the file picker: {e}"))?;
+            let output = operation_output(Command::new("python3").arg(picker), &operation, None).await?;
             if output.status.code() == Some(1) {
                 return Err("No files selected.".into());
             }
@@ -1255,47 +1995,12 @@ mod linux {
             }) {
                 return Err("The file picker returned an invalid file.".into());
             }
-            if !recent_mt7922_peers(None)?
-                .iter()
-                .any(|peer| peer.mac == mac)
-            {
-                return Err(
-                    "The AirDrop device list expired while selecting files. Scan again.".into(),
-                );
-            }
-            // The explicit 12-digit service ID prevents the backend's unsafe
-            // default of sending to the first device that happened to answer.
-            let output = Command::new("timeout")
-                .args(["--signal=INT", "--kill-after=5s", "900s"])
-                .arg(daemon)
-                .arg("send")
-                .args(&files)
-                .env("AIRDROP_MODE", "shared")
-                .env("AIRDROP_DUALCHAN", "1")
-                .env("AIRDROP_RECEIVER", &mac)
-                .kill_on_drop(true)
-                .output()
-                .await
-                .map_err(|e| format!("Could not send through AirDrop: {e}"))?;
-            let message = String::from_utf8_lossy(if output.status.success() {
-                &output.stdout
-            } else {
-                &output.stderr
-            })
-            .trim()
-            .to_string();
-            if !output.status.success() {
-                return Err(if message.is_empty() {
-                    "AirDrop transfer failed or timed out.".into()
-                } else {
-                    message
-                });
-            }
-            return Ok(if message.is_empty() {
-                "AirDrop transfer complete.".into()
-            } else {
-                message
-            });
+            // The receiver already owns the radio and its Bluetooth advert.
+            // Use the same exact-ID sender verified by the live image test,
+            // not airdropd's attach/rebrowse wrapper (which can stop on self).
+            // Never reselect by index/name or auto-retry an ambiguous delivery.
+            let name = crate::settings::load().airdrop_name;
+            return send_mt7922_files(opendrop, &mac, &name, &files, &operation).await;
         }
         // Never accept command switches or a device name from the webview:
         // --to must be the exact address of the row the user picked. Omdrop
@@ -1308,8 +2013,8 @@ mod linux {
         if !valid {
             return Err("Invalid AirDrop recipient.".into());
         }
-        let _guard = SWITCH.get_or_init(|| Mutex::new(())).lock().await;
-        let state = status().await?;
+        let _guard = operation.run(SWITCH.get_or_init(|| Mutex::new(())).lock()).await?;
+        let state = operation.run(status()).await??;
         if !state.visible {
             return Err(
                 "Turn on AirDrop and open the iPhone's AirDrop receiving settings first.".into(),
@@ -1317,15 +2022,327 @@ mod linux {
         }
         // --pick uses Omdrop's desktop portal file chooser; paths remain in
         // the user-owned CLI, never pass through the webview or a shell.
-        let (ok, message) = run(&["send", "--to", &mac, "--pick"], 900).await?;
+        let (ok, message) = run_operation(&["send", "--to", &mac, "--pick"], 900, &operation).await?;
         if !ok {
             return Err(message);
         }
         Ok("AirDrop transfer complete.".into())
     }
 
+    async fn run_operation(args: &[&str], seconds: u64, operation: &Operation) -> Result<(bool, String), String> {
+        let exe = executable().ok_or(SETUP)?;
+        let output = operation_output(Command::new(exe).args(args), operation, Some(Duration::from_secs(seconds))).await?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Ok((output.status.success(), if stdout.is_empty() { stderr } else { stdout }))
+    }
+
     #[cfg(test)]
     mod tests {
+        #[test]
+        fn receiving_progress_compares_decoded_counts_and_never_guesses_missing_totals() {
+            let data = serde_json::json!({"wireBytes":50, "decodedBytes":1000, "totalBytes":2000,
+                "updatedMs":10000, "bytesPerSecond":25.0, "phase":"complete"});
+            let sample = super::measured_receive_progress(&data, 50, None, 10000).unwrap();
+            assert_eq!(sample.received_bytes, Some(1000));
+            assert_eq!(sample.total_bytes, Some(2000));
+            assert_eq!(sample.wire_bytes, Some(50));
+            assert_eq!(sample.state, "receiving", "telemetry cannot certify archive completion");
+            let no_total = serde_json::json!({"wireBytes":50, "updatedMs":10000});
+            let sample = super::measured_receive_progress(&no_total, 50, Some(2000), 10000).unwrap();
+            assert_eq!(sample.received_bytes, Some(50));
+            assert_eq!(sample.total_bytes, None, "raw compressed bytes cannot be compared to decoded totals");
+            let stale = super::measured_receive_progress(&data, 50, None, 13000).unwrap();
+            assert_eq!(stale.bytes_per_second, Some(0.0));
+            assert!(super::measured_receive_progress(&data, 50, None, 0).is_none());
+            assert!(super::measured_receive_progress(&serde_json::json!({"wireBytes":100000, "updatedMs":10000}), 0, None, 10000).is_none());
+        }
+
+        #[test]
+        fn detected_services_can_be_displayed_but_never_become_sendable_named_peers() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+            let raw = serde_json::json!([{"id":"000000000000", "name":null, "address":"fe80::2",
+                "lastSeen":now, "connection":"connecting", "discoverable":false}]);
+            let mut display = super::parse_mt_peers_with_age(serde_json::from_value(raw.clone()).unwrap(), "", "", 180.0);
+            assert_eq!(display.len(), 1);
+            assert!(display[0].name.is_none());
+            assert!(!display[0].fresh);
+            assert!(!super::selected_mt_peer_present(&display, "000000000000"));
+            assert!(super::parse_mt_peers(serde_json::from_value(raw).unwrap(), "", "").is_empty());
+            let seen = display[0].last_seen.unwrap();
+            super::expire_cached_peers(&mut display, seen + 30_001);
+            assert!(display.is_empty());
+        }
+
+        #[test]
+        fn warm_send_snapshot_requires_a_recent_named_response_from_the_exact_service() {
+            let row = serde_json::json!({"id":"000000000000", "name":"Phone", "address":"fe80::2", "port":8770,
+                "discoverable":true, "lastSeen":1000.0});
+            let report = |row: serde_json::Value| serde_json::json!([row]).to_string();
+            assert!(super::fresh_selected_report(&report(row.clone()), "000000000000", 1004.0, 5.0).is_some());
+            assert!(super::fresh_selected_report(&report(row.clone()), "abcdef123456", 1004.0, 5.0).is_none());
+            assert!(super::fresh_selected_report(&report(row.clone()), "000000000000", 1006.0, 5.0).is_none());
+            for (key, value) in [("lastSeen", serde_json::json!(99999)), ("address", serde_json::json!("::1")),
+                ("discoverable", serde_json::json!(false)), ("port", serde_json::json!(0)), ("name", serde_json::json!(""))] {
+                let mut bad = row.clone(); bad[key] = value;
+                assert!(super::fresh_selected_report(&report(bad), "000000000000", 1004.0, 5.0).is_none());
+            }
+        }
+
+        #[test]
+        fn live_selected_service_skips_redundant_probe_but_never_uses_display_cache_or_name_match() {
+            let row = serde_json::json!({"id":"000000000000", "name":"Phone", "address":"fe80::2", "port":8770,
+                "discoverable":true, "lastSeen":1000.0, "lastAnnounced":1024.0, "sessionVerified":true});
+            let report = |row: serde_json::Value| serde_json::json!([row]).to_string();
+            assert!(super::fresh_selected_report(&report(row.clone()), "000000000000", 1025.0, 5.0).is_none());
+            assert!(super::live_selected_report(&report(row.clone()), "000000000000", 1025.0).is_some());
+            assert!(super::live_selected_report(&report(row.clone()), "abcdef123456", 1025.0).is_none());
+            for (key, value) in [("lastAnnounced", serde_json::json!(990.0)),
+                ("lastAnnounced", serde_json::json!(1026.0)), ("sessionVerified", serde_json::json!(false)),
+                ("sessionVerified", serde_json::Value::Null), ("lastSeen", serde_json::json!(800.0)),
+                ("name", serde_json::json!("")), ("address", serde_json::json!("::1"))] {
+                let mut bad = row.clone(); bad[key] = value;
+                assert!(super::live_selected_report(&report(bad), "000000000000", 1025.0).is_none(), "invalid {key}");
+            }
+        }
+
+        #[test]
+        fn cached_phone_freshness_ages_without_extending_the_three_minute_display_lifetime() {
+            let mut peers = vec![super::Peer { mac: "000000000000".into(), name: Some("Phone".into()),
+                rssi: None, last_seen: Some(100_000), fresh: true, connection: None }];
+            super::expire_cached_peers(&mut peers, 120_000);
+            assert!(peers[0].fresh);
+            super::expire_cached_peers(&mut peers, 120_001);
+            assert!(!peers[0].fresh);
+            super::expire_cached_peers(&mut peers, 280_000);
+            assert_eq!(peers.len(), 1);
+            super::expire_cached_peers(&mut peers, 280_001);
+            assert!(peers.is_empty());
+        }
+
+        #[test]
+        fn display_cache_parser_does_not_relax_the_sender_freshness_gate() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+            let raw = serde_json::json!([{"id":"000000000000", "name":"Phone", "address":"fe80::2", "lastSeen":now - 60.0}]);
+            let display = super::parse_mt_peers_with_age(serde_json::from_value(raw.clone()).unwrap(), "Mochi", "", 180.0);
+            assert_eq!(display.len(), 1);
+            assert!(!display[0].fresh);
+            assert!(super::parse_mt_peers(serde_json::from_value(raw).unwrap(), "Mochi", "").is_empty());
+        }
+
+        #[test]
+        fn sender_progress_never_trusts_a_completion_phase_or_invalid_byte_counts() {
+            let session = super::SendingSession::begin().unwrap();
+            assert!(super::SendingSession::begin().is_err());
+            assert!(super::read_send_progress(r#"MOCHI_SEND {"phase":"sending","sentBytes":10,"totalBytes":100}"#));
+            assert_eq!(super::outbound().unwrap().sent_bytes, Some(10));
+            for line in [
+                r#"MOCHI_SEND {"phase":"complete","sentBytes":100,"totalBytes":100}"#,
+                r#"MOCHI_SEND {"phase":"sending","sentBytes":200,"totalBytes":100}"#,
+                r#"MOCHI_SEND {"phase":"untrusted","sentBytes":99,"totalBytes":100}"#,
+            ] {
+                super::read_send_progress(line);
+                let state = super::outbound().unwrap();
+                assert_eq!(state.phase, "sending");
+                assert_eq!(state.sent_bytes, Some(10));
+            }
+            super::send_phase("confirming", Some(100), Some(100));
+            assert_eq!(super::outbound().unwrap().phase, "confirming");
+            super::send_phase("complete", None, None);
+            assert_eq!(super::outbound().unwrap().phase, "complete");
+            drop(session);
+            assert!(!super::SENDING.load(std::sync::atomic::Ordering::SeqCst));
+        }
+
+        #[tokio::test]
+        async fn streaming_sender_cancellation_kills_the_owned_child_without_waiting_for_pipe_eof() {
+            let root = fixture_root("streaming-send-cancel");
+            let pid_file = root.join("pid");
+            let mut control = super::OperationControl::new();
+            let operation = control.register().unwrap();
+            let mut command = blocking_command(&pid_file);
+            let (result, pid) = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+                tokio::join!(super::sender_output(&mut command, &operation), async {
+                    let pid = wait_for_test_pid(&pid_file).await;
+                    control.stop();
+                    pid
+                })
+            }).await.unwrap();
+            assert_eq!(result.unwrap_err(), super::CANCELLED);
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn stopping_invalidates_existing_operations_and_blocks_late_registration() {
+            let mut control = super::OperationControl::new();
+            let operation = control.register().unwrap();
+            let old_epoch = control.epoch;
+            let stopped_epoch = control.stop();
+            assert!(operation.check().is_err());
+            assert!(control.register().is_err(), "off must also block work that registers after its signal");
+            assert!(!control.enabled(old_epoch), "a stale enable cannot undo a newer off");
+            assert!(control.enabled(stopped_epoch));
+            assert!(control.register().unwrap().check().is_ok());
+            assert!(operation.check().is_err(), "old operations stay cancelled after enabling again");
+        }
+
+        fn blocking_command(pid_file: &std::path::Path) -> tokio::process::Command {
+            // exec keeps one PID. The inert child ignores SIGINT and performs
+            // no networking, file transfer, or radio operations.
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command.args(["-c", "trap '' INT; printf '%s' $$ > \"$1\"; exec sleep 120", "mochi-test"])
+                .arg(pid_file);
+            command
+        }
+
+        async fn wait_for_test_pid(path: &std::path::Path) -> u32 {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Ok(value) = std::fs::read_to_string(path) {
+                        if let Ok(pid) = value.parse() { return pid; }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }).await.expect("test helper must report its PID")
+        }
+
+        #[tokio::test]
+        async fn off_cancels_each_workflow_phase_reaps_its_child_and_releases_the_switch() {
+            use std::time::Duration;
+            for phase in ["scan", "chooser", "send"] {
+                let root = fixture_root(phase);
+                let pid_file = root.join("pid");
+                let gate = tokio::sync::Mutex::new(());
+                let mut control = super::OperationControl::new();
+                let operation = control.register().unwrap();
+                let work = async {
+                    let _guard = operation.run(gate.lock()).await?;
+                    if phase == "scan" {
+                        let mut child = super::OwnedChild::spawn(blocking_command(&pid_file)
+                            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null()))?;
+                        let result = operation.run(std::future::pending::<()>()).await;
+                        child.kill_and_reap().await;
+                        result
+                    } else {
+                        super::operation_output(&mut blocking_command(&pid_file), &operation,
+                            if phase == "send" { Some(super::SEND_TIMEOUT) } else { None }).await.map(|_| ())
+                    }
+                };
+                let stop = async {
+                    let pid = wait_for_test_pid(&pid_file).await;
+                    control.stop();
+                    assert!(control.register().is_err());
+                    pid
+                };
+                let (result, pid) = tokio::time::timeout(Duration::from_secs(4), async {
+                    tokio::join!(work, stop)
+                }).await.expect("off must not wait for the chooser or 900-second sender timeout");
+                assert_eq!(result.unwrap_err(), super::CANCELLED);
+                assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists(), "actual child must be reaped: {phase}");
+                assert!(gate.try_lock().is_ok(), "off must be able to acquire SWITCH after {phase}");
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+
+        #[tokio::test]
+        async fn deadline_kills_the_actual_sender_even_when_it_ignores_sigint() {
+            use std::time::Duration;
+            let root = fixture_root("sender-timeout");
+            let pid_file = root.join("pid");
+            let control = super::OperationControl::new();
+            let operation = control.register().unwrap();
+            let result = super::operation_output(&mut blocking_command(&pid_file), &operation,
+                Some(Duration::from_millis(500))).await;
+            assert_eq!(result.unwrap_err(), super::SEND_TIMED_OUT);
+            let pid = wait_for_test_pid(&pid_file).await;
+            assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[tokio::test]
+        async fn cancelling_a_dropped_command_future_does_not_leave_the_helper_running() {
+            use std::time::Duration;
+            let root = fixture_root("dropped-helper");
+            let pid_file = root.join("pid");
+            let control = super::OperationControl::new();
+            let operation = control.register().unwrap();
+            let mut command = blocking_command(&pid_file);
+            let mut work = Box::pin(super::operation_output(&mut command, &operation, None));
+            let pid = tokio::select! {
+                result = &mut work => panic!("blocking helper unexpectedly returned: {result:?}"),
+                pid = wait_for_test_pid(&pid_file) => pid,
+            };
+            // Dropping the owning future happens when a Tauri request is aborted.
+            drop(work);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }).await.expect("dropping an owned helper must kill and reap it");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[tokio::test]
+        async fn selected_phone_discovery_waits_past_other_phones_and_respects_its_deadline() {
+            use std::time::{Duration, Instant};
+            let control = super::OperationControl::new();
+            let operation = control.register().unwrap();
+            let phone = |id: &str| super::Peer { mac: id.into(), name: Some("Phone".into()), rssi: None, last_seen: None, fresh: true, connection: None };
+            let mut child = super::OwnedChild::spawn(tokio::process::Command::new("/bin/sleep").arg("120")).unwrap();
+            let mut calls = 0;
+            let peers = super::wait_for_mt_peers(&mut child, Some("aaaaaaaaaaaa"), &operation,
+                Duration::from_secs(1), Duration::from_millis(5), || {
+                    calls += 1;
+                    Some(vec![phone(if calls == 1 { "bbbbbbbbbbbb" } else { "aaaaaaaaaaaa" })])
+                }).await.unwrap();
+            assert_eq!(calls, 2, "phone B must not end a refresh for phone A");
+            assert!(super::selected_mt_peer_present(&peers, "aaaaaaaaaaaa"));
+            let start = Instant::now();
+            let peers = super::wait_for_mt_peers(&mut child, Some("aaaaaaaaaaaa"), &operation,
+                Duration::from_millis(30), Duration::from_millis(5), || Some(vec![phone("bbbbbbbbbbbb")]))
+                .await.unwrap();
+            assert!(start.elapsed() >= Duration::from_millis(30));
+            assert!(!super::selected_mt_peer_present(&peers, "aaaaaaaaaaaa"), "an absent target must never be replaced");
+            child.kill_and_reap().await;
+        }
+
+        #[test]
+        fn post_chooser_refresh_requires_the_same_named_service_never_a_name_match() {
+            let phones = vec![super::Peer { mac: "abcdef123456".into(), name: Some("My iPhone".into()), rssi: None, last_seen: None, fresh: true, connection: None }];
+            assert!(super::selected_mt_peer_present(&phones, "ABCDEF123456"));
+            assert!(!super::selected_mt_peer_present(&phones, "000000000000"));
+            let unnamed = vec![super::Peer { mac: "abcdef123456".into(), name: None, rssi: None, last_seen: None, fresh: true, connection: None }];
+            assert!(!super::selected_mt_peer_present(&unnamed, "abcdef123456"));
+            assert!(!super::selected_mt_peer_present(&[], "abcdef123456"));
+        }
+
+        #[test]
+        fn sending_uses_exact_id_and_repeatable_files_without_radio_wrapper() {
+            let command = super::mt7922_send_command(std::path::Path::new("/custom/opendrop"),
+                "000000000000", "Mochi", &["/photos/one image.png".into(), "/photos/two.jpg".into()]);
+            let args: Vec<_> = command.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+            assert_eq!(command.as_std().get_program(), "/custom/python");
+            assert_eq!(super::SEND_TIMEOUT, std::time::Duration::from_secs(900));
+            let helper = crate::platform::local_dir().join("bin/mochi-airdrop-send");
+            assert_eq!(args, ["-u", helper.to_str().unwrap(), "-n", "Mochi", "-i", "awdl0", "-r", "000000000000",
+                "-f", "/photos/one image.png", "-f", "/photos/two.jpg"]);
+            assert!(!args.iter().any(|arg| arg.contains("airdropd")));
+        }
+
+        #[test]
+        fn send_errors_explain_recovery_without_leaking_paths_or_claiming_radio_setup() {
+            for reason in ["ConnectionRefusedError", "RemoteDisconnected", "Selected AirDrop service no longer exists"] {
+                let message = super::mt7922_send_error(Some(1), &format!("{reason}: /private/photo.png"));
+                assert!(message.contains("Find iPhone"));
+                assert!(!message.contains("/private"));
+            }
+            assert!(super::mt7922_send_error(Some(124), "").contains("Check the phone before retrying"));
+            assert!(super::mt7922_send_error(Some(1), "Receiver declined").contains("accept the prompt"));
+            assert!(super::mt7922_send_error(Some(1), "Traceback: /private/photo.png").contains("did not confirm delivery"));
+        }
+
         fn fixture_root(label: &str) -> std::path::PathBuf {
             let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
             let root = std::env::temp_dir().join(format!("mochi-{label}-{}-{nonce}", std::process::id()));
@@ -1370,8 +2387,12 @@ mod linux {
             let directory = root.join("airdropd");
             let guard = super::lock_idle_receiver_at(&directory).unwrap();
             assert!(super::lock_idle_receiver_at(&directory).is_err());
+            // A concurrent fork inherits the same open file description until
+            // exec. Simulate that reference without forking the test runner.
+            let inherited = guard.0.try_clone().unwrap();
             drop(guard);
             drop(super::lock_idle_receiver_at(&directory).unwrap());
+            drop(inherited);
 
             let alias = root.join("alias");
             symlink(&directory, &alias).unwrap();
@@ -1428,13 +2449,12 @@ mod linux {
         }
 
         #[test]
-        fn upload_progress_uses_wire_total_and_only_the_new_raw_archive() {
+        fn upload_progress_reads_declared_totals_and_only_the_new_raw_archive() {
             use super::{archive_received, upload_total_bytes};
             let log = "POST request at /Upload\nTotalBytes: 186876480\nTransfer-Encoding: chunked\nReceiving file(s) ...";
             assert_eq!(upload_total_bytes(log), Some(186876480));
-            // iOS 26 sends dvzip. Its TotalBytes still drives the ring, so a
-            // real transfer shows measured progress instead of an endless
-            // spinner. Success comes from the trailer, never from this.
+            // Compare TotalBytes with decoded telemetry, never compressed
+            // raw bytes. Success comes from the trailer, never this header.
             assert_eq!(
                 upload_total_bytes(
                     "POST request at /Upload\nContent-Type: application/x-dvzip\nTotalBytes: 456877337\nReceiving file(s) ..."
@@ -1474,11 +2494,29 @@ mod linux {
         fn long_upload_keeps_its_status_and_partial_files_are_not_success() {
             use super::transfer_state;
             assert_eq!(transfer_state("Receiving file(s) ...", 30 * 60), Some("receiving"));
-            assert_eq!(transfer_state("", 11 * 60), None);
+            assert_eq!(transfer_state("", 11 * 60), Some("notStarted"));
+            assert_eq!(transfer_state("", 90), Some("waiting"));
+            assert_eq!(transfer_state("", 91), Some("notStarted"));
+            assert_eq!(transfer_state("POST request at /Upload", 30 * 60), Some("receiving"));
             assert_eq!(transfer_state("", 30), Some("waiting"));
             assert_eq!(transfer_state("Receiving file(s) ...\nExtracted into /tmp: video.mov\nFile(s) received", 180), Some("complete"));
             assert_eq!(transfer_state("Receiving file(s) ...\nincomplete, kept as .partial: video.mov\nCould not extract the archive\nFile(s) received", 180), Some("failed"));
             assert_eq!(transfer_state("Receiving file(s) ...\nFile(s) incomplete", 180), Some("failed"));
+        }
+
+        #[test]
+        fn accepted_request_without_upload_becomes_actionable_without_claiming_received_bytes() {
+            for (age, state, message) in [(0, "waiting", "Accepted"), (15, "waiting", "Accepted"),
+                (16, "waiting", "Connection delayed"), (90, "waiting", "Connection delayed"),
+                (91, "failed", "No file bytes were received")] {
+                let transfer = super::upload_start_status(age);
+                assert_eq!(transfer.state, state);
+                assert!(transfer.message.unwrap().contains(message));
+                assert_eq!(transfer.received_bytes, None);
+                assert_eq!(transfer.total_bytes, None);
+                assert_eq!(transfer.wire_bytes, None);
+                assert_eq!(transfer.bytes_per_second, None);
+            }
         }
 
         #[test]
@@ -1512,6 +2550,24 @@ mod linux {
             let radio_active = true;
             let receiver_listening = false;
             assert!(!(daemon_active && radio_active && receiver_listening));
+        }
+
+        #[test]
+        fn retired_selection_is_detected_without_substituting_a_same_name_service() {
+            let peer = |id: &str, name: Option<&str>| serde_json::from_value::<super::Peer>(serde_json::json!({
+                "mac":id, "name":name, "fresh":false,
+            })).unwrap();
+            let mut snapshot = super::Discovery { running: true, peers: vec![peer("aabbccddeeff", Some("Test Phone"))], ..Default::default() };
+            assert!(!super::selected_service_retired(&snapshot, "AABBCCDDEEFF"));
+            snapshot.peers = vec![peer("112233445566", Some("Test Phone"))];
+            assert!(super::selected_service_retired(&snapshot, "aabbccddeeff"), "same name must not authorize a rotated service");
+            snapshot.peers.push(peer("aabbccddeeff", None));
+            assert!(!super::selected_service_retired(&snapshot, "aabbccddeeff"), "an unresolved exact service can still answer");
+            snapshot.peers.clear();
+            assert!(!super::selected_service_retired(&snapshot, "aabbccddeeff"), "an empty startup snapshot is not proof of removal");
+            snapshot.peers = vec![peer("112233445566", Some("Other Phone"))];
+            snapshot.running = false;
+            assert!(!super::selected_service_retired(&snapshot, "aabbccddeeff"), "an inactive cache must not prevent cold discovery");
         }
 
         #[test]
@@ -1551,7 +2607,16 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{decide, incoming, peers, preferences, send, set, status, stop_if_owned, transfer, watch_incoming};
+pub use linux::{decide, discovery, discovery_set, outbound, incoming, peers, preferences, send, set, status, stop_if_owned, transfer, watch_incoming};
+
+#[cfg(not(target_os = "linux"))]
+pub fn discovery() -> Discovery { Discovery::default() }
+
+#[cfg(not(target_os = "linux"))]
+pub async fn discovery_set(_enabled: bool) -> Result<Discovery, String> { Ok(Discovery::default()) }
+
+#[cfg(not(target_os = "linux"))]
+pub fn outbound() -> Option<Outbound> { None }
 
 #[cfg(target_os = "linux")]
 pub use linux::Incoming;

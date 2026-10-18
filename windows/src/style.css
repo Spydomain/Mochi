@@ -2305,14 +2305,26 @@ input[type="range"]::-webkit-slider-thumb {
   border-radius: 19px; background: radial-gradient(ellipse at 22% 55%, rgba(45, 212, 191, .12), transparent 45%), #141518;
   padding: 13px 20px 11px 132px; overflow: hidden;
 }
-.airdrop-view-head { display: flex; align-items: center; color: #6ee7d6; }
+.airdrop-view { padding: 14px 16px 14px 112px; overflow-y: auto; }
+.airdrop-view-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: #6ee7d6; }
+.airdrop-view-head .airdrop-view-done { border: 0; background: transparent; color: var(--dim-3); font: 600 11px var(--font); cursor: pointer; padding: 4px 0 4px 8px; }
+.airdrop-view-head .airdrop-view-done:disabled { opacity: .5; cursor: default; }
 .airdrop-view-body { display: flex; flex-direction: column; gap: 5px; padding-top: 6px; min-height: 0; font: 12px/1.3 var(--font); }
-.airdrop-view-info { color: var(--ink); font-weight: 600; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.airdrop-view-info { color: var(--ink); font-weight: 600; overflow-wrap: anywhere; }
+.airdrop-view-info.failed { color: #ff9da6; }
 .airdrop-view-destination, .airdrop-view-notice { color: var(--dim-3); }
 .airdrop-view-destination { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.airdrop-view-peers { min-height: 0; overflow: auto; max-height: 19px; }
-.airdrop-view-peer { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.airdrop-view-peers { min-height: 0; overflow: auto; max-height: 78px; display: flex; flex-direction: column; gap: 6px; }
+.airdrop-view-peer { display: flex; flex-shrink: 0; align-items: center; gap: 12px; justify-content: space-between; min-height: 32px; padding: 3px 8px; border-radius: 10px; background: rgba(45, 212, 191, .06); }
+.airdrop-view-peer-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.airdrop-view-peer .airdrop-view-send { flex-shrink: 0; min-width: 54px; }
+.airdrop-transfer-progress { flex-direction: column; gap: 5px; padding: 6px 0; }
+.airdrop-transfer-labels { display: flex; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.airdrop-transfer-progress progress { width: 100%; height: 7px; border: 0; border-radius: 8px; overflow: hidden; accent-color: #58a6ff; }
+.airdrop-transfer-progress progress::-webkit-progress-bar { background: #173a66; border-radius: 8px; }
+.airdrop-transfer-progress progress::-webkit-progress-value { background: #58a6ff; border-radius: 8px; }
 .airdrop-view-actions, .airdrop-request-actions { display: flex; flex-wrap: nowrap; gap: 5px; align-items: center; margin-top: auto; }
+.airdrop-view-actions { flex-wrap: wrap; padding-top: 6px; }
 .airdrop-view-actions button, .airdrop-view-peer button, .airdrop-request-actions button {
   font: 600 11px var(--font); color: #b3fff2; background: rgba(45, 212, 191, .12);
   border: 1px solid rgba(45, 212, 191, .34); border-radius: 999px; padding: 4px 8px; cursor: pointer; white-space: nowrap;
@@ -2331,13 +2343,16 @@ input[type="range"]::-webkit-slider-thumb {
 #airdrop-compact-status {
   position: absolute; inset: 0; z-index: 9;
   display: none; justify-content: space-between; align-items: center;
-  padding: 0 12px; border-radius: 0 0 14px 14px;
+  padding: 0 10px; border-radius: 0 0 14px 14px;
   background: #000; pointer-events: none;
 }
+/* The normal bot/glow may overhang the new, shallower transfer strip. */
+#island.airdrop-session :is(#bot-canvas, #bot-glow, #mini-grid) { visibility: hidden; }
 .airdrop-compact-icon { display: flex; align-items: center; color: #55aaff; }
+.airdrop-compact-detail { color: #8ac6ff; font: 600 10px/1 var(--font); white-space: nowrap; }
 .airdrop-ring {
   display: flex; align-items: center; justify-content: center;
-  width: 23px; height: 23px; border: 3px solid #173a66;
+  width: 18px; height: 18px; border: 2px solid #173a66;
   border-top-color: #58a6ff; border-right-color: #58a6ff;
   border-radius: 50%; animation: airdrop-spin 1.15s linear infinite;
 }
@@ -2346,13 +2361,13 @@ input[type="range"]::-webkit-slider-thumb {
   background: conic-gradient(from -90deg, #58a6ff var(--airdrop-progress), #173a66 var(--airdrop-progress));
 }
 #airdrop-compact-status.determinate .airdrop-ring::before {
-  content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #000;
+  content: ""; position: absolute; inset: 2px; border-radius: 50%; background: #000;
 }
 #airdrop-compact-status.waiting .airdrop-ring { border-top-color: #367ac3; border-right-color: #367ac3; }
 #airdrop-compact-status.complete .airdrop-ring { border-color: #58a6ff; animation: none; }
-#airdrop-compact-status.complete .airdrop-ring::after { content: "✓"; color: #58a6ff; font: 700 15px/1 var(--font); }
+#airdrop-compact-status.complete .airdrop-ring::after { content: "✓"; color: #58a6ff; font: 700 12px/1 var(--font); }
 #airdrop-compact-status.failed .airdrop-ring { border-color: #fb7185; animation: none; }
-#airdrop-compact-status.failed .airdrop-ring::after { content: "!"; color: #fb7185; font: 700 15px/1 var(--font); }
+#airdrop-compact-status.failed .airdrop-ring::after { content: "!"; color: #fb7185; font: 700 12px/1 var(--font); }
 @keyframes airdrop-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .airdrop-ring { animation: none; } }
 

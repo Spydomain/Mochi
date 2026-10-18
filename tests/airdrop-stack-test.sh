@@ -66,6 +66,18 @@ if [[ -n "$opendrop_source" ]]; then
   mkdir -p "$tmp/opendrop/opendrop"
   cp "$opendrop_source" "$tmp/opendrop/opendrop/server.py"
   security_patch="$patches/opendrop-receive-security.patch"
+  progress_patch="$patches/opendrop-receive-progress.patch"
+  tls_patch="$patches/opendrop-concurrent-tls.patch"
+  finish_patch="$patches/opendrop-receive-finish.patch"
+  if patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$finish_patch" >/dev/null 2>&1; then
+    patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --reverse < "$finish_patch" >/dev/null
+  fi
+  if patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$tls_patch" >/dev/null 2>&1; then
+    patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --reverse < "$tls_patch" >/dev/null
+  fi
+  if patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$progress_patch" >/dev/null 2>&1; then
+    patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --reverse < "$progress_patch" >/dev/null
+  fi
   # Security overlaps workspace hunks, so unwind newest-first on this copy.
   if patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse \
       < "$security_patch" >/dev/null 2>&1; then
@@ -91,6 +103,13 @@ if [[ -n "$opendrop_source" ]]; then
   python3 "$repo/tests/opendrop-archive-test.py" "$tmp/opendrop/opendrop/server.py"
   patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" < "$security_patch" >/dev/null
   patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$security_patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" < "$progress_patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$progress_patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" < "$tls_patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$tls_patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" < "$finish_patch" >/dev/null
+  patch --batch --forward --fuzz=0 "$tmp/opendrop/opendrop/server.py" --dry-run --reverse < "$finish_patch" >/dev/null
+  "$installed_opendrop/bin/python" "$repo/tests/airdrop-tls-test.py" "$tmp/opendrop/opendrop/server.py"
   "$installed_opendrop/bin/python" "$repo/tests/airdrop-receive-test.py" "$tmp/opendrop/opendrop/server.py" --no-network
   cp "$(dirname "$opendrop_source")/config.py" "$tmp/opendrop/opendrop/config.py"
   identity_patch="$patches/opendrop-stable-service-id.patch"
@@ -101,6 +120,34 @@ if [[ -n "$opendrop_source" ]]; then
   patch --batch --forward -d "$tmp/opendrop/opendrop" -p1 --fuzz=0 < "$identity_patch" >/dev/null
   patch --batch --forward -d "$tmp/opendrop/opendrop" -p1 --fuzz=0 --dry-run --reverse < "$identity_patch" >/dev/null
   "$installed_opendrop/bin/python" "$repo/tests/airdrop-identity-test.py" "$tmp/opendrop/opendrop/config.py"
+  for name in client cli util; do
+    cp "$(dirname "$opendrop_source")/$name.py" "$tmp/opendrop/opendrop/$name.py"
+  done
+  formats_patch="$patches/opendrop-file-formats.patch"
+  if patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 --dry-run --reverse \
+      < "$formats_patch" >/dev/null 2>&1; then
+    patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 --reverse < "$formats_patch" >/dev/null
+  fi
+  patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 < "$formats_patch" >/dev/null
+  patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 --dry-run --reverse < "$formats_patch" >/dev/null
+  "$installed_opendrop/bin/python" "$repo/tests/airdrop-file-formats-test.py" \
+    "$tmp/opendrop/opendrop/client.py" "$tmp/opendrop/opendrop/util.py"
+  discovery_patch="$patches/opendrop-send-discovery.patch"
+  if patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 --dry-run --reverse \
+      < "$discovery_patch" >/dev/null 2>&1; then
+    patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 --reverse < "$discovery_patch" >/dev/null
+  fi
+  patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 < "$discovery_patch" >/dev/null
+  patch --batch --forward --fuzz=0 -d "$tmp/opendrop/opendrop" -p1 --dry-run --reverse < "$discovery_patch" >/dev/null
+  "$installed_opendrop/bin/python" "$repo/tests/airdrop-discovery-test.py" \
+    "$tmp/opendrop/opendrop/client.py" "$tmp/opendrop/opendrop/cli.py"
+  cp "$tmp/opendrop/opendrop/server.py" "$tmp/workspace-server.py"
+  patch --batch --forward --fuzz=0 --reverse "$tmp/workspace-server.py" < "$finish_patch" >/dev/null
+  patch --batch --forward --fuzz=0 --reverse "$tmp/workspace-server.py" < "$tls_patch" >/dev/null
+  patch --batch --forward --fuzz=0 --reverse "$tmp/workspace-server.py" < "$progress_patch" >/dev/null
+  patch --batch --forward --fuzz=0 --reverse "$tmp/workspace-server.py" < "$security_patch" >/dev/null
+  bash "$repo/tests/setup-airdrop-receiver-test.sh" "$tmp/workspace-server.py" \
+    "$tmp/opendrop/opendrop/config.py" "$tmp/opendrop/opendrop/client.py" "$tmp/opendrop/opendrop/cli.py" "$tmp/opendrop/opendrop/util.py"
 fi
 if [[ -n "${MOCHI_TEST_HOSTAPD_TARBALL:-}" ]]; then
   printf '%s  %s\n' '2b3facb632fd4f65e32f4bf82a76b4b72c501f995a4f62e330219fe7aed1747a' \

@@ -18,7 +18,7 @@ Mochi is a Linux-first, Dynamic Island-style desktop companion built with Tauri,
 - **Agent activity and chat:** follow supported coding-agent sessions, respond to prompts, and chat through your existing OpenCode installation. Setup installs the OpenCode hook and starts its local service; it does not install Llama.
 - **Media:** play, pause, skip, and select players exposed through Linux MPRIS. A browser or page must publish a controllable media session for these buttons to work.
 - **System and power:** view process and network snapshots, see battery charge and charging state, and use the optional Awake control to inhibit screen-idle blanking on supported Linux desktops.
-- **AirDrop (Linux, experimental):** control an optional AWDL receiver and select a specific nearby recipient for file sharing. Hardware support varies; a real iPhone transfer is required to verify it on your machine. On the development machine, receiving from an iPhone has been tested; sending to an iPhone has not. See [AirDrop setup](#airdrop-style-sharing-on-linux).
+- **AirDrop (Linux, experimental):** control an optional AWDL receiver and select a specific nearby recipient for file sharing. Hardware support varies; a real iPhone transfer is required to verify it on your machine. On the MT7922 development machine, both receiving an iPhone photo and sending a small test JPEG to an iPhone have been verified. See [AirDrop setup](#airdrop-style-sharing-on-linux).
 - **Clock and weather:** show local 12-hour time and, if you opt in, live conditions and subtle weather animation behind the Clock card.
 - **A little personality:** Mochi reacts to music, charging changes, low battery, and the time of day. Reminders and animations stay inside the expanded capsule.
 
@@ -28,19 +28,21 @@ The four small companion pills are configurable in Settings. The capsule retract
 
 [![Animated Linux demo: Mochi opens its Clock and weather card, prompts for an iPhone AirDrop, and shows transfer completion](docs/media/mochi-demo.gif)](docs/media/mochi-demo.mp4)
 
-*The looping demo plays inline above. Click it to open the [MP4 version](docs/media/mochi-demo.mp4). Recorded from the running Linux build on October 16, 2026: hover opening, Clock with weather, an actual iPhone consent prompt, the compact transfer indicator, and completion. Pauses between excerpts are removed; no audio or file contents are included.*
+*Recorded from the running Linux app on October 18, 2026. This 27-second edit shows Clock and weather, a real iPhone consent prompt, measured transfer progress, and completion. Excerpts play at their recorded speed; waits are omitted and compact indicators are enlarged for readability. No audio or transferred-file contents are included. Click the GIF for the [MP4 version](docs/media/mochi-demo.mp4).*
 
 | Clock and weather | Incoming AirDrop |
 | --- | --- |
-| ![Mochi's Clock card with Kathmandu weather, four companion pills, battery status, AirDrop, and Awake](docs/media/mochi-overview.png) | ![An actual incoming iPhone photo request with explicit Decline and Accept buttons](docs/media/mochi-airdrop-request.png) |
+| ![Mochi's Clock card with Kathmandu weather, four companion pills, battery status, AirDrop, and Awake](docs/media/mochi-overview.png) | ![An actual incoming iPhone video request with explicit Decline and Accept buttons](docs/media/mochi-airdrop-request.png) |
 
 *Actual desktop captures, cropped to Mochi. Weather stays behind the Clock card. Other platforms and desktop themes may look different.*
 
-![Mochi's compact AirDrop indicator showing successful receipt](docs/media/mochi-airdrop-received.png)
+| Receiving | Completed |
+| --- | --- |
+| ![Mochi's compact AirDrop indicator displaying measured progress](docs/media/mochi-airdrop-progress.png) | ![Mochi's compact AirDrop indicator showing successful receipt](docs/media/mochi-airdrop-received.png) |
 
 [Open the Linux demo as MP4](docs/media/mochi-demo.mp4) · [View the overview](docs/media/mochi-overview.png) · [View the consent prompt](docs/media/mochi-airdrop-request.png).
 
-The recorded iPhone → Mochi test received a 2.17 MB photo. The receiver verified the archive trailer, extracted the photo, and returned HTTP 200 before reporting success. This demonstrates receiving on the development machine, not universal hardware compatibility or verified sending to an iPhone. Requests need an explicit **Accept**; unanswered prompts expire after 15 seconds.
+The recorded iPhone → Mochi test received a 76.44 MB video. The receiver verified its archive, saved the video, and returned HTTP 200; its reported average was about 1.01 MB/s. It also logged an incomplete HTTP-ending warning after the verified archive arrived. These observations describe this development-machine transfer, not universal compatibility or maximum speed. A separate Mochi → iPhone test delivered a 19 KB generated JPEG after the phone accepted it; the user confirmed the image arrived. Requests need an explicit **Accept**; unanswered Mochi prompts expire after 15 seconds. See the [capture notes](docs/media/README.md) for provenance and editing details.
 
 ## Install on Linux
 
@@ -69,7 +71,54 @@ On Niri, setup enables a user `systemd` service for graphical login. On other de
 ./update-mochi.sh
 ```
 
-The updater checks this repository's default branch. It leaves an up-to-date, complete installation unchanged, fast-forwards a clean checkout when a new commit exists, and rebuilds through the same setup script. If a previous installation stopped partway through or its relay, cleanup script, AirDrop consent hook, or supported MT7922 backend is missing or outdated, it retries setup. A verified, running AirDrop receiver stays up while the app updates; if its backend needs replacing, finish the transfer and turn AirDrop off before retrying instead of updating a live radio. It refuses to overwrite local edits or merge divergent histories; commit or stash your changes first.
+The updater checks this repository's default branch. It leaves an up-to-date, complete installation unchanged, fast-forwards a clean checkout when a new commit exists, and rebuilds through the same setup script. If a previous installation stopped partway through or its relay, cleanup script, AirDrop file chooser/consent hook, or supported MT7922 backend is missing or outdated, it retries setup. Setup also checks for an outgoing AirDrop sender or file chooser before replacing/restarting the app; finish that workflow before retrying. A verified, running AirDrop receiver stays up while the app updates; if its backend needs replacing, finish the transfer and turn AirDrop off before retrying instead of updating a live radio. It refuses to overwrite local edits or merge divergent histories; commit or stash your changes first.
+
+Updates preserve setup's `--no-airdrop` choice; they do not silently install
+the experimental radio backend. To opt back in on supported hardware, rerun
+`./mochi-full-setup.sh` without that option.
+
+### Uninstall
+
+Run as your desktop user, **not** with `sudo`:
+
+```bash
+./uninstall-mochi.sh --dry-run   # preview without changing anything
+./uninstall-mochi.sh             # remove app, launchers, user services and managed hooks
+# Also delete Mochi settings/logs/history/cache and incomplete-transfer recovery:
+./uninstall-mochi.sh --purge --remove-airdrop-system
+```
+
+Setup also installs `~/.local/share/mochi/bin/uninstall-mochi`, so the checkout
+is not needed. Paths honor `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`
+and `XDG_STATE_HOME`. Removal asks for confirmation; `--yes` skips only that
+question, not safety checks. Finish sends/file selection and **turn AirDrop off**
+first; uninstall refuses an active receiver instead of disrupting transfers or
+Wi-Fi.
+
+The uninstaller detects the same Arch, Debian/Ubuntu, Fedora/RHEL, and openSUSE
+families as setup. It removes the installed user services or XDG autostart
+entries that actually exist, rather than assuming a desktop from the distro
+name. Unknown and immutable distributions can still use safe XDG cleanup.
+`--check` is an alias for the non-destructive `--dry-run`. Shared system
+packages are never removed with `apt`, `pacman`, `dnf`, or `zypper`.
+
+By default, preferences, history, logs and private recovery data remain for a
+reinstall. `--purge` deletes them, including staged incomplete files. Received
+files and the chosen save folder are never deleted; overlapping managed/save
+directories require manual review. Autostart backups and backups of edited
+agent configurations are retained. Hooks are removed selectively, preserving
+other commands and restoring Claude's previous status line when available.
+
+`--remove-airdrop-system` additionally requests `sudo` to remove privileged
+AirDrop helpers whose bytes match the installed backend sources/builds, plus
+the exact current-user sudoers rules. These upstream-named helpers may be shared
+with a separate AirDrop installation; omit this option if you still use one.
+Run it **with the initial uninstall**, while those comparison sources exist.
+Unknown/modified helpers are kept for manual review; unexpected sudoers rules
+abort cleanup. Preexisting/shared OpenDrop identity (`~/.opendrop`), third-party
+AirDrop configuration, distro packages, Rust, OpenCode, its sessions, other
+agents and your source checkout are never removed. No network reset or global
+radio/TCP changes are performed.
 
 ### Check the running app
 
@@ -98,6 +147,13 @@ MediaTek MT7922 adapters (`14c3:0616`, `mt7921e`) can use the experimental [aird
 On a detected MT7922 (`14c3:0616`, `mt7921e`), `./mochi-full-setup.sh` and updates through `./update-mochi.sh` install the pinned [airdrop-mt7921](https://github.com/jedbillyb/airdrop-mt7921) and [OWL](https://github.com/jedbillyb/owl) revisions with Mochi's tested patches, a checksum-verified hostapd 2.11 build with the [P2P-GO patch](https://github.com/jedbillyb/mt7921-dual-channel), and root-owned helpers. The upstream installer adds narrowly scoped passwordless-sudo rules after validating them with `visudo`; you may be prompted for your administrator password on a fresh machine. Only root-owned binaries outside the writable source checkouts enter these rules. Installation never starts the radio, refuses to modify an active receiver, and creates a **shared-mode** config instead of upstream's Wi-Fi-disconnecting exclusive default. `--no-airdrop` skips radio provisioning. Review the upstream [P2P-GO instructions](https://github.com/jedbillyb/airdrop-mt7921/blob/main/daemon/README.md) before enabling this experimental feature.
 
 Setup also applies the Wi-Fi coexistence update. This keeps the managed Wi-Fi station awake while AirDrop shares the radio and restores its previous power-saving setting when AirDrop stops. The connection stays on its existing network; power use may increase while AirDrop is active. An unrecognized backend checkout is preserved for manual review rather than overwritten.
+
+MT7922 setup explicitly installs BlueZ, NetworkManager, Python D-Bus/GObject,
+GTK chooser bindings and the required build libraries. Mochi bundles its own
+multi-file chooser; this route does not require an Omdrop checkout. The setup
+does not unblock Bluetooth, replace an active network manager, or enable the
+radio for you: BlueZ must be running, Bluetooth enabled and Wi-Fi managed by
+NetworkManager before using AirDrop. Unsupported adapters remain opt-in/manual.
 
 The backend lives under `~/.local/share/mochi/airdrop-mt7921`. To send **to** Mochi, set the iPhone to **Everyone for 10 Minutes** and **open** its Share → AirDrop sheet; the AirDrop switch only confirms that the Linux radio is running, not that the iPhone has discovered it. To send **from** Mochi, keep the iPhone unlocked and in receiving mode, **close** its share sheet, click **Find iPhone**, and select the named phone before choosing files. On MT7922, Mochi briefly sends a Bluetooth wake advertisement before scanning AWDL. This requires the backend's `tools/blewake-dbus.py`, BlueZ, and Python D-Bus bindings. Mochi passes the selected device's unique service ID to the sender; it will not silently choose the first nearby device. Discovery may take about 30 seconds and needs a fresh scan before sending.
 
@@ -133,11 +189,11 @@ printf '%s\n' USB_INTERFACE_NAME | sudo tee /etc/omdrop/infra-iface
 ~/.local/bin/omdrop doctor
 ```
 
-The USB card's *exclusive* mode takes **that USB card** out of normal networking; it should not take the internal Wi-Fi offline. Mochi refuses to start Omdrop on its selected adapter if that adapter is connected to Wi-Fi, even if the driver advertises shared mode. Check the backend's card-specific notes and test it with a nearby iPhone before relying on it. The switch shows Omdrop's actual receiver/radio status and a setup or error message if it cannot make the computer visible. Neither a green switch nor unit tests replace a real transfer test: on the development machine, iPhone → Mochi received a photo successfully, but Mochi → iPhone discovery and transfer remain unverified.
+The USB card's *exclusive* mode takes **that USB card** out of normal networking; it should not take the internal Wi-Fi offline. Mochi refuses to start Omdrop on its selected adapter if that adapter is connected to Wi-Fi, even if the driver advertises shared mode. Check the backend's card-specific notes and test it with a nearby iPhone before relying on it. The switch shows Omdrop's actual receiver/radio status and a setup or error message if it cannot make the computer visible. Neither a green switch nor unit tests replace a real transfer test: the development machine's bidirectional photo tests used MT7922, not this separate Omdrop/USB route.
 
 The MT7922 route above is still not a no-disconnection guarantee: upstream reports that a sustained active AWDL session can stall the driver and require recovery. [AirScreen](https://www.airscreen.app/) is an AirPlay/Cast receiver, not an AirDrop file receiver; it does not make Linux appear in the iPhone AirDrop picker.
 
-The device list is passive by default. **Find iPhone** actively scans for AirDrop services and may briefly advertise over Bluetooth to wake nearby devices; use it only when you want to discover them. An empty list means no iPhone AirDrop service answered, even if AWDL radio frames were seen. If the iPhone does not list Mochi, confirm Bluetooth and Wi-Fi are enabled on the phone, reopen its Share → AirDrop sheet, and allow a few seconds; shared-radio mode remains experimental and may not establish a usable channel on every run.
+The device list is passive by default. On MT7922, **Find iPhone** starts continuous discovery and a Bluetooth wake advertisement, with results appearing as devices resolve. Found phones remain listed for **three minutes** after their last successful response, with **recently seen** marking cached entries. Background discovery adds new devices and refreshes existing ones; cached selections still require a fresh exact-device check before sending. Browsing pauses during an upload and resumes afterward within the original ten-minute search session. **Stop finding**, Turn off, pausing, or app exit stops that search. The panel folds when you stop hovering without cancelling search or sending; outgoing transfers use the same compact strip as receiving. Outgoing phase/counter reporting distinguishes waiting for phone acceptance from byte progress and receiver confirmation; it does not promise a higher radio throughput. Omdrop retains one-shot discovery. Shared-radio mode remains experimental and may not establish a usable channel on every run.
 
 The third-party receiver and sender keep local runtime logs that may include device names and filenames. Review them before sharing diagnostics. Mochi does not add a cloud relay to this optional path.
 
@@ -156,6 +212,7 @@ playerctl metadata
 | Media controls do nothing | Start eligible media and confirm the browser or app appears in `playerctl -l`. |
 | Locate me names no new city | Check desktop location permission and GeoClue accuracy; use Find city if the only fix is coarse. |
 | Chat reports a local connection error | Check `opencode service status`, then try `opencode service start`. |
+| OpenCode still appears busy after stopping | The managed V2 plugin handles execution completion/interruption and reconciles missed stop events against OpenCode's activity API. Reinstall the managed plugin from Mochi settings/setup if an old copy is loaded; do not restart active sessions just to clear a card. A different running OpenCode session can legitimately keep the shared pill active. |
 | An AirDrop request is declined automatically | Answer the island's consent prompt within 15 seconds. If no prompt appears, check the app and receiver logs; never enable blanket acceptance as a workaround. |
 | An AirDrop upload is incomplete | Leave the originals on the iPhone, retry a small file, and inspect the [recovery and diagnostics guide](windows/airdrop/README.md#storage-and-recovery). |
 | Awake is off but the laptop has not suspended | Awake off releases Mochi's idle inhibitor; your desktop's screen-off and suspend timeouts still apply. Check those timeouts and other apps' inhibitors before reporting a regression. |

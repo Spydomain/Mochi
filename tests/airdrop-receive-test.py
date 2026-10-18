@@ -17,6 +17,7 @@ import socket
 import struct
 import sys
 import tempfile
+import threading
 import time
 import tracemalloc
 import unittest
@@ -94,6 +95,8 @@ class FakeHandler(scope.get("PatchedHandler", object)):
         self.config = SimpleNamespace(computer_model="test", computer_name="Mochi", record_data=None)
     def settimeout(self, timeout):
         self.timeout = timeout
+    def gettimeout(self):
+        return getattr(self, 'timeout', None)
     def send_response(self, code):
         self.responses.append(code)
     def send_header(self, *_):
@@ -138,6 +141,7 @@ class WorkspaceTestCase(unittest.TestCase):
 class WorkspaceTests(WorkspaceTestCase):
     def workspace(self, kind="dvzip"):
         workspace = receive.ReceiveWorkspace(self.gallery, kind)
+        self.addCleanup(workspace._close_decoded)
         self.addCleanup(lambda: workspace.mapping.close() if workspace.mapping is not None else None)
         return workspace
 
@@ -342,9 +346,141 @@ class WorkspaceTests(WorkspaceTestCase):
             tracemalloc.stop()
             workspace.finish(True, [])
 
+    def test_streamed_decode_reuses_validated_frames_without_decompressing_twice(self):
+        data = os.urandom(256 * 1024)
+        archive = member("document.pdf", data) + TRAILER
+        wire = dvzip(archive)
+        workspace = self.workspace()
+        workspace.raw_path.write_bytes(wire)
+        for offset in range(0, len(wire), 3333):
+            ended = workspace.observe(wire[offset:offset + 3333])
+        self.assertTrue(ended)
+        with patch.object(receive.zlib, "decompressobj", side_effect=AssertionError("duplicate decode")):
+            decoded = workspace.decode_dvzip(workspace.raw_path)
+        self.assertEqual(decoded[:], archive)
+        self.assertTrue(workspace.container_complete)
+        workspace.extract_file(workspace.decoded_path)
+        workspace.finish(True, list(workspace.verified_files))
+        self.assertEqual((self.gallery / "document.pdf").read_bytes(), data)
+
+    def test_streamed_decode_never_ignores_a_suspicious_tail(self):
+        archive = member("document.pdf", b"test") + TRAILER
+        workspace = self.workspace()
+        wire = dvzip(archive) + b"BAD"
+        workspace.raw_path.write_bytes(wire)
+        self.assertTrue(workspace.observe(wire))
+        with patch.object(receive.zlib, "decompressobj", wraps=zlib.decompressobj) as decode:
+            self.assertEqual(workspace.decode_dvzip(workspace.raw_path)[:], archive)
+            self.assertGreater(decode.call_count, 0, "suspicious tails must use the full salvage validator")
+        self.assertFalse(workspace.container_complete)
+
+    def marker(self):
+        marker = self.root / "run/mochi-airdrop/transfer.json"
+        marker.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        marker.write_text(json.dumps({"start": int(time.time()), "offset": 0, "directory": str(self.gallery)}))
+        return marker
+
+    def test_progress_reports_wire_and_decoded_counts_separately_without_fabricating_a_total(self):
+        marker = self.marker()
+        archive = member("document.pdf", b"A" * 65536) + TRAILER
+        wire = dvzip(archive)
+        workspace = self.workspace()
+        workspace.raw_path.write_bytes(wire)
+        self.assertTrue(workspace.observe(wire))
+        progress = json.loads(marker.read_text())["progress"]
+        self.assertEqual(progress["wireBytes"], len(wire))
+        self.assertEqual(progress["decodedBytes"], len(archive))
+        self.assertGreater(progress["decodedBytes"], progress["wireBytes"])
+        self.assertIsNone(progress["totalBytes"])
+        self.assertEqual(progress["phase"], "receiving")
+        workspace.set_phase("verifying")
+        self.assertEqual(json.loads(marker.read_text())["progress"]["phase"], "verifying")
+        self.assertEqual(list(self.gallery.iterdir()), [], "progress never publishes unchecked files")
+        self.assertEqual(marker.stat().st_mode & 0o777, 0o600)
+
+    def test_older_workspace_cannot_replace_a_newly_accepted_transfers_marker(self):
+        marker = self.marker()
+        workspace = self.workspace()
+        replacement = {"start": int(time.time()), "offset": 10, "directory": str(self.gallery)}
+        marker.write_text(json.dumps(replacement))
+        workspace.set_phase("verifying")
+        self.assertEqual(json.loads(marker.read_text()), replacement)
+
+    def test_workspace_without_initial_consent_marker_does_not_attach_to_a_later_request(self):
+        workspace = self.workspace()
+        marker = self.marker()
+        before = marker.read_bytes()
+        workspace.set_phase("verifying")
+        self.assertEqual(marker.read_bytes(), before)
+
+    def test_declared_total_is_bounded_and_gzip_bytes_are_not_treated_as_decoded_bytes(self):
+        marker = self.marker()
+        for value in ("-1", "nan", "१२", "1" * 100, "0"):
+            workspace = receive.ReceiveWorkspace(self.gallery, "cpio", total_bytes=value)
+            self.assertIsNone(workspace.total_bytes)
+        workspace = receive.ReceiveWorkspace(self.gallery, "cpio", total_bytes="1000")
+        wire = gzip.compress(member("notes.txt", b"test") + TRAILER)
+        workspace.raw_path.write_bytes(wire)
+        workspace.observe(wire)
+        workspace.set_phase("verifying")
+        progress = json.loads(marker.read_text())["progress"]
+        self.assertEqual(progress["totalBytes"], 1000)
+        self.assertIsNone(progress["decodedBytes"])
+        self.assertEqual(progress["wireBytes"], len(wire))
+
 
 @unittest.skipUnless(scope, "supply a patched server.py to run handler tests")
 class ReceiveTests(WorkspaceTestCase):
+    @unittest.skipIf(NO_NETWORK, 'networking disabled')
+    def test_phone_can_finish_writing_before_receiving_http_success(self):
+        class Handler(scope['PatchedHandler']):
+            protocol_version = 'HTTP/1.1'
+            UPLOAD_CONTENT_TYPES = ('application/x-cpio', 'application/x-dvzip')
+            def log_message(self, *_):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), Handler)
+        server.mochi_upload_permissions = receive.UploadPermissions()
+        peer = ('127.0.0.1', 0)
+        ticket = server.mochi_upload_permissions.begin(peer)
+        self.assertTrue(server.mochi_upload_permissions.accept(peer, ticket))
+        worker = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True)
+        worker.start()
+        try:
+            with socket.create_connection(server.server_address, timeout=2) as phone:
+                wire = dvzip(member('photo.jpg', b'whole photo') + TRAILER)
+                phone.sendall(b'POST /Upload HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-dvzip\r\n'
+                              b'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n' +
+                              f'{len(wire):x}\r\n'.encode() + wire + b'\r\n')
+                phone.settimeout(.1)
+                with self.assertRaises(TimeoutError, msg='do not reply/close while the phone is still sending the HTTP ending'):
+                    phone.recv(1)
+                phone.sendall(b'4\r\n' + b'\0' * 4 + b'\r\n0\r\n\r\n')
+                phone.settimeout(2)
+                response = bytearray()
+                while block := phone.recv(65536):
+                    response.extend(block)
+                self.assertTrue(response.startswith(b'HTTP/1.1 200 '), response)
+                self.assertEqual((self.gallery / 'photo.jpg').read_bytes(), b'whole photo')
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+
+    def test_success_consumes_http_ending_before_replying_to_the_phone(self):
+        wire = dvzip(member('photo.jpg', b'whole photo') + TRAILER)
+        handler = FakeHandler(wire)
+        # iOS may send the optional DVZip terminator in a separate HTTP chunk.
+        handler.rfile = io.BytesIO(f'{len(wire):x}\r\n'.encode() + wire +
+                                  b'\r\n4\r\n' + b'\0' * 4 + b'\r\n0\r\n\r\n')
+        ask = FakeControl(server=handler.server)
+        ask.handle_ask()
+        handler.handle_upload()
+        self.assertEqual(handler.responses[-1], 200)
+        self.assertEqual(handler.rfile.read(), b'', 'unread upload bytes must not turn a successful receive into a reset')
+        self.assertEqual((self.gallery / 'photo.jpg').read_bytes(), b'whole photo')
+
     def send(self, data, kind="dvzip", terminate=True):
         handler = FakeHandler(data, kind, terminate)
         ask = FakeControl(server=handler.server)
@@ -353,11 +489,46 @@ class ReceiveTests(WorkspaceTestCase):
         scope["handle_upload"](handler)
         self.assertEqual(handler.timeout, 300)
         return handler.responses[-1]
+    def test_separately_chunked_junk_after_archive_is_not_ignored(self):
+        wire = dvzip(member('photo.jpg', b'whole photo') + TRAILER)
+        handler = FakeHandler(wire)
+        handler.rfile = io.BytesIO(f'{len(wire):x}\r\n'.encode() + wire + b'\r\n5\r\nJUNK!\r\n0\r\n\r\n')
+        FakeControl(server=handler.server).handle_ask()
+        handler.handle_upload()
+        self.assertEqual(handler.responses[-1], 500)
+
+    def test_missing_http_ending_uses_short_timeout_and_restores_upload_timeout(self):
+        calls = []
+        connection = SimpleNamespace(gettimeout=lambda: 300, settimeout=calls.append)
+        def missing(_):
+            raise TimeoutError('simulated lost HTTP ending')
+        storage = SimpleNamespace(detector=SimpleNamespace(tail=b''))
+        self.assertFalse(receive.finish_http_upload(SimpleNamespace(read=missing), io.BytesIO(), storage, connection))
+        self.assertEqual(calls, [15, 300])
     def test_nested_photo_without_http_terminator(self):
         archive = member(".", mode=0o40755) + member("Containers/tmp/NSIRD_AirDrop_abc/photo.jpg", b"hello") + TRAILER
         self.assertEqual(self.send(dvzip(archive), terminate=False), 200)
         self.assertEqual([p.name for p in self.gallery.iterdir()], ["photo.jpg"])
         self.assertEqual((self.gallery / "photo.jpg").read_bytes(), b"hello")
+
+    def test_approved_mixed_documents_archives_and_unknown_files_keep_names_and_bytes(self):
+        files = {"report.pdf": b"%PDF-1.4\n%%EOF\n", "notes.txt": "नमस्ते\n".encode(),
+                 "bundle.zip": b"PK\x03\x04archive", "document.docx": b"PK\x03\x04document",
+                 "binary.unknown": bytes(range(256)), "no-extension": b"\x00\xffopaque",
+                 "empty": b"", "script.sh": b"#!/bin/sh\nexit 0\n"}
+        body = plistlib.dumps({"SenderComputerName": "Phone", "Files": [
+            {"FileName": name, "FileType": "public.data"} for name in files]})
+        archive = b"".join(member(name, data, mode=0o100755) for name, data in files.items()) + TRAILER
+        handler = FakeHandler(dvzip(archive))
+        ask = FakeControl(body=body, server=handler.server)
+        ask.handle_ask()
+        self.assertEqual(ask.prompt_count, 1)
+        self.assertEqual(ask.responses, [200])
+        scope["handle_upload"](handler)
+        self.assertEqual(handler.responses[-1], 200)
+        self.assertEqual({p.name: p.read_bytes() for p in self.gallery.iterdir()}, files)
+        self.assertTrue(all(not (p.stat().st_mode & 0o111) for p in self.gallery.iterdir()),
+                        "incoming executables must be stored without execute permissions")
     def test_incomplete_batch_only_publishes_whole_members(self):
         archive = member("PHMediaFormatConversionRequest-abc/photo.jpg", b"whole") + member("PHMediaFormatConversionRequest-abc/video.mov", b"X" * 5000)
         self.assertEqual(self.send(dvzip(archive[:-1000])), 500)

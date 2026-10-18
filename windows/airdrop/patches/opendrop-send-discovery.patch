@@ -1,0 +1,53 @@
+--- a/client.py
++++ b/client.py
+@@ -66,6 +66,11 @@
+             interfaces=[str(self.ip_addr)],
+             ip_version=IPVersion.V6Only,
+             apple_p2p=platform.system() == "Darwin",
++            # Linux's running receiver also binds 5353. iOS sends unicast
++            # replies, which can land on that socket instead of this browser.
++            # A per-browser ephemeral socket gives each scan its own reply
++            # destination while still asking the normal mDNS multicast group.
++            unicast=platform.system() == "Linux",
+         )
+ 
+         self.callback_add = None
+--- a/cli.py
++++ b/cli.py
+@@ -268,19 +268,25 @@
+         with open(self.config.discovery_report, "r") as f:
+             infos = json.load(f)
+ 
+-        # (1) try 'index'
+-        try:
+-            self.receiver = int(self.receiver)
+-            return infos[self.receiver]
++        # A 12-digit hex service ID is an exact recipient, even when every
++        # digit happens to be numeric. Never reinterpret an absent ID as an
++        # index or hostname, and never replace self.receiver with an integer.
++        receiver = str(self.receiver)
++        if len(receiver) == 12 and all(c in "0123456789abcdefABCDEF" for c in receiver):
++            for info in infos:
++                if info.get("id", "").lower() == receiver.lower():
++                    return info
++            logger.error("Selected AirDrop service no longer exists; scan again")
++            return None
++        # Keep the upstream index syntax only for an explicit short index.
++        try:
++            index = int(receiver)
+         except ValueError:
+             pass
+-        except IndexError:
+-            pass
+-        # (2) try 'id'
+-        if len(self.receiver) == 12:
+-            for info in infos:
+-                if info["id"] == self.receiver:
+-                    return info
++        else:
++            if 0 <= index < len(infos):
++                return infos[index]
++            return None
+         # (3) try hostname
+         for info in infos:
+             if info["name"] == self.receiver:

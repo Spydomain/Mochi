@@ -1,0 +1,20 @@
+--- a/server.py
++++ b/server.py
+@@ -570,7 +570,7 @@
+     UPLOAD_CONTENT_TYPES = ("application/x-cpio", "application/x-dvzip")
+ 
+     def handle_upload(self):
+-        from .mochi_receive import HTTPChunkedReader, ReceiveWorkspace
++        from .mochi_receive import HTTPChunkedReader, ReceiveWorkspace, finish_http_upload
+ 
+         # Consume atomically before opening a workspace, reading the body, or
+         # sending 100 Continue. A denied, missing, expired or replayed Ask is
+@@ -613,6 +613,8 @@
+                     # phone loses the final HTTP zero chunk over AWDL.
+                     if storage.observe(buf):
+                         logger.info("Verified archive trailer received")
++                        if not finish_http_upload(reader, raw, storage, self.connection):
++                            logger.warning("Verified archive received without a complete HTTP upload ending")
+                         break
+             except (socket.timeout, TimeoutError):
+                 logger.warning(f"sender went quiet for {stall:.0f}s after {reader.total} B - salvaging")

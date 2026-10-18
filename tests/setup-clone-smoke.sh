@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+real_node="$(command -v node)"
 test_dir="$(mktemp -d -p "$HOME" mochi-setup-smoke.XXXXXX)"
 trap 'rm -rf -- "$test_dir"' EXIT
 
@@ -34,21 +35,32 @@ fi
 "$test_dir/mochi/mochi-full-setup.sh" --no-launch --no-airdrop
 
 test -x "$test_dir/data/mochi/bin/mochi"
+test "$(cat "$test_dir/data/mochi/installed-no-airdrop")" = 1
 test -x "$test_dir/data/mochi/bin/mochi-hook"
+test -x "$test_dir/data/mochi/bin/uninstall-mochi"
+test -x "$test_dir/data/mochi/bin/uninstall-mochi.py"
+cmp "$test_dir/mochi/uninstall-mochi.sh" "$test_dir/data/mochi/bin/uninstall-mochi"
+cmp "$test_dir/mochi/windows/scripts/uninstall-mochi.py" "$test_dir/data/mochi/bin/uninstall-mochi.py"
 test -x "$test_dir/data/mochi/bin/cleanup-opencode-sessions"
 cmp "$test_dir/mochi/windows/scripts/cleanup-opencode-sessions.sh" "$test_dir/data/mochi/bin/cleanup-opencode-sessions"
 test -x "$test_dir/data/mochi/bin/mochi-airdrop-confirm"
 cmp "$test_dir/mochi/windows/scripts/mochi-airdrop-confirm.sh" "$test_dir/data/mochi/bin/mochi-airdrop-confirm"
+test -x "$test_dir/data/mochi/bin/mochi-airdrop-pick"
+cmp "$test_dir/mochi/windows/scripts/mochi-airdrop-pick.py" "$test_dir/data/mochi/bin/mochi-airdrop-pick"
+cmp "$test_dir/mochi/windows/airdrop/mochi_discover.py" "$test_dir/data/mochi/bin/mochi-airdrop-browse"
+cmp "$test_dir/mochi/windows/airdrop/mochi_send.py" "$test_dir/data/mochi/bin/mochi-airdrop-send"
 test -f "$test_dir/config/mochi/settings.json"
-node -e 'const s=require(process.argv[1]); for (const key of ["showCodexPlanInNotch", "showAirDropInNotch", "showBatteryInNotch", "showKeepAwakeInNotch"]) if (s[key] !== true) throw new Error(`${key} was not enabled by setup`);' "$test_dir/config/mochi/settings.json"
+"$real_node" -e 'const s=require(process.argv[1]); for (const key of ["showCodexPlanInNotch", "showAirDropInNotch", "showBatteryInNotch", "showKeepAwakeInNotch"]) if (s[key] !== true) throw new Error(`${key} was not enabled by setup`);' "$test_dir/config/mochi/settings.json"
 
 # Updating must introduce newly added controls without undoing an explicit
 # choice to hide any header indicator.
-node -e 'const fs=require("node:fs"); const p=process.argv[1]; const s=require(p); s.showCodexPlanInNotch=false; s.showAirDropInNotch=false; s.showBatteryInNotch=false; s.airdropDirectory="/user-chosen/received"; delete s.showKeepAwakeInNotch; fs.writeFileSync(p, JSON.stringify(s));' "$test_dir/config/mochi/settings.json"
+"$real_node" -e 'const fs=require("node:fs"); const p=process.argv[1]; const s=require(p); s.showCodexPlanInNotch=false; s.showAirDropInNotch=false; s.showBatteryInNotch=false; s.airdropDirectory="/user-chosen/received"; delete s.showKeepAwakeInNotch; fs.writeFileSync(p, JSON.stringify(s));' "$test_dir/config/mochi/settings.json"
 "$test_dir/mochi/mochi-full-setup.sh" --no-launch --no-airdrop
+test "$(cat "$test_dir/data/mochi/installed-no-airdrop")" = 1
 cmp "$test_dir/mochi/windows/scripts/cleanup-opencode-sessions.sh" "$test_dir/data/mochi/bin/cleanup-opencode-sessions"
 cmp "$test_dir/mochi/windows/scripts/mochi-airdrop-confirm.sh" "$test_dir/data/mochi/bin/mochi-airdrop-confirm"
-node -e 'const s=require(process.argv[1]); for (const key of ["showCodexPlanInNotch", "showAirDropInNotch", "showBatteryInNotch"]) if (s[key] !== false) throw new Error(`${key} user choice was overwritten`); if (s.showKeepAwakeInNotch !== true) throw new Error("showKeepAwakeInNotch was not added for an existing installation"); if (s.airdropDirectory !== "/user-chosen/received") throw new Error("AirDrop save folder changed during update");' "$test_dir/config/mochi/settings.json"
+cmp "$test_dir/mochi/windows/scripts/mochi-airdrop-pick.py" "$test_dir/data/mochi/bin/mochi-airdrop-pick"
+"$real_node" -e 'const s=require(process.argv[1]); for (const key of ["showCodexPlanInNotch", "showAirDropInNotch", "showBatteryInNotch"]) if (s[key] !== false) throw new Error(`${key} user choice was overwritten`); if (s.showKeepAwakeInNotch !== true) throw new Error("showKeepAwakeInNotch was not added for an existing installation"); if (s.airdropDirectory !== "/user-chosen/received") throw new Error("AirDrop save folder changed during update");' "$test_dir/config/mochi/settings.json"
 test -f "$test_dir/config/opencode/plugins/mochi.js"
 test -f "$test_dir/config/systemd/user/mochi-app.service"
 test -f "$test_dir/config/systemd/user/mochi-opencode-cleanup.timer"

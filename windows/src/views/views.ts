@@ -60,6 +60,8 @@ export interface ViewActions {
 export interface ViewHost {
   el: HTMLElement;
   sync(): void;
+  /** Authoritative native/cursor hover, including leaves lost to a modal chooser. */
+  pointerInside?(inside: boolean): void;
   /** Called when the view becomes active, for views with a text field. */
   focus?(): void;
   /** Called every frame while the view is on screen. True = needs another frame. */
@@ -899,7 +901,10 @@ export function buildViews(
   map.set("choose", buildChoose(actions));
   map.set("recap", buildRecap(actions));
   map.set("wardrobe", buildWardrobe(actions));
-  map.set("airdrop", buildAirDropView(actions.openSettingsWindow, () => actions.setView("overview")));
+  map.set("airdrop", buildAirDropView(actions.openSettingsWindow, () => {
+    actions.setView("overview");
+    actions.collapse();
+  }, onChatHeightChange));
   map.set("airdropRequest", buildAirDropRequest());
   // Not in the Windows v1: sending a file by email, window attach + web result.
   map.set("mail", buildPlaceholder(tl("Sending by email isn't in this version."), ""));

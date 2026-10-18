@@ -13,7 +13,7 @@ import { applySpotify, registerSpotifyHandlers } from "./island/spotify";
 import { SPOTIFY_ID } from "./core/spotify";
 import { Recap } from "./recap/recap";
 import { onLanguageChange, resolveLanguage, setLanguage, systemLanguages } from "./i18n/i18n";
-import { refreshAirDrop } from "./views/airdrop";
+import { applyAirDropReceive, refreshAirDrop, refreshAirDropActivity } from "./views/airdrop";
 
 /** Shows the language Settings asks for ("" = the system's, when Mochi has it). */
 function applyLanguage() {
@@ -62,6 +62,7 @@ async function main() {
           if (request.id !== State.airdropRequest?.id) {
             State.airdropRequest = request;
             State.airdropError = "";
+            State.airdropReceiveError = "";
             State.notify();
           }
           // A busy agent or a stale hidden-state transition must not strand an
@@ -93,12 +94,12 @@ async function main() {
   await onEvent<null>("airdrop-incoming", checkIncoming);
   checkIncoming();
   window.setInterval(checkIncoming, 200);
+  window.setInterval(() => { void refreshAirDropActivity(); }, 350);
   window.setInterval(() => {
     if (State.os !== "linux" || checkingTransfer) return;
     if (!State.airdropStatus?.receiving) {
-      if (State.airdropTransfer || State.airdropProgress) {
-        State.airdropTransfer = null;
-        State.airdropProgress = null;
+      if (State.airdropTransfer || State.airdropProgress || State.airdropReceiveDetail || State.airdropReceiveError) {
+        completedAt = applyAirDropReceive(null, 0);
         State.notify();
       }
       return;
@@ -108,26 +109,20 @@ async function main() {
     void (async () => {
       try {
         const now = Date.now();
-        if (now - lastTransferCheck < (State.airdropTransfer === "receiving" ? 500 : 1_000)) return;
+        if (now - lastTransferCheck < (["receiving", "verifying"].includes(State.airdropTransfer || "") ? 200 : 1_000)) return;
         lastTransferCheck = now;
         const transfer = await Bridge.airdropTransfer();
+        // A read started before Turn off must not resurrect its old warning.
+        if (!State.airdropStatus?.receiving) return;
         const previous = State.airdropTransfer;
         const previousReceived = State.airdropProgress?.receivedBytes;
         const previousTotal = State.airdropProgress?.totalBytes;
-        if (transfer?.state === "complete" || transfer?.state === "failed") {
-          if (!completedAt) completedAt = Date.now();
-          if (transfer.state === "failed" && State.airdropTransfer !== "failed") {
-            State.airdropError = "AirDrop transfer incomplete. Any complete files were saved. Unfinished data is kept in Mochi's private recovery folder; please retry.";
-          }
-          State.airdropTransfer = Date.now() - completedAt < 5000 ? transfer.state : null;
-        } else {
-          completedAt = 0;
-          State.airdropTransfer = transfer?.state ?? null;
-        }
-        State.airdropProgress = State.airdropTransfer && transfer
-          ? { receivedBytes: transfer.receivedBytes, totalBytes: transfer.totalBytes } : null;
+        const previousDetail = JSON.stringify(State.airdropReceiveDetail);
+        const previousError = State.airdropReceiveError;
+        completedAt = applyAirDropReceive(transfer, completedAt);
         if (State.airdropTransfer !== previous || State.airdropProgress?.receivedBytes !== previousReceived ||
-            State.airdropProgress?.totalBytes !== previousTotal) State.notify();
+            State.airdropProgress?.totalBytes !== previousTotal || State.airdropReceiveError !== previousError ||
+            JSON.stringify(State.airdropReceiveDetail) !== previousDetail) State.notify();
       } catch (err) {
         console.error("[mochi] AirDrop transfer check failed", err);
       } finally { checkingTransfer = false; }

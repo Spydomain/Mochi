@@ -49,16 +49,38 @@ export interface AirDropPeer {
   mac: string;
   name: string | null;
   rssi: number | null;
+  lastSeen?: number | null;
+  fresh?: boolean;
+  connection?: "connecting" | "retrying" | null;
 }
 
 export interface AirDropIncoming { id: string; sender: string; detail: string }
 
-/** Raw upload bytes measured from the receiver's growing archive; nullable
- * when the sender did not declare a usable wire payload size. */
+/** Received wire counts and, where available, comparable decoded archive
+ * progress. Unknown totals remain indeterminate rather than fabricated. */
 export interface AirDropTransfer {
-  state: "waiting" | "receiving" | "complete" | "failed";
+  message?: string | null;
+  state: "waiting" | "receiving" | "verifying" | "complete" | "failed";
   receivedBytes: number | null;
   totalBytes: number | null;
+  wireBytes?: number | null;
+  bytesPerSecond?: number | null;
+}
+
+export interface AirDropDiscovery {
+  supported: boolean;
+  running: boolean;
+  peers: AirDropPeer[];
+  error: string | null;
+}
+
+export interface AirDropOutbound {
+  phase: "choosing" | "waking" | "discovering" | "connecting" | "asking" | "accepted" | "preparing" | "sending" | "stalled" | "confirming" | "complete" | "failed" | "cancelled";
+  sentBytes: number | null;
+  totalBytes: number | null;
+  elapsedMs: number;
+  measurement?: "tcpAck" | "tlsWritten" | null;
+  bytesPerSecond?: number | null;
 }
 
 export const Bridge = {
@@ -141,6 +163,9 @@ export const Bridge = {
   airdropPeers: (named = false) => callOrThrow<AirDropPeer[]>("airdrop_peers", { named }),
   /** Open Omdrop's native multi-file chooser, then send to exactly this peer. */
   airdropSend: (mac: string) => callOrThrow<string>("airdrop_send", { mac }),
+  airdropDiscovery: () => callOrThrow<AirDropDiscovery>("airdrop_discovery"),
+  airdropDiscoverySet: (enabled: boolean) => callOrThrow<AirDropDiscovery>("airdrop_discovery_set", { enabled }),
+  airdropOutbound: () => callOrThrow<AirDropOutbound | null>("airdrop_outbound"),
 
   openSettingsWindow: () => call<void>("open_settings_window"),
 

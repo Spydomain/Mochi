@@ -8,7 +8,7 @@ This is an optional Apple-platform component, **not an AirDrop service or a prer
 
 ![Mochi Live Activity on an iPhone](../docs/media/iphone-live-activity.jpg)
 
-*Earlier Apple-platform example, not a capture from the latest Linux build. For current desktop captures, see the [Linux demo](../docs/media/mochi-demo.mp4).*
+*Earlier Apple-platform example, not a capture from the latest Linux build. For the October 18, 2026 desktop captures, see the [Linux GIF](../docs/media/mochi-demo.gif) or [27-second video](../docs/media/mochi-demo.mp4). Those recordings show the local Linux interface and an AirDrop receive, not Apple push delivery or this relay.*
 
 ```text
 Mac app ── activity state + iPhone push token ──▶ your Cloudflare Worker ──▶ APNs ──▶ iPhone

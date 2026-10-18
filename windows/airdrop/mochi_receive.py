@@ -160,11 +160,38 @@ class HTTPChunkedReader(io.RawIOBase):
         return len(block)
 
 
+def finish_http_upload(reader, raw, storage, connection):
+    """Consume the HTTP ending before replying after a verified DVZip trailer.
+
+    Only an optional four-byte DVZip terminator may follow the archive. Bound
+    both extra payload and individual reads; a lost HTTP ending must not turn
+    into the full upload inactivity wait. Do not acknowledge while the sender
+    is still writing normal ending bytes: closing with unread input can reset
+    its connection even though all user files arrived intact.
+    """
+    previous = connection.gettimeout()
+    try:
+        connection.settimeout(15)
+        remaining = max(0, 5 - len(storage.detector.tail))
+        while remaining:
+            block = reader.read(remaining)
+            if not block:
+                return reader.finished
+            raw.write(block)
+            storage.observe(block)
+            remaining -= len(block)
+        return False  # More than four trailing bytes: full validation rejects it.
+    except (TimeoutError, ValueError):
+        return False  # Whole-file salvage still requires normal archive validation.
+    finally:
+        connection.settimeout(previous)
+
+
 class DVZipEnd:
     """Recognize the ODC trailer at record boundaries, never inside file data."""
     LIMIT = 16 * 1024 * 1024
 
-    def __init__(self):
+    def __init__(self, sink=None):
         self.wire = bytearray()
         self.record = bytearray()
         self.need = 76
@@ -172,9 +199,15 @@ class DVZipEnd:
         self.remaining = 0
         self.invalid = False
         self.finished = False
+        self.sink = sink
+        self.decoded_bytes = 0
+        self.tail = b""
 
     def feed(self, data):
-        if self.invalid or self.finished:
+        if self.finished:
+            self.tail = (self.tail + bytes(data))[:5]
+            return True
+        if self.invalid:
             return self.finished
         self.wire.extend(data)
         try:
@@ -195,8 +228,12 @@ class DVZipEnd:
                     if (len(decoded) > self.LIMIT or not decoder.eof
                             or decoder.unused_data or decoder.unconsumed_tail):
                         raise ValueError("oversized or incomplete dvzip block")
+                if self.sink is not None:
+                    self.sink(decoded)
+                self.decoded_bytes += len(decoded)
                 self._odc(decoded)
                 if self.finished:
+                    self.tail = bytes(self.wire)
                     self.wire.clear()
                     return True
         except (ValueError, zlib.error, struct.error):
@@ -323,7 +360,7 @@ def publication_directory(destination, name, *, directory=False):
 
 
 class ReceiveWorkspace:
-    def __init__(self, destination, extension):
+    def __init__(self, destination, extension, total_bytes=None):
         self.destination = Path(destination).resolve()
         cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
         self.base = cache / "mochi" / "airdrop"
@@ -338,13 +375,35 @@ class ReceiveWorkspace:
         self.decoded_path = self.directory / "decoded.cpio"
         self.mapping = None
         self.container_complete = False
-        self.detector = DVZipEnd() if extension == "dvzip" else None
+        self._decoded_stream = None
+        self._stream_error = False
+        self.detector = DVZipEnd(self._write_decoded) if extension == "dvzip" else None
+        self.wire_bytes = 0
+        self._prefix = bytearray()
+        self.started = time.monotonic()
+        self._last_progress = float("-inf")
+        self._progress_key = None
+        self._progress_initial = True
+        self.phase = "receiving"
+        try:
+            total = str(total_bytes or "")
+            self.total_bytes = int(total) if total.isascii() and total.isdecimal() and len(total) <= 13 and 0 < int(total) <= 10**12 else None
+        except (ValueError, TypeError):
+            self.total_bytes = None
         self.directories = set()
         self.published = []
         self.verified_files = {}
-        self._progress()
+        self._progress(force=True)
 
-    def _progress(self):
+    def _progress(self, force=False):
+        initial = self._progress_initial
+        self._progress_initial = False
+        if not initial and self._progress_key is None:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_progress < .2:
+            return
+        self._last_progress = now
         runtime = os.environ.get("XDG_RUNTIME_DIR")
         if not runtime:
             return
@@ -355,21 +414,74 @@ class ReceiveWorkspace:
             data = json.loads(marker.read_text())
             if Path(data.get("directory", "")).resolve() != self.destination:
                 return
+            key = (data.get("start"), data.get("offset"))
+            if initial:
+                self._progress_key = key
+            elif key != self._progress_key or data.get("rawPath") != str(self.raw_path):
+                return  # Never overwrite a later accepted transfer's progress.
             data["rawPath"] = str(self.raw_path)
+            elapsed = max(0, now - self.started)
+            decoded = self.detector.decoded_bytes if self.detector is not None and not self.detector.invalid else None
+            if self.detector is None and len(self._prefix) == 2 and self._prefix != b"\x1f\x8b":
+                decoded = self.wire_bytes
+            data["progress"] = {"phase": self.phase, "wireBytes": self.wire_bytes,
+                "decodedBytes": decoded, "totalBytes": self.total_bytes,
+                "elapsedMs": int(elapsed * 1000), "updatedMs": int(time.time() * 1000),
+                "bytesPerSecond": self.wire_bytes / elapsed if elapsed > 0 else 0}
             fd, temporary = tempfile.mkstemp(prefix=".progress-", dir=marker.parent)
-            with os.fdopen(fd, "w") as out:
-                json.dump(data, out)
-            os.replace(temporary, marker)
+            try:
+                with os.fdopen(fd, "w") as out:
+                    json.dump(data, out)
+                os.replace(temporary, marker)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
         except (OSError, ValueError, TypeError):
             pass
 
     def observe(self, data):
-        return self.detector is not None and self.detector.feed(data)
+        self.wire_bytes += len(data)
+        self._prefix.extend(data[:max(0, 2 - len(self._prefix))])
+        try:
+            ended = self.detector is not None and self.detector.feed(data)
+        except Exception:
+            self._stream_error = True
+            raise
+        self._progress(force=bool(ended))
+        return ended
+
+    def set_phase(self, phase):
+        if phase not in ("receiving", "verifying", "complete", "failed"):
+            raise ValueError("invalid receive phase")
+        self.phase = phase
+        self._progress(force=True)
+
+    def _write_decoded(self, data):
+        if self._decoded_stream is None:
+            self._decoded_stream = self.decoded_path.open("wb")
+        self._decoded_stream.write(data)
+
+    def _close_decoded(self):
+        if self._decoded_stream is not None:
+            self._decoded_stream.close()
+            self._decoded_stream = None
 
     def decode_dvzip(self, path):
         # The CPIO verifier separately decides whether the archive has ended.
         # A missing container terminator is fine; a partial frame is not.
         self.container_complete = False
+        streamed = self._decoded_stream is not None
+        self._close_decoded()
+        if (streamed and not self._stream_error and Path(path) == self.raw_path
+                and self.detector.finished and not self.detector.invalid
+                and self.detector.tail in (b"", b"\0" * 4)
+                and Path(path).stat().st_size == self.wire_bytes):
+            # Each full frame was already length/checksum validated while
+            # receiving. Reuse that decoded stream, then run the SAME CPIO
+            # member/extraction/publication checks. Never fast-path partial or
+            # suspicious tails; the bounded salvage decoder below handles them.
+            self.container_complete = True
+            return self.map_cpio(self.decoded_path)
         intact = True
         frames = 0
         with open(path, "rb") as incoming, self.decoded_path.open("wb") as out:
@@ -516,6 +628,7 @@ class ReceiveWorkspace:
         return recovery / self.directory.name
 
     def finish(self, complete, good):
+        self._close_decoded()
         sidecars = []
         seen = set()
         for name in good:

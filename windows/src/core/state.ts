@@ -14,7 +14,8 @@ import { DEFAULT_OUTFIT, type Outfit } from "../mochi/wardrobe";
 import { pillColor } from "./pill-colors";
 import { Spotify, musicPlaying } from "./spotify";
 import type { WeatherLocation, WeatherReport } from "./weather";
-import type { AirDropPeer, AirDropStatus, AirDropTransfer } from "./bridge";
+import type { AirDropPeer, AirDropStatus, AirDropTransfer, AirDropOutbound } from "./bridge";
+import { AgentSessions } from "./agent-sessions";
 
 export type AgentSource = "claudeCode" | "n8n" | "agent";
 export type PillBadge = "approval" | "finished" | "error";
@@ -304,13 +305,19 @@ class AppState {
   airdropPending = false;
   airdropScanning = false;
   airdropSending = false;
+  airdropDiscovering = false;
+  airdropOutbound: AirDropOutbound | null = null;
   airdropNotice = "";
   airdropError = "";
+  readonly agentSessions = new AgentSessions();
+  airdropPanelHeight = 160;
   airdropRequest: { id: string; sender: string; detail: string } | null = null;
   airdropDeciding = false;
   airdropAnsweredId: string | null = null;
-  airdropTransfer: "waiting" | "receiving" | "complete" | "failed" | null = null;
+  airdropTransfer: "waiting" | "receiving" | "verifying" | "complete" | "failed" | null = null;
   airdropProgress: Pick<AirDropTransfer, "receivedBytes" | "totalBytes"> | null = null;
+  airdropReceiveDetail: AirDropTransfer | null = null;
+  airdropReceiveError = "";
   airdropActiveName: string | null = null;
   airdropActiveDirectory: string | null = null;
 

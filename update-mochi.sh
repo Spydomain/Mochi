@@ -25,19 +25,35 @@ INSTALLED_BINARY="$DATA_HOME/mochi/bin/mochi"
 INSTALLED_HOOK="$DATA_HOME/mochi/bin/mochi-hook"
 INSTALLED_CLEANUP="$DATA_HOME/mochi/bin/cleanup-opencode-sessions"
 INSTALLED_CONFIRM="$DATA_HOME/mochi/bin/mochi-airdrop-confirm"
+INSTALLED_PICKER="$DATA_HOME/mochi/bin/mochi-airdrop-pick"
 INSTALLED_REVISION="$DATA_HOME/mochi/installed-revision"
 installed_sha="$(sed -n '1p' "$INSTALLED_REVISION" 2>/dev/null || true)"
+NO_AIRDROP=0
+[[ "$(cat "$DATA_HOME/mochi/installed-no-airdrop" 2>/dev/null || true)" != 1 ]] || NO_AIRDROP=1
+
+run_setup() {
+  local -a options=()
+  (( !NO_AIRDROP )) || options+=(--no-airdrop)
+  "$MOCHI_DIR/mochi-full-setup.sh" "${options[@]}"
+}
 
 installation_complete() {
-  [[ -x "$INSTALLED_BINARY" && -x "$INSTALLED_HOOK" && -x "$INSTALLED_CLEANUP" && -x "$INSTALLED_CONFIRM" ]] &&
+  [[ -x "$INSTALLED_BINARY" && -x "$INSTALLED_HOOK" && -x "$INSTALLED_CLEANUP" && -x "$INSTALLED_CONFIRM" && -x "$INSTALLED_PICKER" ]] &&
+    cmp -s "$MOCHI_DIR/windows/scripts/mochi-airdrop-pick.py" "$INSTALLED_PICKER" &&
+    [[ -x "$DATA_HOME/mochi/bin/mochi-airdrop-browse" && -x "$DATA_HOME/mochi/bin/mochi-airdrop-send" ]] &&
+    cmp -s "$MOCHI_DIR/windows/airdrop/mochi_discover.py" "$DATA_HOME/mochi/bin/mochi-airdrop-browse" &&
+    cmp -s "$MOCHI_DIR/windows/airdrop/mochi_send.py" "$DATA_HOME/mochi/bin/mochi-airdrop-send" &&
+    [[ -x "$DATA_HOME/mochi/bin/uninstall-mochi" && -x "$DATA_HOME/mochi/bin/uninstall-mochi.py" ]] &&
+    cmp -s "$MOCHI_DIR/uninstall-mochi.sh" "$DATA_HOME/mochi/bin/uninstall-mochi" &&
+    cmp -s "$MOCHI_DIR/windows/scripts/uninstall-mochi.py" "$DATA_HOME/mochi/bin/uninstall-mochi.py" &&
     cmp -s "$MOCHI_DIR/windows/scripts/mochi-airdrop-confirm.sh" "$INSTALLED_CONFIRM" &&
     cmp -s "$MOCHI_DIR/windows/scripts/cleanup-opencode-sessions.sh" "$INSTALLED_CLEANUP" &&
-    bash "$MOCHI_DIR/windows/scripts/install-airdrop-mt7922.sh" --verify >/dev/null 2>&1
+    { ((NO_AIRDROP)) || bash "$MOCHI_DIR/windows/scripts/install-airdrop-mt7922.sh" --verify >/dev/null 2>&1; }
 }
 
 verify_install() {
   local expected="$1"
-  installation_complete || die 'Setup returned without the full app, relay, cleanup, and AirDrop consent hook.'
+  installation_complete || die 'Setup returned without the full app, relay, cleanup, uninstaller, AirDrop file chooser, and consent hook.'
   [[ "$(sed -n '1p' "$INSTALLED_REVISION" 2>/dev/null || true)" == "$expected" ]] ||
     die 'Setup returned without confirming the installed revision; rerun setup or inspect its output.'
 }
@@ -52,7 +68,7 @@ if [[ "$local_sha" == "$remote_sha" ]]; then
     exit 0
   fi
   log 'Source is current, but the installed app is missing or an earlier setup did not finish. Reinstalling.'
-  "$MOCHI_DIR/mochi-full-setup.sh" || die 'Setup failed; the existing app was left as-is where possible.'
+  run_setup || die 'Setup failed; the existing app was left as-is where possible.'
   verify_install "$local_sha"
   log 'Mochi installation repaired.'
   exit 0
@@ -70,7 +86,7 @@ if git -C "$MOCHI_DIR" merge-base --is-ancestor "$fetched_sha" HEAD; then
     exit 0
   fi
   log 'Local source is ahead of upstream, but its installation is incomplete. Reinstalling the local revision.'
-  "$MOCHI_DIR/mochi-full-setup.sh" || die 'Setup failed; the existing app was left as-is where possible.'
+  run_setup || die 'Setup failed; the existing app was left as-is where possible.'
   verify_install "$local_sha"
   log 'Mochi installation repaired.'
   exit 0
@@ -80,6 +96,6 @@ git -C "$MOCHI_DIR" merge-base --is-ancestor HEAD "$fetched_sha" ||
 
 log "Updating $local_sha to $fetched_sha."
 git -C "$MOCHI_DIR" merge --ff-only "$fetched_sha" || die 'Fast-forward failed; the installed app was left unchanged.'
-"$MOCHI_DIR/mochi-full-setup.sh" || die 'Source updated, but setup failed. The previous installed app may still be running; inspect setup output.'
+run_setup || die 'Source updated, but setup failed. The previous installed app may still be running; inspect setup output.'
 verify_install "$fetched_sha"
 log 'Mochi updated and restarted.'

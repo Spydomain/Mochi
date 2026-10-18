@@ -31,6 +31,14 @@ export class IslandStateMachine {
   greetHoverCollapseDelay = 10;
   /** An alert waiting for an answer stays open, even when the mouse leaves. */
   pinned = false;
+  /** A focused workflow owns its idle timer, independently of alert pinning. */
+  get holdExpanded(): boolean { return this.expandedHeld; }
+  set holdExpanded(on: boolean) {
+    if (on === this.expandedHeld) return;
+    this.expandedHeld = on;
+    this.clear("homeCollapse");
+    if (!on && this.state === "home" && !this.pointerInside) this.scheduleHomeCollapse();
+  }
   /** Keep a live compact status visible without pinning the expanded panel. */
   get keepCompact(): boolean {
     return this.compactHeld;
@@ -62,6 +70,7 @@ export class IslandStateMachine {
 
   private homeDelay = 15;
   private compactHeld = false;
+  private expandedHeld = false;
   private pointerInside = false;
   private byHover = false;
   private petitHide: number | null = null;
@@ -185,14 +194,14 @@ export class IslandStateMachine {
 
   private scheduleHomeCollapse() {
     this.clear("homeCollapse");
-    if (this.pinned) return;
+    if (this.pinned || this.holdExpanded) return;
     const ms = (this.byHover ? this.hoverCloseDelay : this.homeDelay) * 1000;
     this.homeCollapseDueAt = performance.now() + ms;
     this.homeCollapse = window.setTimeout(() => {
       this.homeCollapse = null;
       this.homeCollapseDueAt = null;
       // An alert pinned while the countdown ran keeps the island open.
-      if (this.state === "home" && !this.pinned) {
+      if (this.state === "home" && !this.pinned && !this.holdExpanded) {
         this.byHover = false;
         this.transition("petit");
       }

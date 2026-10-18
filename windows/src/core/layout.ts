@@ -61,6 +61,9 @@ export const PANEL_H = 320;
 export const NOTCH_W = 184;
 export const NOTCH_H = 32;
 export const COMPACT_W = 288; // NOTCH_W + 104
+// A transfer needs only its icon and ring, not the normal agent session strip.
+export const AIRDROP_COMPACT_W = 160;
+export const AIRDROP_COMPACT_H = 24;
 export const EXPANDED_W = 640;
 
 export const ROUNDED_CORNER = 14; // hidden / compact
@@ -95,10 +98,8 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   // to the shared image.
   recap: { height: 184, botX: 62, botY: null, botDiameter: 58, agentMode: "column" },
   wardrobe: { height: 160, botX: 68, botY: null, botDiameter: 58, agentMode: "none" },
-  // Keep AirDrop the same compact size as its original island card. It returns
-  // to the overview automatically, so diagnostics must be concise rather than
-  // making the island taller.
-  airdrop: { height: 182, botX: 66, botY: 96, botDiameter: 58, agentMode: "none" },
+  // Start at the normal card height; the view measures real wrapped content.
+  airdrop: { height: 160, botX: 58, botY: null, botDiameter: 50, agentMode: "none" },
   airdropRequest: { height: 182, botX: 66, botY: 96, botDiameter: 58, agentMode: "none" },
 };
 
@@ -118,6 +119,7 @@ export function islandSize(
   mode: IslandMode,
   view: IslandViewName,
   chatCount = 0,
+  airDropTransfer = false,
 ): { w: number; h: number } {
   switch (mode) {
     case "hidden":
@@ -125,7 +127,9 @@ export function islandSize(
       // slides into the top edge of the screen instead of sitting there as a bar.
       return { w: NOTCH_W, h: 0 };
     case "compact":
-      return { w: COMPACT_W, h: NOTCH_H };
+      return airDropTransfer
+        ? { w: AIRDROP_COMPACT_W, h: AIRDROP_COMPACT_H }
+        : { w: COMPACT_W, h: NOTCH_H };
     case "expanded": {
       const h = view === "prompt" ? chatPromptHeight(chatCount) : VIEW_LAYOUTS[view].height;
       return { w: EXPANDED_W, h };

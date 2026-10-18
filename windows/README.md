@@ -14,7 +14,7 @@ This directory contains Mochi's shared TypeScript interface and Tauri/Rust deskt
 | --- | --- | --- |
 | ![Windows overview reference](screenshots/overview.png) | ![Windows compact island reference](screenshots/compact.png) | ![Windows settings reference](screenshots/settings.png) |
 
-These older Windows captures are interface references, not evidence of a newly tested Windows release. The latest Linux captures, recorded October 16, 2026, show [Clock and weather](../docs/media/mochi-overview.png), an actual [incoming iPhone request](../docs/media/mochi-airdrop-request.png), and verified receipt in the [animated demo](../docs/media/mochi-demo.gif) and [MP4 video](../docs/media/mochi-demo.mp4). Linux AirDrop is not a Windows feature.
+These older Windows captures are interface references, not evidence of a newly tested Windows release. The latest Linux captures, recorded October 18, 2026, show [Clock and weather](../docs/media/mochi-overview.png), an actual [incoming iPhone video request](../docs/media/mochi-airdrop-request.png), [transfer progress](../docs/media/mochi-airdrop-progress.png), and verified receipt in the [animated demo](../docs/media/mochi-demo.gif) and [MP4 video](../docs/media/mochi-demo.mp4). The 27-second edit uses real-time excerpts, omits waits, and enlarges compact indicators; it is not a speed benchmark. Linux AirDrop is not a Windows feature.
 
 ## Requirements
 
@@ -62,7 +62,9 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 npm run pack
 ```
 
-`npm run pack` builds release bundles and copies the Windows installers to `windows\release\`. Tauri's raw release artifacts remain under `windows\target\release\`. Packaging availability depends on the Windows build environment; inspect the command's output for the actual installer paths.
+`npm run pack` builds packages for the host operating system and collects them in `windows/release/`. On Windows it produces NSIS and MSI installers. On Linux it produces AppImage, DEB, and RPM packages, with architecture-specific names such as `Mochi-Linux-0.3.0-x86_64.AppImage`. Tauri's original artifacts remain in `windows/target/release/bundle/`. Inspect the build output for the actual paths; building on Linux does not produce or verify Windows packages.
+
+The Linux desktop packages do not provision OpenCode, agent hooks, login autostart, or the optional privileged AirDrop backend. Use the [full Linux setup](../README.md#install-on-linux) for that configuration. Packages built on a recent distribution also require compatible system libraries; test each intended distribution before publishing. The locally prepared Linux packages are unsigned, and no GitHub release is implied by a successful local build. When distributing them with a `SHA256SUMS` manifest, verify it from the artifact directory with `sha256sum --check SHA256SUMS`.
 
 ### After moving or renaming a checkout
 

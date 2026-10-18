@@ -316,6 +316,16 @@ mod input_region_tests {
     }
 
     #[test]
+    fn compact_airdrop_uses_only_its_narrow_top_edge_for_input() {
+        let transfer = IslandRect { x: 280.0, y: 0.0, w: 160.0, h: 24.0 };
+        assert_eq!(interactive_rect(transfer, false), (280.0, 0.0, 160.0, 16.0));
+        assert!(interactive_hit(transfer, false, 360.0, 8.0));
+        assert!(!interactive_hit(transfer, false, 360.0, 20.0));
+        assert!(!interactive_hit(transfer, false, 240.0, 8.0));
+        assert!(!interactive_hit(transfer, false, 480.0, 8.0));
+    }
+
+    #[test]
     fn hidden_wake_area_stays_centered_and_small() {
         let hidden = IslandRect::default();
         assert!(interactive_hit(hidden, true, 360.0, 8.0));

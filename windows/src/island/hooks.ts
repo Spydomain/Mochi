@@ -263,6 +263,11 @@ function handleHook(island: Island, payload: HookPayload) {
 
   /** Alerts force the island open; work events only reveal the compact island. */
   const surface = (view: Parameters<Island["alert"]>[0], isAlert: boolean) => {
+    // A user is choosing files or using the phone. Ordinary agent completion
+    // and error cards must not replace this foreground workflow. Real
+    // permission requests use their separate explicit path below; AirDrop
+    // consent is independently surfaced by the native request watcher.
+    if (State.mode === "expanded" && State.view === "airdrop") return;
     if (State.mode === "expanded") {
       if (isAlert) island.setView(view);
     } else if (isAlert) {
@@ -307,6 +312,25 @@ function handleHook(island: Island, payload: HookPayload) {
     pendingTimeout = null;
     if (pending.requestId) void Bridge.approvalDecline(pending.requestId);
     dropPendingCard(island);
+  }
+
+  if (sessionId && (validAgent === "codex" || validAgent === "opencode")) {
+    const update = State.agentSessions.observe(agentId, sessionId, name, cwd);
+    if (update.ignore) return;
+    if (update.terminal && update.remaining) {
+      // A single pill can represent several terminals. Finishing A must not
+      // put B to sleep, remove B's pill, or leave A's command as the live work.
+      supersedeStop();
+      clearFinalLine(agentId);
+      const task = State.tasks.find(task => task.id === agentId);
+      if (task) {
+        task.sessionId = update.remaining.id;
+        task.sessionCwd = update.remaining.cwd;
+      }
+      State.updateTask(agentId, update.remaining.state);
+      State.setPillBadge(agentId, null);
+      return;
+    }
   }
 
   // Read after the card above is dropped: its pill may have handed the front
