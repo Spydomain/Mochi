@@ -6,7 +6,7 @@ import { Bridge, IS_TAURI, onDragDrop } from "../core/bridge";
 import {
   EXPANDED_CORNER, EXPANDED_W, NOTCH_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, VIEW_LAYOUTS, botGlowColor, botGlowOpacity, botPosition, chatPromptHeight,
-  islandSize,
+  islandSize, WAKE_STRIP_W, WAKE_STRIP_H,
   QUESTION_PICKER_H,
   type BotEmoteName, type IslandMode, type IslandViewName,
 } from "../core/layout";
@@ -812,7 +812,7 @@ export class Island {
     this.greetingCanvas.style.left = `${(w - EXPANDED_W) / 2}px`;
     this.uploadCanvas.el.style.left = `${(w - EXPANDED_W) / 2}px`;
 
-    const rect = { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    const rect = this.inputRect();
     const p = this.pushedRect;
     if (Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5) {
       this.pushedRect = rect;
@@ -825,6 +825,17 @@ export class Island {
     const w = this.width.value;
     const hh = this.height.value;
     return { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+  }
+
+  /** Keep native and page input aligned, including before an opening spring grows. */
+  private inputRect(): { x: number; y: number; w: number; h: number } {
+    if (State.mode === "hidden") {
+      return { x: (PANEL_W - WAKE_STRIP_W) / 2, y: 0, w: WAKE_STRIP_W, h: WAKE_STRIP_H };
+    }
+    const rect = this.islandRect();
+    const target = this.targetSize();
+    const w = Math.max(rect.w, target.w);
+    return { x: (PANEL_W - w) / 2, y: 0, w, h: Math.max(rect.h, target.h) };
   }
 
   // ── Window collapse (hidden → wake input region, zero polling) ────────────
@@ -1014,11 +1025,13 @@ export class Island {
     // The compositor's enter edge is authoritative after a wake. A WebKit
     // mousemove can arrive before this edge and look like a leave while the
     // pointer is still over the newly opened island; cancel that countdown.
-    if (inside && this.pointerInside !== true && State.mode !== "hidden") {
+    const changed = this.pointerInside !== inside;
+    this.pointerInside = inside;
+    if (inside && changed) {
       this.wasInIsland = true;
       this.fsm.mouseEntered();
     }
-    this.pointerInside = inside;
+    if (!inside) this.onCursor(-10_000, -10_000);
     if (State.view === "airdrop" && State.mode === "expanded") {
       this.views?.get("airdrop")?.pointerInside?.(inside);
     }
@@ -1046,11 +1059,12 @@ export class Island {
       UploadSeq.updateCursor(State.mouseInIsland.x, State.mouseInIsland.y);
     }
 
-    const compact = rect.h <= 32;
+    const input = this.inputRect();
+    const compact = input.h <= 32;
     const inIsland = compact
-      ? x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + Math.min(16, rect.h)
-      : x >= rect.x - HIT_MARGIN && x <= rect.x + rect.w + HIT_MARGIN &&
-        y >= rect.y - HIT_MARGIN && y <= rect.y + rect.h + HIT_MARGIN;
+      ? x >= input.x && x <= input.x + input.w && y >= input.y && y <= input.y + Math.min(WAKE_STRIP_H, input.h)
+      : x >= input.x - HIT_MARGIN && x <= input.x + input.w + HIT_MARGIN &&
+        y >= input.y - HIT_MARGIN && y <= input.y + input.h + HIT_MARGIN;
 
     // Recorded before the state machine hears of it: a transition it makes
     // right away (open on hover) reads where the pointer is, and must not see

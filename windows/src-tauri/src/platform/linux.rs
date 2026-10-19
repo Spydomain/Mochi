@@ -505,7 +505,9 @@ fn start_pointer_watch() {
         WATCH_RUNNING.store(false, Ordering::Relaxed);
         return;
     };
-    let inside = std::cell::Cell::new(false);
+    // Report the first snapshot too: a quick wake/leave can finish before this
+    // restarted watch's first tick, and the page must not remain "inside".
+    let inside = std::cell::Cell::new(None);
     gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
         if !WATCH_WANTED.load(Ordering::Relaxed) {
             WATCH_RUNNING.store(false, Ordering::Relaxed);
@@ -520,7 +522,7 @@ fn start_pointer_watch() {
                 Some(under?.toplevel() == ours.toplevel())
             })
             .unwrap_or(false);
-        if inside.replace(now_inside) != now_inside {
+        if inside.replace(Some(now_inside)) != Some(now_inside) {
             // The page gates its own (late, sometimes stale) mouse events on
             // this state, so a mousemove queued before the pointer left cannot
             // pull the island back to "inside".

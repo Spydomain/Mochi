@@ -124,6 +124,61 @@ async fn request_models(service: &Service) -> Result<Vec<AvailableModel>, String
         .collect())
 }
 
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ActiveSession {
+    id: String,
+    cwd: String,
+}
+
+fn active_ids(body: &Value) -> Result<Vec<String>, String> {
+    let data = body.get("data").and_then(Value::as_object).ok_or_else(unavailable)?;
+    data.iter().map(|(id, status)| {
+        if id.starts_with("ses") && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            && status.get("type").and_then(Value::as_str) == Some("running") {
+            Ok(id.clone())
+        } else {
+            Err(unavailable())
+        }
+    }).collect()
+}
+
+/// Recover live work after Mochi restarts, without starting OpenCode or mistaking
+/// saved history (or an idle client process) for a running session.
+#[tauri::command]
+pub async fn opencode_active_sessions() -> Result<Vec<ActiveSession>, String> {
+    if !service_file().is_file() { return Ok(Vec::new()); }
+    let service = service()?;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let client = net::client(&service.base, Duration::from_secs(3))?;
+        let read_active = || async {
+            let response = client.get(endpoint(&service, "session/active"))
+                .header("Authorization", &service.authorization)
+                .send().await.map_err(|_| unavailable())?;
+            active_ids(&json_response(response).await?)
+        };
+        let mut sessions = Vec::new();
+        for id in read_active().await? {
+            let response = client.get(endpoint(&service, &format!("session/{id}")))
+                .header("Authorization", &service.authorization)
+                .send().await.map_err(|_| unavailable())?;
+            // A session can disappear while its metadata is being fetched.
+            if response.status() == reqwest::StatusCode::NOT_FOUND { continue; }
+            let body = json_response(response).await?;
+            let Some(info) = body.get("data") else { continue };
+            if info.get("id").and_then(Value::as_str) != Some(id.as_str()) { continue; }
+            let Some(cwd) = info.pointer("/location/directory").and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty()) else { continue };
+            sessions.push(ActiveSession { id, cwd: cwd.to_string() });
+        }
+        if !sessions.is_empty() {
+            // Do not revive a turn that finished during the metadata requests.
+            let still_running = read_active().await?;
+            sessions.retain(|session| still_running.contains(&session.id));
+        }
+        Ok(sessions)
+    }).await.map_err(|_| unavailable())?
+}
+
 fn model_key(model: &AvailableModel) -> String {
     format!("{}/{}", model.provider_id, model.model_id)
 }
@@ -297,5 +352,25 @@ mod tests {
             authorization: "Basic test".into(),
         };
         assert_eq!(endpoint(&service, "model"), "http://127.0.0.1:49374/api/model");
+    }
+
+    #[test]
+    fn startup_reads_only_authoritative_running_session_ids() {
+        assert_eq!(active_ids(&json!({ "data": {
+            "ses_one": { "type": "running" }, "ses_two": { "type": "running" }
+        }})).unwrap(), vec!["ses_one", "ses_two"]);
+        assert!(active_ids(&json!({ "data": {} })).unwrap().is_empty());
+    }
+
+    #[test]
+    fn startup_rejects_history_errors_and_unsafe_session_paths() {
+        for body in [
+            json!({ "data": [{ "id": "ses_old" }] }),
+            json!({ "error": "unavailable" }),
+            json!({ "data": { "ses_idle": { "type": "idle" } } }),
+            json!({ "data": { "ses/../../config": { "type": "running" } } }),
+        ] {
+            assert!(active_ids(&body).is_err());
+        }
     }
 }

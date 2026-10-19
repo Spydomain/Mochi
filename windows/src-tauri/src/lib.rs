@@ -1013,6 +1013,7 @@ pub fn run() {
             secret_set,
             secret_clear,
             refresh_integration,
+            opencode::opencode_active_sessions,
             media_control,
             media_set_player,
             weather_find_city,

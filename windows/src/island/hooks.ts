@@ -227,7 +227,31 @@ function recordDiff(agentId: string, payload: HookPayload) {
 export function registerHookHandlers(island: Island) {
   // The last plan numbers seen survive a restart, as on the Mac.
   State.planUsage ??= restorePlanUsage(storedClaudePlanUsage());
-  void onEvent<HookPayload>("hook", (payload) => handleHook(island, payload));
+  let observed: Set<string> | null = new Set();
+  const ready = onEvent<HookPayload>("hook", (payload) => {
+    if (payload.mochi_agent === "opencode" && payload.session_id) observed?.add(payload.session_id);
+    handleHook(island, payload);
+  });
+  // Run after launch, once the live listener is ready. Live events always win
+  // over a delayed startup snapshot, including a Stop received before its reply.
+  return async () => {
+    await ready;
+    if (!observed) return;
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const sessions = await Bridge.opencodeActiveSessions();
+        if (sessions !== null) {
+          for (const session of sessions) {
+            if (State.paused || observed.has(session.id)) continue;
+            handleHook(island, { hook_event_name: "UserPromptSubmit", mochi_agent: "opencode",
+              session_id: session.id, cwd: session.cwd });
+          }
+          return;
+        }
+        if (attempt < 2) await new Promise<void>(resolve => window.setTimeout(resolve, 1000 * (attempt + 1)));
+      }
+    } finally { observed = null; }
+  };
 }
 
 function handleHook(island: Island, payload: HookPayload) {

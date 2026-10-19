@@ -85,6 +85,7 @@ export interface AirDropOutbound {
 
 export const Bridge = {
   boot: () => call<BootInfo>("boot"),
+  opencodeActiveSessions: () => call<{ id: string; cwd: string }[]>("opencode_active_sessions"),
   powerStatus: () => call<PowerStatus>("power_status"),
   weatherFindCity: (query: string) => call<WeatherLocation>("weather_find_city", { query }),
   weatherAutoLocation: (force = false) => call<WeatherLocation>("weather_auto_location", { force }),

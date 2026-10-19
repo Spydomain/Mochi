@@ -202,7 +202,7 @@ async function main() {
     void refreshConfigured();
   });
 
-  registerHookHandlers(island);
+  const recoverAgentSessions = registerHookHandlers(island);
   registerIntegrationHandlers(island);
   registerShortcutHandlers(island, () => setPaused(false));
   registerSpotifyHandlers(island);
@@ -221,6 +221,7 @@ async function main() {
   await onEvent<null>("recap-check", checkRecap);
 
   island.launch();
+  void recoverAgentSessions();
   wellbeing.start();
 
   // In a plain browser there is no wake strip behind the cursor: make the whole
